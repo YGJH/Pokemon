@@ -9,7 +9,18 @@ dependencies = [
     "kagglehub>=1.0.2",
     "pandas>=3.0.5",
     "pyarrow>=25.0.0",
+    "torch>=2.8.0",
 ]
+
+# CUDA 12.8 wheels — required for Blackwell (RTX 50xx, sm_120).
+# The default PyPI torch wheel does not carry sm_120 kernels.
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [dependency-groups]
 dev = [

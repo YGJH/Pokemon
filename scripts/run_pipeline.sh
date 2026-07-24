@@ -17,6 +17,9 @@ set -euo pipefail
 # ── 预设参数 ────────────────────────────────────────────────────────────────
 SKIP_DOWNLOAD=""
 NO_TRAIN=""
+SKIP_RUST=""
+# 相对路径一律以 python/ 为基准（管线全程在 python/ 下执行，
+# 因为 ptcg_mine / ptcg_il 套件位于该目录，必须是 cwd 才 import 得到）。
 RAW_DIR="raw"
 DATA_DIR="data"
 CHECKPOINT_DIR="checkpoints"
@@ -28,7 +31,7 @@ G_MIN=50
 JACCARD_THRESH=0.90
 BATCH_SIZE=2048
 EPOCHS=10
-
+echo $1
 # ── 解析参数 ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -38,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-train)
             NO_TRAIN="true"
+            shift
+            ;;
+        --skip-rust)
+            SKIP_RUST="true"
             shift
             ;;
         --raw-dir)
@@ -70,14 +77,18 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "用法: $0 [选项]"
             echo ""
-            echo "管线步骤: Phase 1-2(mine) → Phase 3(build-shards) → QA → Training"
+            echo "管线步骤: Rust engine → Phase 1-2(mine) → Phase 3(build-shards) → QA → Training"
+            echo ""
+            echo "路径说明: 相对路径以 python/ 为基准（预设 = python/raw, python/data,"
+            echo "          python/checkpoints）。要指定别处请给绝对路径。"
             echo ""
             echo "选项:"
             echo "  --skip-download        跳过 Phase 1 下载（raw/ 已有资料时使用）"
+            echo "  --skip-rust            跳过 Rust search engine 编译"
             echo "  --no-train             只做 mine + build-shards，不训练"
-            echo "  --raw-dir DIR          raw 目录 (默认: raw)"
-            echo "  --data-dir DIR         产出目录 (默认: data)"
-            echo "  --checkpoint-dir DIR   checkpoint 目录 (默认: checkpoints)"
+            echo "  --raw-dir DIR          raw 目录 (默认: python/raw)"
+            echo "  --data-dir DIR         产出目录 (默认: python/data)"
+            echo "  --checkpoint-dir DIR   checkpoint 目录 (默认: python/checkpoints)"
             echo "  --n-days N             下载的天数 (默认: 20)"
             echo "  --target-episodes N    总 episode 目标 (默认: 10000)"
             echo "  --seed N               随机种子 (默认: 0)"
@@ -95,22 +106,59 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
+PY_DIR="$PROJECT_DIR/python"
+RUST_DIR="$PY_DIR/ptcg_search"
+
+# 相对路径 → 绝对路径（以 python/ 为基准），避免各步骤 cwd 不同时指到不同目录
+abspath() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *)  printf '%s' "$PY_DIR/$1" ;;
+    esac
+}
+RAW_DIR="$(abspath "$RAW_DIR")"
+DATA_DIR="$(abspath "$DATA_DIR")"
+CHECKPOINT_DIR="$(abspath "$CHECKPOINT_DIR")"
+
+cd "$PY_DIR"
 
 echo "============================================"
 echo " Pokémon TCG IL — 完整训练管线"
 echo "============================================"
 echo "专案目录: $PROJECT_DIR"
+echo "执行目录: $PY_DIR"
 echo "Raw 目录: $RAW_DIR"
 echo "资料目录: $DATA_DIR"
 echo "Checkpoint 目录: $CHECKPOINT_DIR"
 echo ""
 
-# ── 步骤 1: Phase 0–2 语料挖掘 ────────────────────────────────────────────
+# ── 步骤 1: 编译 Rust search engine ──────────────────────────────────────
 echo "══════════════════════════════════════════════"
-echo " 步骤 1/3: 语料挖掘 (Phase 0–2)"
+echo " 步骤 1/4: 编译 Rust search engine"
 echo "══════════════════════════════════════════════"
-cd "$PROJECT_DIR/python"
+
+RUST_LIB="$RUST_DIR/target/release/libptcg_search.so"
+if [[ "$SKIP_RUST" == "true" ]]; then
+    echo "--skip-rust 已指定，跳过编译。"
+elif ! command -v cargo >/dev/null 2>&1; then
+    echo "[警告] 找不到 cargo — 跳过 Rust engine 编译。" >&2
+    echo "       只影响 live-eval 的 search planner 对手；mine / 训练不受影响。" >&2
+    echo "       安装: https://rustup.rs  或用 --skip-rust 静音此警告。" >&2
+else
+    echo "\$ cargo build --release --manifest-path $RUST_DIR/Cargo.toml"
+    cargo build --release --manifest-path "$RUST_DIR/Cargo.toml"
+    if [[ ! -f "$RUST_LIB" ]]; then
+        echo "[错误] cargo 编译成功但未产生 $RUST_LIB" >&2
+        exit 1
+    fi
+    echo "✓ Rust engine 编译完成 — $RUST_LIB"
+fi
+echo ""
+
+# ── 步骤 2: Phase 0–2 语料挖掘 ────────────────────────────────────────────
+echo "══════════════════════════════════════════════"
+echo " 步骤 2/4: 语料挖掘 (Phase 0–2)"
+echo "══════════════════════════════════════════════"
 MINE_CMD="uv run python -m ptcg_mine.mine \
     --raw-dir $RAW_DIR \
     --out-dir $DATA_DIR \
@@ -161,9 +209,9 @@ echo ""
 echo "✓ 语料挖掘完成 — vocab.json, archetypes.json 已产生"
 echo ""
 
-# ── 步骤 2: Phase 3 特征化 ────────────────────────────────────────────────
+# ── 步骤 3: Phase 3 特征化 ────────────────────────────────────────────────
 echo "══════════════════════════════════════════════"
-echo " 步骤 2/3: 建立训练分片 (Phase 3)"
+echo " 步骤 3/4: 建立训练分片 (Phase 3)"
 echo "══════════════════════════════════════════════"
 
 BS_CMD="uv run python -m ptcg_il.cli build-shards \
@@ -187,7 +235,7 @@ echo ""
 echo "✓ 分片建立完成 — $SHARD_COUNT 个 .npz 文件, meta.parquet 已产生"
 echo ""
 
-# ── 步骤 3: 训练 ──────────────────────────────────────────────────────────
+# ── 步骤 4: 训练 ──────────────────────────────────────────────────────────
 if [[ "$NO_TRAIN" == "true" ]]; then
     echo "═══ --no-train 已指定，跳过训练 ═══"
     echo "管线结束。产物在: $DATA_DIR/"
@@ -195,8 +243,17 @@ if [[ "$NO_TRAIN" == "true" ]]; then
 fi
 
 echo "══════════════════════════════════════════════"
-echo " 步骤 3/3: 训练 IL Policy"
+echo " 步骤 4/4: 训练 IL Policy"
 echo "══════════════════════════════════════════════"
+
+# 前置检查：训练需要 torch，缺了就在这里明确失败（而不是 import 时炸掉）
+if ! uv run python -c "import torch" >/dev/null 2>&1; then
+    echo "[错误] 找不到 torch — 无法训练。" >&2
+    echo "       执行 'uv sync' 安装（pyproject.toml 已设定 CUDA 12.8 wheel）。" >&2
+    echo "       分片已建立完成，之后可直接跑:" >&2
+    echo "         cd $PY_DIR && uv run python -m ptcg_il.cli train --data-dir $DATA_DIR --out-dir $CHECKPOINT_DIR" >&2
+    exit 1
+fi
 
 TRAIN_CMD="uv run python -m ptcg_il.cli train \
     --data-dir $DATA_DIR \
@@ -220,7 +277,7 @@ echo "最佳模型: $CHECKPOINT_DIR/ckpt-best.pt"
 echo "训练产出: $CHECKPOINT_DIR/"
 echo "语料产物: $DATA_DIR/"
 echo ""
-echo "下一步:"
+echo "下一步 (需先 cd $PY_DIR):"
 echo "  # 评估模型"
 echo "  uv run python -m ptcg_il.cli train --eval-only --resume $CHECKPOINT_DIR/ckpt-best.pt"
 echo ""

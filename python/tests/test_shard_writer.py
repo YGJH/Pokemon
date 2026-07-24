@@ -1060,3 +1060,92 @@ class TestBuildShards:
                 episodes=episodes,
                 vocab=vocab,
             )
+
+    def test_streaming_path_matches_in_memory_and_is_memory_bounded(self, tmp_path):
+        """build_shards must stream the corpus off disk, not hold it resident.
+
+        Whole parsed episodes cost ~14.5 MB each (3.5x their ~4 MB on disk), so
+        retaining the corpus needs ~145 GB at the 10k-episode target. The
+        disk-backed path must (a) produce exactly what the in-memory path does,
+        and (b) peak well below the corpus size.
+        """
+        import tracemalloc
+
+        from ptcg_mine.config import MineConfig
+
+        episodes, vocab, archetypes, self_ids, opp_ids, experts = self._setup_test_data(
+            tmp_path, n_episodes=6
+        )
+
+        def _write_artifacts(out_dir):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with open(out_dir / "vocab.json", "w") as f:
+                json.dump(vocab, f)
+            with open(out_dir / "archetypes.json", "w") as f:
+                json.dump(
+                    {
+                        "self_ids": self_ids,
+                        "opp_ids": opp_ids,
+                        "archetypes": [
+                            {
+                                "id": a.id,
+                                "representative": list(a.representative),
+                                "frequency": a.frequency,
+                                "n_members": len(getattr(a, "members", [])),
+                            }
+                            for a in archetypes
+                        ],
+                    },
+                    f,
+                )
+
+        # Reference run: episodes handed over in memory.
+        mem_out = tmp_path / "data_mem"
+        _write_artifacts(mem_out)
+        mem_summary = build_shards(
+            config=MineConfig(raw_dir=tmp_path / "raw_unused", out_dir=mem_out),
+            episodes=episodes,
+            vocab=vocab,
+            archetypes_data=archetypes,
+            self_ids=self_ids,
+            opp_ids=opp_ids,
+            experts=experts,
+        )
+
+        # Same corpus on disk, with each step log inflated so the corpus is far
+        # larger than its Phase-2 projection -- exactly the real-episode shape.
+        raw_dir = tmp_path / "raw_stream"
+        raw_dir.mkdir(parents=True)
+        for eid, ep in episodes:
+            fat = dict(ep)
+            padding = [{"junk": "y" * 4000} for _ in range(2)]
+            fat["steps"] = list(ep["steps"]) + [padding for _ in range(120)]
+            (raw_dir / f"{eid}.json").write_text(json.dumps(fat))
+        corpus_bytes = sum(p.stat().st_size for p in raw_dir.glob("*.json"))
+
+        stream_out = tmp_path / "data_stream"
+        _write_artifacts(stream_out)
+
+        tracemalloc.start()
+        stream_summary = build_shards(
+            config=MineConfig(raw_dir=raw_dir, out_dir=stream_out),
+            vocab=vocab,
+            archetypes_data=archetypes,
+            self_ids=self_ids,
+            opp_ids=opp_ids,
+            experts=experts,
+        )
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+
+        # (a) identical work, whichever way the episodes arrived
+        assert stream_summary["n_kept_games"] == mem_summary["n_kept_games"]
+        assert stream_summary["total_samples"] == mem_summary["total_samples"]
+        assert stream_summary["split_counts"] == mem_summary["split_counts"]
+        assert stream_summary["n_kept_games"] > 0, "fixture kept nothing; test is vacuous"
+
+        # (b) peak stays sub-corpus: one episode resident, not all of them
+        assert peak < corpus_bytes, (
+            f"peak {peak / 1e6:.1f} MB >= corpus {corpus_bytes / 1e6:.1f} MB — "
+            "build_shards is still holding the corpus in memory"
+        )

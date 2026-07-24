@@ -42,7 +42,7 @@ SUM = 2
 STAD = 1
 CLS = 1
 L_STATE = 46  # CLS + P_MAX + H_MAX + SUM + STAD
-O_MAX = 64
+O_MAX = 128
 
 # ============================================================
 # Feature dims (A.1)
@@ -442,14 +442,42 @@ def _build_option_tokens(
     your_index: int,
     id_to_index: dict,
     attack_id_to_index: dict,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    action: list[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int]]:
     """Build option tensors per A.4/A.7.
 
+    When the raw option list exceeds O_MAX, the chosen actions are always
+    included within the O_MAX window so that no training samples are silently
+    dropped.  Returns an *index_remap* dict mapping old option indices to new
+    positions (identity when no reordering occurred).
+
     Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id, opt_attack_idx,
-             opt_scalar, opt_mask).
+             opt_scalar, opt_mask, index_remap).
     """
     options = select["option"]
-    n_opts = min(len(options), O_MAX)
+    n_total = len(options)
+
+    # ---- choose which option indices to keep (old → new) ----
+    if n_total <= O_MAX:
+        indices_to_keep = list(range(n_total))
+        index_remap = {i: i for i in range(n_total)}
+    else:
+        # Prioritise action-chosen options so the model can always predict them
+        chosen: set[int] = set()
+        if action is not None:
+            for a in action:
+                a_int = int(a)
+                if 0 <= a_int < n_total:
+                    chosen.add(a_int)
+        indices_to_keep = list(chosen)
+        for i in range(n_total):
+            if len(indices_to_keep) >= O_MAX:
+                break
+            if i not in chosen:
+                indices_to_keep.append(i)
+        index_remap = {old: new for new, old in enumerate(indices_to_keep)}
+
+    n_opts = len(indices_to_keep)
 
     opt_type = np.zeros(O_MAX, dtype=np.int64)
     opt_src_idx = np.full(O_MAX, -1, dtype=np.int64)
@@ -459,23 +487,23 @@ def _build_option_tokens(
     opt_scalar = np.zeros((O_MAX, F_OPT), dtype=np.float32)
     opt_mask = np.zeros(O_MAX, dtype=bool)
 
-    for j in range(n_opts):
-        opt = options[j]
+    for new_j, old_j in enumerate(indices_to_keep):
+        opt = options[old_j]
         otype = int(opt["type"])
-        opt_type[j] = otype
-        opt_mask[j] = True
+        opt_type[new_j] = otype
+        opt_mask[new_j] = True
 
         # Fill scalar features
-        opt_scalar[j, 0] = _clip_norm(float(opt.get("number", 0)), COUNT_N)
-        opt_scalar[j, 1] = _clip_norm(float(opt.get("count", 0)), COUNT_N)
-        opt_scalar[j, 2] = _clip_norm(
+        opt_scalar[new_j, 0] = _clip_norm(float(opt.get("number", 0)), COUNT_N)
+        opt_scalar[new_j, 1] = _clip_norm(float(opt.get("count", 0)), COUNT_N)
+        opt_scalar[new_j, 2] = _clip_norm(
             float(opt.get("energyIndex", 0)), float(N_ENERGY)
         )
-        opt_scalar[j, 3] = _clip_norm(float(opt.get("toolIndex", 0)), 2.0)
-        opt_scalar[j, 4] = _clip_norm(
+        opt_scalar[new_j, 3] = _clip_norm(float(opt.get("toolIndex", 0)), 2.0)
+        opt_scalar[new_j, 4] = _clip_norm(
             float(select.get("remainEnergyCost", 0)), ATKCOST_N
         )
-        opt_scalar[j, 5] = _clip_norm(
+        opt_scalar[new_j, 5] = _clip_norm(
             float(select.get("remainDamageCounter", 0)), DMGCTR_N
         )
 
@@ -486,82 +514,82 @@ def _build_option_tokens(
         # Resolve per option type (A.7)
         if otype == 7:  # PLAY
             src = _ref(2, your_index, opt.get("index", -1))
-            opt_src_idx[j] = src if src != -1 else -1
+            opt_src_idx[new_j] = src if src != -1 else -1
 
         elif otype == 8:  # ATTACH
             area = opt.get("area")
             index = opt.get("index")
             if area is not None and index is not None:
-                opt_src_idx[j] = _ref(area, your_index, index)
+                opt_src_idx[new_j] = _ref(area, your_index, index)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
-                opt_tgt_idx[j] = _ref(in_play_area, your_index, in_play_idx)
+                opt_tgt_idx[new_j] = _ref(in_play_area, your_index, in_play_idx)
 
         elif otype == 9:  # EVOLVE
             area = opt.get("area")
             index = opt.get("index")
             if area is not None and index is not None:
-                opt_src_idx[j] = _ref(area, your_index, index)
+                opt_src_idx[new_j] = _ref(area, your_index, index)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
-                opt_tgt_idx[j] = _ref(in_play_area, your_index, in_play_idx)
+                opt_tgt_idx[new_j] = _ref(in_play_area, your_index, in_play_idx)
 
         elif otype in (10, 11):  # ABILITY, DISCARD
             area = opt.get("area")
             player_idx = opt.get("playerIndex")
             index = opt.get("index")
             if area is not None and player_idx is not None and index is not None:
-                opt_src_idx[j] = _ref(area, player_idx, index)
+                opt_src_idx[new_j] = _ref(area, player_idx, index)
 
         elif otype == 12:  # RETREAT
-            opt_src_idx[j] = 1  # my active (row 1)
+            opt_src_idx[new_j] = 1  # my active (row 1)
 
         elif otype == 13:  # ATTACK
-            opt_src_idx[j] = 1  # my active (row 1)
-            opt_attack_idx[j] = _remap_attack(
+            opt_src_idx[new_j] = 1  # my active (row 1)
+            opt_attack_idx[new_j] = _remap_attack(
                 opt.get("attackId"), attack_id_to_index
             )
             # Some attacks target specific bench slots (snipe effects)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
-                opt_tgt_idx[j] = _ref(in_play_area, 1 - your_index, in_play_idx)
+                opt_tgt_idx[new_j] = _ref(in_play_area, 1 - your_index, in_play_idx)
 
         elif otype == 3:  # CARD
             area = opt.get("area")
             player_idx = opt.get("playerIndex", your_index)
             index = opt.get("index")
             if area is not None and index is not None:
-                opt_src_idx[j] = _ref(area, player_idx, index)
+                opt_src_idx[new_j] = _ref(area, player_idx, index)
             # Always set card_id for disambiguation (A.7)
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _remap_card(cid, id_to_index)
 
         elif otype in (4, 5, 6):  # TOOL_CARD, ENERGY_CARD, ENERGY
             area = opt.get("area")
             player_idx = opt.get("playerIndex", your_index)
             index = opt.get("index")
             if area is not None and index is not None:
-                opt_src_idx[j] = _ref(area, player_idx, index)
+                opt_src_idx[new_j] = _ref(area, player_idx, index)
             # Card id for attachment disambiguation (A.7)
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _remap_card(cid, id_to_index)
 
         elif otype in (1, 2, 14, 15, 16):  # YES, NO, END, SKILL, SPECIAL_CONDITION
             # src = -1, tgt = -1 (constant-type options)
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _remap_card(cid, id_to_index)
 
         elif otype == 0:  # NUMBER
             # src = -1, tgt = -1; scalar carries the number
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _remap_card(cid, id_to_index)
 
     return (
         opt_type,
@@ -571,25 +599,42 @@ def _build_option_tokens(
         opt_attack_idx,
         opt_scalar,
         opt_mask,
+        index_remap,
     )
 
 
 def _build_label(
-    action: list[int], select: dict
+    action: list[int],
+    select: dict,
+    index_remap: dict[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build action_idx[O_MAX] int64 and action_len scalar int64.
 
     action_idx stores the expert's picks in order, padded with -1.
+    When *index_remap* is provided, action indices are translated from
+    original option positions to their new (possibly reordered) positions.
+    Any action whose original index is absent from the remap is skipped
+    (this can happen when the action's option was truncated away — which
+    *index_remap* is designed to prevent).
     """
     action_idx = np.full(O_MAX, -1, dtype=np.int64)
     min_count = select["minCount"]
     max_count = select["maxCount"]
 
     n_picks = min(len(action), max_count)
+    write_pos = 0
     for k in range(n_picks):
-        action_idx[k] = int(action[k])
+        old_idx = int(action[k])
+        if index_remap is not None:
+            new_idx = index_remap.get(old_idx)
+            if new_idx is None:
+                continue  # option was truncated away (should not happen with remap logic)
+        else:
+            new_idx = old_idx
+        action_idx[write_pos] = new_idx
+        write_pos += 1
 
-    action_len = np.int64(n_picks)
+    action_len = np.int64(write_pos)
     return action_idx, action_len
 
 
@@ -677,11 +722,14 @@ def featurize(
         opt_attack_idx,
         opt_scalar,
         opt_mask,
-    ) = _build_option_tokens(select, ref_map, your_index, id_to_index, attack_id_to_index)
+        index_remap,
+    ) = _build_option_tokens(
+        select, ref_map, your_index, id_to_index, attack_id_to_index, action
+    )
 
     # --- Labels ---
     if action is not None:
-        action_idx, action_len = _build_label(action, select)
+        action_idx, action_len = _build_label(action, select, index_remap)
     else:
         action_idx = np.full(O_MAX, -1, dtype=np.int64)
         action_len = np.int64(0)

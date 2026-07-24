@@ -13,7 +13,7 @@ from ptcg_il.model import MLP
 from ptcg_il.model.cards import AttackEncoder, CardEncoder
 
 L_STATE = 46
-O_MAX = 64
+O_MAX = 128
 F_OPT = 6
 
 

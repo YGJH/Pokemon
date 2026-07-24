@@ -21,7 +21,14 @@ import pandas as pd
 from ptcg_il.featurizer import featurize
 from ptcg_mine.archetype import Archetype, assign_archetype
 from ptcg_mine.config import MineConfig
-from ptcg_mine.episode import deck_of, load_episode, rewards, teams, validate_episode
+from ptcg_mine.episode import (
+    deck_of,
+    load_episode,
+    project_for_selection,
+    rewards,
+    teams,
+    validate_episode,
+)
 from ptcg_mine.stats import select_experts, team_leaderboard
 
 logger = logging.getLogger(__name__)
@@ -148,19 +155,57 @@ def _load_all_episodes(raw_dir: Path) -> tuple[list[tuple[str, dict]], int, int]
     episodes: list[tuple[str, dict]] = []
     n_loaded = 0
     n_invalid = 0
+    for eid, ep in _iter_episodes(raw_dir, counts := {"n_loaded": 0, "n_invalid": 0}):
+        episodes.append((eid, ep))
+    n_loaded = counts["n_loaded"]
+    n_invalid = counts["n_invalid"]
+    return episodes, n_loaded, n_invalid
+
+
+def _iter_kept_games(source, keep: dict[str, list[tuple[int, bool]]]):
+    """Yield ``(eid, ep, p, won)`` for kept games, streaming episodes from
+    *source* and dropping each one as soon as its samples are emitted.
+
+    *source* is a zero-arg callable returning a fresh ``(eid, ep)`` iterator,
+    so this is the second pass over the corpus; *keep* is the decision map
+    built from the cheap first pass.
+    """
+    for eid, ep in source():
+        plans = keep.get(eid)
+        if not plans:
+            continue
+        for p, won in plans:
+            yield eid, ep, p, won
+
+
+def _iter_episodes(raw_dir, counts: dict | None = None):
+    """Stream ``(episode_id, ep)`` for each valid episode under *raw_dir*.
+
+    The generator holds exactly one parsed episode at a time (~14.5 MB), so a
+    caller that does not retain them is memory-flat regardless of corpus size.
+    ``_load_all_episodes`` retains everything and is therefore only safe for
+    small/test corpora — the real pipeline goes through ``build_shards``, which
+    makes two streaming passes instead.
+
+    *counts*, if given, is updated in place with ``n_loaded`` / ``n_invalid``.
+    """
+    def _bump(key):
+        if counts is not None:
+            counts[key] = counts.get(key, 0) + 1
+
     for path in sorted(Path(raw_dir).rglob("*.json")):
         try:
             ep = load_episode(path)
         except (json.JSONDecodeError, OSError):
-            n_loaded += 1
-            n_invalid += 1
+            _bump("n_loaded")
+            _bump("n_invalid")
             continue
-        n_loaded += 1
+        _bump("n_loaded")
         if validate_episode(ep):
-            episodes.append((path.stem, ep))
+            yield path.stem, ep
         else:
-            n_invalid += 1
-    return episodes, n_loaded, n_invalid
+            _bump("n_invalid")
+        del ep
 
 
 def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) -> Path:
@@ -255,15 +300,32 @@ def build_shards(
         k_experts = 10
         g_min = 50
 
-    # Load episodes if not provided
+    # Load episodes if not provided.
+    #
+    # Two streaming passes over disk rather than one resident corpus: pass A
+    # (here) keeps only ~1 KB per episode -- enough to pick experts and decide
+    # which (episode, player) pairs to keep -- and pass B (the featurize loop
+    # below) re-reads each kept episode to get its full game log. Holding whole
+    # episodes costs ~14.5 MB each, i.e. ~145 GB at the 10k-episode target.
     if episodes is None:
         if config is None:
             raise ValueError("build_shards: either config or episodes must be provided")
-        ep_list, n_loaded, n_invalid = _load_all_episodes(raw_dir)
+        counts: dict = {"n_loaded": 0, "n_invalid": 0}
+        ep_list = [(eid, project_for_selection(ep))
+                   for eid, ep in _iter_episodes(raw_dir, counts)]
+        n_loaded = counts["n_loaded"]
+        n_invalid = counts["n_invalid"]
+
+        def _episode_source():
+            return _iter_episodes(raw_dir)
     else:
         ep_list = list(episodes)
         n_loaded = len(ep_list)
         n_invalid = 0
+
+        # Bound as a default so the later `del ep_list` cannot break it.
+        def _episode_source(_eps=ep_list):
+            return iter(_eps)
 
     if not ep_list:
         logger.warning("No valid episodes found; nothing to featurize.")
@@ -312,17 +374,23 @@ def build_shards(
     )
 
     # --- Filter kept games ---
-    kept_games: list[tuple[str, dict, int, bool]] = []  # (eid, ep, p, won)
+    # `keep` records only the decision (episode id -> [(player, won), ...]).
+    # The episode bodies are re-read from disk in the featurize pass, so this
+    # filter never pins the corpus in memory.
+    keep: dict[str, list[tuple[int, bool]]] = defaultdict(list)
+    n_kept = 0
     for eid, ep in ep_list:
         for p in (0, 1):
             if _is_kept_game(ep, p, experts_set, self_id_set, opp_id_set, archetypes_data, jaccard_thresh):
                 r = rewards(ep)[p]
                 won = r == 1
-                kept_games.append((eid, ep, p, won))
+                keep[eid].append((p, won))
+                n_kept += 1
 
-    logger.info("Kept %d (episode, player) pairs out of %d", len(kept_games), len(ep_list) * 2)
+    logger.info("Kept %d (episode, player) pairs out of %d", n_kept, len(ep_list) * 2)
+    del ep_list
 
-    if not kept_games:
+    if not n_kept:
         logger.warning("No kept games; writing empty meta.parquet only.")
         meta_path = out_dir / "meta.parquet"
         pd.DataFrame(columns=META_COLUMNS).to_parquet(meta_path, index=False)
@@ -341,7 +409,8 @@ def build_shards(
     buffers: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     meta_rows: list[dict] = []
 
-    for eid, ep, p, won in kept_games:
+    # Pass B: re-read each kept episode's full game log, one at a time.
+    for eid, ep, p, won in _iter_kept_games(_episode_source, keep):
         r = rewards(ep)[p]
         value_target = 1.0 if r == 1 else -1.0
         team_name = teams(ep)[p]
@@ -424,7 +493,7 @@ def build_shards(
         "split_counts": split_counts,
         "n_shards": sum(shard_counters.values()),
         "total_samples": len(meta_df),
-        "n_kept_games": len(kept_games),
+        "n_kept_games": n_kept,
         "n_loaded": n_loaded,
         "n_invalid": n_invalid,
         "meta_path": str(meta_path),

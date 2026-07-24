@@ -28,6 +28,19 @@ uv run pytest tests/test_download.py
 # Run a specific test
 uv run pytest tests/test_download.py::test_something -xvs
 
+# Full pipeline (Rust engine → mine → shards → train)
+./scripts/run_pipeline.sh --skip-download
+
+# --- Individual stages ---
+# NOTE: cd python/ first. ptcg_mine/ and ptcg_il/ live under python/, and
+# pyproject.toml's `pythonpath` applies to pytest only — `python -m ptcg_mine.mine`
+# from the repo root raises ModuleNotFoundError. All corpus paths below are
+# therefore relative to python/ (i.e. python/raw, python/data, python/checkpoints).
+cd python
+
+# Build the Rust search engine (only used by live-eval's search planner baseline)
+cargo build --release --manifest-path ptcg_search/Cargo.toml
+
 # Run the corpus mining pipeline (Phases 0–2)
 uv run python -m ptcg_mine.mine --skip-download --raw-dir raw --out-dir data
 

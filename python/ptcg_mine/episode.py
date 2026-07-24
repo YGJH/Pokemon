@@ -11,6 +11,33 @@ import json
 from pathlib import Path
 
 
+def project_for_selection(ep: dict) -> dict:
+    """Reduce an episode to the fields the selection stages actually read.
+
+    Expert selection, archetype clustering, vocab building and the kept-game
+    filter only ever touch TeamNames, rewards, statuses and the two opening
+    deck actions at ``steps[1][p]``. Everything else in ``steps`` is the
+    turn-by-turn game log: ~4 MB on disk per episode, ~14.5 MB once parsed
+    into Python objects. Retaining whole episodes therefore costs ~145 GB at
+    the 10k-episode target, which the miner cannot survive.
+
+    The projection is ~1 KB, so a caller holding one per episode scales with
+    episode *count*, not corpus bytes. ``steps`` keeps its two-element shape so
+    ``validate_episode``'s ``len(steps) >= 2`` check and ``deck_of``'s
+    ``steps[1][p]["action"]`` indexing keep working against the projection.
+
+    Stages that need the real game log (Phase 3 featurization) must re-read the
+    episode from disk rather than expect it here.
+    """
+    return {
+        "info": ep.get("info", {}),
+        "statuses": ep.get("statuses"),
+        "rewards": ep.get("rewards"),
+        "steps": [[], [{"action": ep["steps"][1][0]["action"]},
+                       {"action": ep["steps"][1][1]["action"]}]],
+    }
+
+
 def load_episode(path: str | Path) -> dict:
     """Load an episode JSON file into a dict."""
     with open(path, "r") as f:
