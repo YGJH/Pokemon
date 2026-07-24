@@ -1,0 +1,21 @@
+[project]
+name = "pokemon"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "kaggle>=2.2.4",
+    "kagglehub>=1.0.2",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+

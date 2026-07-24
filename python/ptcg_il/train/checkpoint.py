@@ -1,0 +1,203 @@
+"""Save/load checkpoints + submission bundle assembly (C.7).
+
+A checkpoint stores ``{step, model_state_dict, ema_state_dict,
+optimizer_state_dict, scheduler_state_dict, rng_state}``.
+
+The submission bundle packs best-val EMA weights together with the frozen
+preprocessing artifacts (vocab.json, archetypes.json) so the agent runs
+identically at inference.
+"""
+
+from __future__ import annotations
+
+import random
+import shutil
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+def _rng_state() -> dict[str, Any]:
+    """Capture Python, NumPy, and PyTorch RNG states."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+
+
+def _restore_rng_state(state: dict[str, Any]) -> None:
+    """Restore all RNG states from a checkpoint."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    if "torch" in state:
+        torch.set_rng_state(state["torch"])
+
+
+def save_checkpoint(
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    ema: Any,
+    *,
+    step: int,
+    save_dir: str | Path,
+    tag: str | None = None,
+) -> Path:
+    """Save a training checkpoint (C.7).
+
+    Parameters
+    ----------
+    policy : nn.Module
+        Model (should have EMA weights applied before calling).
+    optimizer : Optimizer
+    scheduler : LRScheduler
+    ema : _EMA
+        EMA tracker with .state_dict().
+    step : int
+        Global training step.
+    save_dir : Path
+        Output directory.
+    tag : str or None
+        Suffix for the filename (e.g. "best", "last", "step-0004000").
+
+    Returns
+    -------
+    Path to the saved checkpoint.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    fname = f"ckpt-{tag}.pt" if tag else "ckpt.pt"
+    path = save_dir / fname
+
+    ckpt: dict[str, Any] = {
+        "step": step,
+        "model_state_dict": {k: v.cpu() for k, v in policy.state_dict().items()},
+        "ema_state_dict": ema.state_dict(),
+        "optimizer_state_dict": _cpu_state_dict(optimizer.state_dict()),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "rng_state": _rng_state(),
+    }
+
+    torch.save(ckpt, path)
+    return path
+
+
+def _cpu_state_dict(sd: dict) -> dict:
+    """Move all tensors in a state dict to CPU."""
+    out = {}
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.cpu()
+        else:
+            out[k] = v
+    return out
+
+
+def load_checkpoint(
+    path: str | Path,
+    device: torch.device | str = "cpu",
+) -> dict[str, Any]:
+    """Load a training checkpoint (C.7).
+
+    Parameters
+    ----------
+    path : Path
+        Path to the ``.pt`` checkpoint file.
+    device : torch.device
+        Device to load tensors to.
+
+    Returns
+    -------
+    Dict with ``step, model_state_dict, ema_state_dict, optimizer_state_dict,
+    scheduler_state_dict, rng_state``.
+    """
+    path = Path(path)
+    if isinstance(device, str):
+        device = torch.device(device)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    # Map model/optimizer state to requested device
+    if device.type != "cpu":
+        for v in [ckpt["model_state_dict"], ckpt["optimizer_state_dict"]]:
+            for k in v:
+                if isinstance(v[k], torch.Tensor):
+                    v[k] = v[k].to(device)
+
+    return ckpt
+
+
+def build_submission_bundle(
+    checkpoint_path: str | Path,
+    data_dir: str | Path,
+    output_dir: str | Path,
+    main_py: str | Path | None = None,
+    deck_csv: str | Path | None = None,
+) -> Path:
+    """Assemble a Kaggle-ready submission bundle (C.7).
+
+    Copies the EMA weights, ``vocab.json``, ``archetypes.json``, ``deck.csv``,
+    and ``main.py`` / ``cg/`` into a flat ``submission/`` directory.
+
+    Parameters
+    ----------
+    checkpoint_path : Path
+        Path to a ``ckpt-best.pt`` (EMA weights already applied).
+    data_dir : Path
+        Directory containing ``vocab.json``, ``archetypes.json``.
+    output_dir : Path
+        Where to create the ``submission/`` directory.
+    main_py : Path or None
+        Path to the top-level ``main.py``.  Defaults to the repo root
+        ``main.py`` relative to the caller's cwd.
+    deck_csv : Path or None
+        Path to ``deck.csv``.  Defaults to ``data_dir / "deck.csv"``.
+
+    Returns
+    -------
+    Path to the submission directory.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    data_path = Path(data_dir)
+    output_path = Path(output_dir) / "submission"
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Model weights
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # Strip optimizer/scheduler — we only need EMA weights
+    torch.save({"model_state_dict": ckpt["model_state_dict"]}, output_path / "weights.pt")
+
+    # Vocab + archetypes
+    for f in ("vocab.json", "archetypes.json"):
+        src = data_path / f
+        if src.exists():
+            shutil.copy2(src, output_path / f)
+
+    # main.py
+    if main_py is None:
+        main_py = Path("main.py")
+    if Path(main_py).exists():
+        shutil.copy2(main_py, output_path / "main.py")
+
+    # deck.csv
+    if deck_csv is None:
+        deck_csv = data_path / "deck.csv"
+    if Path(deck_csv).exists():
+        shutil.copy2(deck_csv, output_path / "deck.csv")
+
+    # cg/ engine lib
+    cg_src = Path("cg")
+    if cg_src.exists():
+        cg_dst = output_path / "cg"
+        if cg_dst.exists():
+            shutil.rmtree(cg_dst)
+        shutil.copytree(cg_src, cg_dst, dirs_exist_ok=True)
+
+    return output_path
