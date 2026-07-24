@@ -1,10 +1,10 @@
-"""Frozen artifact writers: vocab.orjson, archetypes.orjson, mining_report.md.
+"""Frozen artifact writers: vocab.json, archetypes.json, mining_report.md.
 
 See docs/plans/corpus-mining-plan.md "Global Constraints" and
 TRANSFORMER_IL_SPEC.md Appendix A for the exact constants recorded here.
 """
 
-import orjson
+import json
 from pathlib import Path
 
 from ptcg_mine.cards import ATKCOST_N, ATKDMG_N, HP_N, RETREAT_N
@@ -50,7 +50,7 @@ def write_vocab_json(path, vocab: dict, attack_id_to_index: dict, config) -> Non
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        orjson.dump(data, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
 def write_archetypes_json(path, self_ids: list[int], opp_ids: list[int], archetypes: list, fixed_deck: list[int]) -> None:
@@ -73,7 +73,7 @@ def write_archetypes_json(path, self_ids: list[int], opp_ids: list[int], archety
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        orjson.dump(data, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
 def write_mining_report(

@@ -23,6 +23,10 @@ from ptcg_mine.stats import select_experts, team_leaderboard
 from ptcg_mine.vocab import build_vocab
 
 
+class InsufficientDataError(RuntimeError):
+    """Raised when the parsed corpus is too thin to select any experts
+    (i.e. no episodes / no teams at all). Reported cleanly by main()."""
+
 def build_parser() -> argparse.ArgumentParser:
     d = MineConfig()
     p = argparse.ArgumentParser(
@@ -50,6 +54,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default=str(d.out_dir))
     p.add_argument("--manifest-csv", default=str(d.manifest_csv))
     p.add_argument("--dataset-prefix", default=d.dataset_prefix)
+    p.add_argument(
+        "--day-order",
+        default=d.day_order,
+        choices=["recent-first", "oldest-first", "as-selected"],
+        help="Order Phase 1 fetches days in (default: recent-first, so a run cut "
+        "short by rate limiting keeps the most recent days).",
+    )
+    p.add_argument(
+        "--list-mode",
+        default=d.list_mode,
+        choices=["stream", "sample"],
+        help="stream (default): queue downloads page-by-page, stop listing once the "
+        "per-day quota is met — far fewer API calls, downloads start immediately. "
+        "sample: list every page of the day first, then take a seeded random draw.",
+    )
     p.add_argument(
         "--skip-download",
         action="store_true",
@@ -79,6 +98,8 @@ def config_from_args(args: argparse.Namespace) -> MineConfig:
         out_dir=Path(args.out_dir),
         manifest_csv=Path(args.manifest_csv),
         dataset_prefix=args.dataset_prefix,
+        day_order=args.day_order,
+        list_mode=args.list_mode,
     )
 
 
@@ -114,8 +135,30 @@ def run(config: MineConfig, skip_download: bool) -> dict:
 
     episodes, n_loaded = load_raw_episodes(config.raw_dir)
 
+    # Check the corpus itself before blaming expert selection: an empty or
+    # unparseable raw_dir is a Phase 1 problem, and saying so here saves the
+    # user from debugging the miner when the real fault was the download.
+    if n_loaded == 0:
+        raise InsufficientDataError(
+            f"no episode JSON found under {config.raw_dir!s}. Phase 1 downloaded "
+            f"nothing — rerun without --skip-download, or point --raw-dir at an "
+            f"existing corpus."
+        )
+    if not episodes:
+        raise InsufficientDataError(
+            f"all {n_loaded} episode file(s) under {config.raw_dir!s} failed "
+            f"validation (need statuses == ['DONE','DONE'], >=2 steps, 2 rewards, "
+            f"two 60-card decks). The downloads may be truncated or partial."
+        )
+
     leaderboard = team_leaderboard(episodes)
     experts = select_experts(leaderboard, config.k_experts, config.g_min)
+    if not experts:
+        raise InsufficientDataError(
+            f"no experts could be selected from {len(episodes)} valid episode(s) "
+            f"across {len(leaderboard)} team(s): no team has the required "
+            f"--g-min={config.g_min} games. Download more episodes, or lower --g-min."
+        )
 
     deck_freq: Counter = Counter()
     for ep in episodes:
@@ -167,9 +210,24 @@ def run(config: MineConfig, skip_download: bool) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    from ptcg_mine.download import DownloadError
+
     args = build_parser().parse_args(argv)
     config = config_from_args(args)
-    summary = run(config, skip_download=args.skip_download)
+    try:
+        summary = run(config, skip_download=args.skip_download)
+    except DownloadError as exc:
+        print(f"[ptcg_mine] download failed: {exc}", file=sys.stderr)
+        return 2
+    except InsufficientDataError as exc:
+        print(f"[ptcg_mine] insufficient data: {exc}", file=sys.stderr)
+        return 1
 
     print("=== Corpus mining summary ===")
     print(f"episodes loaded:    {summary['episodes_loaded']}")

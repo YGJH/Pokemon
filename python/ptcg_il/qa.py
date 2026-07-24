@@ -61,7 +61,7 @@ def run_qa_checks(
     vocab_path : Path or None
         Alternative — load vocab from this JSON file.
     fixed_deck : list[int] or None
-        The FIXED_DECK (60 card ids).  If None, deck legality check is skipped.
+        The fixed_deck (60 card ids).  If None, deck legality check is skipped.
     all_episode_deck_cards : list[int] or None
         All raw card ids appearing in any sampled episode's decks.  If None and
         fixed_deck is provided, coverage is only checked for fixed_deck cards.
@@ -781,4 +781,4 @@ def load_fixed_deck(archetypes_path: str | Path) -> list[int] | None:
         return None
     with open(path) as f:
         data = json.load(f)
-    return data.get("FIXED_DECK")
+    return data.get("fixed_deck")

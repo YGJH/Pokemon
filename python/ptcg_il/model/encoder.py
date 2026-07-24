@@ -31,8 +31,9 @@ class Encoder(nn.Module):
         heads: int = 8,
         layers: int = 4,
         ff: int = 1024,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
+        dropout = 0.0
         super().__init__()
         layer = nn.TransformerEncoderLayer(
             d_model=D,

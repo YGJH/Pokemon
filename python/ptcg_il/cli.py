@@ -89,6 +89,26 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run training (shard → featurize → train → eval)",
     )
 
+    # ---- build-shards ----
+    bs_parser = sub.add_parser(
+        "build-shards",
+        help="Featurize kept expert games into training-ready .npz shards + meta.parquet (Phase 3)",
+    )
+    bs_paths = bs_parser.add_argument_group("Paths")
+    bs_paths.add_argument("--raw-dir", type=str, default="raw",
+                        help="Directory with downloaded episode JSONs (default: raw/)")
+    bs_paths.add_argument("--out-dir", type=str, default="data",
+                        help="Directory with vocab.json + archetypes.json; shards/ written here (default: data/)")
+    bs_config = bs_parser.add_argument_group("Corpus config")
+    bs_config.add_argument("--k-experts", type=int, default=10,
+                         help="Number of expert teams to select (default: 10)")
+    bs_config.add_argument("--g-min", type=int, default=50,
+                         help="Min games for expert eligibility (default: 50)")
+    bs_config.add_argument("--jaccard-thresh", type=float, default=0.90,
+                         help="Jaccard threshold for archetype clustering (default: 0.90)")
+    bs_config.add_argument("--samples-per-shard", type=int, default=50000,
+                         help="Max samples per .npz shard file (default: 50000)")
+
     # Paths
     paths = train_parser.add_argument_group("Paths")
     paths.add_argument("--data-dir", type=str, default="data",
@@ -230,7 +250,7 @@ def _load_artifacts(data_dir: Path) -> dict:
     if arch_path.exists():
         with open(arch_path) as f:
             arch = json.load(f)
-        artifacts["fixed_deck"] = arch.get("FIXED_DECK", list(range(60)))
+        artifacts["fixed_deck"] = arch.get("fixed_deck", list(range(60)))
     else:
         raise FileNotFoundError(f"archetypes.json not found at {arch_path}")
 
@@ -273,6 +293,35 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
     from ptcg_il.model import init_weights
     init_weights(policy)
     return policy
+
+
+def cmd_build_shards(args: argparse.Namespace) -> int:
+    """Execute the ``build-shards`` subcommand (Phase 3 featurization)."""
+    from ptcg_mine.config import MineConfig
+    from ptcg_il.shard_writer import build_shards
+
+    config = MineConfig(
+        raw_dir=Path(args.raw_dir),
+        out_dir=Path(args.out_dir),
+        k_experts=args.k_experts,
+        g_min=args.g_min,
+        jaccard_thresh=args.jaccard_thresh,
+    )
+
+    logger.info("Phase 3: building shards from %s → %s", config.raw_dir, config.out_dir)
+    summary = build_shards(config, samples_per_shard=args.samples_per_shard)
+
+    logger.info("Shard build complete:")
+    logger.info("  samples:    %d total (%s)", summary["total_samples"], summary["split_counts"])
+    logger.info("  shards:     %d files", summary["n_shards"])
+    logger.info("  kept games: %d", summary["n_kept_games"])
+    logger.info("  loaded:     %d episodes (%d invalid)", summary["n_loaded"], summary["n_invalid"])
+    logger.info("  meta:       %s", summary["meta_path"])
+
+    if summary["total_samples"] == 0:
+        logger.error("No samples produced! Check that experts, D_self/D_opp, and raw data are available.")
+        return 1
+    return 0
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -496,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train":
         return cmd_train(args)
+    elif args.command == "build-shards":
+        return cmd_build_shards(args)
     else:
         parser.print_help()
         return 0

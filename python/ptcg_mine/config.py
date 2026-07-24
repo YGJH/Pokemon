@@ -32,3 +32,12 @@ class MineConfig:
     out_dir: Path = Path("data")
     manifest_csv: Path = Path("archive/manifest.csv")
     dataset_prefix: str = "kaggle/pokemon-tcg-ai-battle-episodes-"
+    # Order Phase 1 fetches the selected days in. Defaults to newest-first so a
+    # run cut short by rate limiting still leaves the most recent (most
+    # meta-relevant) days on disk. Does not change *which* episodes are picked.
+    day_order: str = "recent-first"
+    # "stream": queue downloads page-by-page and stop listing at quota (fewest
+    # API calls, downloads start immediately). "sample": list the whole day and
+    # take a seeded random draw (reproducible unbiased sample, but must page
+    # through everything before the first download starts).
+    list_mode: str = "stream"

@@ -189,34 +189,316 @@ def random_agent(obs_dict: dict) -> list[int]:
 
 
 def search_planner_agent(obs_dict: dict) -> list[int]:
-    """Use the built-in ``search_begin/step`` planner as a scripted opponent.
+    """Use the built-in ``search_begin/step`` planner backed by Rust MCTS.
 
     This is a strong baseline — the honest, non-trivial bar (Section 5).
-    Requires the ``cg`` engine to be importable.
+    Loads ``libptcg_search.so`` (compiled from ``ptcg_search/``) and runs
+    UCT/MCTS over the engine's determinized forward model via ``search_begin``
+    and ``search_step``.  Falls back to a heuristic if the Rust library is
+    unavailable.
     """
     select = obs_dict.get("select")
     if select is None:
-        # Cannot use search for deck select; return a dummy deck
-        return list(range(60))
+        return _search_planner_deck()
 
-    # The planner uses a two-phase protocol:
-    #   search_begin(battle_data) → SearchOptions
-    #   search_step() → None | (best_option, probability) — call repeatedly
-    # We implement a minimal wrapper that calls search_begin on first invocation.
-    #
-    # Since we receive raw obs_dict here and don't have the engine's StartData,
-    # we fall back to the first legal option as a simple heuristic.
-    #
-    # Full search-planner integration requires the engine's search machinery
-    # (cg.sim.SearchBegin/SearchStep) which needs a Battle object — that is
-    # only available inside a running game, not from a function pointer.
-    #
-    # For now this is a placeholder; the real search-planner evaluator is
-    # implemented in _run_game via direct cg.game calls.
-    options = select.get("option", [])
+    # Try the Rust MCTS library first
+    result = _call_rust_search_planner(obs_dict)
+    if result is not None:
+        return result
+
+    # Fallback: use Python-only search via the engine's cg API directly.
+    # This is less efficient but works without the compiled Rust library.
+    return _search_planner_fallback_python(obs_dict)
+
+
+# ── Rust-backed search planner ──────────────────────────────────────────────
+
+_rust_search_lib = None
+_rust_search_error = None
+
+
+def _load_rust_search_lib():
+    """Lazily load ``libptcg_search.so``.  Returns the ctypes CDLL or None."""
+    global _rust_search_lib, _rust_search_error
+    if _rust_search_lib is not None:
+        return _rust_search_lib
+    if _rust_search_error is not None:
+        return None
+
+    import ctypes
+    import os
+    import sys
+
+    # Search paths for the compiled .so
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "ptcg_search",
+                     "target", "release", "libptcg_search.so"),
+        os.path.join(os.path.dirname(__file__), "..", "ptcg_search",
+                     "target", "debug", "libptcg_search.so"),
+    ]
+
+    lib = None
+    for cand in candidates:
+        if os.path.exists(os.path.normpath(cand)):
+            try:
+                lib = ctypes.CDLL(os.path.normpath(cand))
+                break
+            except OSError as e:
+                _rust_search_error = str(e)
+                continue
+
+    if lib is None:
+        _rust_search_error = _rust_search_error or "libptcg_search.so not found"
+        logger.debug("Rust search planner unavailable: %s", _rust_search_error)
+        return None
+
+    # Define function signatures
+    lib.search_plan.argtypes = [
+        ctypes.c_char_p,  # obs_json
+        ctypes.c_char_p,  # lib_path (to libcg.so)
+        ctypes.c_char_p,  # fixed_deck_json
+        ctypes.c_char_p,  # opp_deck_json
+        ctypes.c_int,     # iterations
+        ctypes.c_int,     # seed
+    ]
+    lib.search_plan.restype = ctypes.c_char_p
+
+    lib.search_plan_free.argtypes = [ctypes.c_char_p]
+    lib.search_plan_free.restype = None
+
+    _rust_search_lib = lib
+    logger.info("Loaded Rust search planner from %s", cand if lib else "?")
+    return lib
+
+
+def _call_rust_search_planner(obs_dict: dict) -> list[int] | None:
+    """Try to get an action from the Rust MCTS planner.  Returns None on failure."""
+    lib = _load_rust_search_lib()
+    if lib is None:
+        return None
+
+    import ctypes
+    import json
+
+    # Find libcg.so path
+    cg_lib_path = _find_libcg_path()
+    if cg_lib_path is None:
+        logger.debug("Cannot find libcg.so — Rust planner requires it")
+        return None
+
+    try:
+        obs_json = json.dumps(obs_dict, default=str)
+        fixed_deck_json = json.dumps(_get_fixed_deck_for_search())
+        opp_deck_json = json.dumps([])  # empty → mirror fallback in Rust
+
+        raw = lib.search_plan(
+            obs_json.encode("utf-8"),
+            cg_lib_path.encode("utf-8"),
+            fixed_deck_json.encode("utf-8"),
+            opp_deck_json.encode("utf-8"),
+            200,  # iterations
+            42,   # seed
+        )
+
+        if raw is None:
+            return None
+
+        result_str = ctypes.c_char_p(raw).value.decode("utf-8")
+        lib.search_plan_free(raw)
+
+        result = json.loads(result_str)
+        if result.get("error"):
+            logger.debug("Rust search planner error: %s", result["error"])
+            return None
+
+        indices = result.get("indices", [])
+        return [int(i) for i in indices]
+
+    except Exception as e:
+        logger.debug("Rust search planner call failed: %s", e)
+        return None
+
+
+# ── Fallback: Python-only search via cg API ──────────────────────────────────
+
+def _search_planner_fallback_python(obs_dict: dict) -> list[int]:
+    """Python-only search using the engine's ``search_begin`` / ``search_step``
+    API via ctypes.  Used when the Rust library is unavailable."""
+    options = obs_dict.get("select", {}).get("option", [])
     if not options:
         return []
-    return [0]  # first option as fallback
+
+    # Single-step lookahead over all legal options using the engine's search API.
+    # For each option, step forward once and evaluate the resulting state.
+    try:
+        return _python_search_one_step(obs_dict)
+    except Exception as e:
+        logger.warning("Python search planner error: %s — using first option", e)
+        return [0]
+
+
+def _python_search_one_step(obs_dict: dict) -> list[int]:
+    """Try each legal option via search_step; pick the one leading to the best
+    board (heuristic: opponent's prize cards remaining, or our HP advantage)."""
+    import ctypes
+    import json
+    import os
+    import random
+    import sys
+    from pathlib import Path
+
+    # Ensure cg is importable
+    engine_dir = str(
+        Path(__file__).resolve().parent.parent
+        / "pokemon-tcg-ai-battle"
+        / "sample_submission"
+        / "sample_submission"
+    )
+    if engine_dir not in sys.path:
+        sys.path.insert(0, engine_dir)
+
+    from cg.sim import lib
+    from cg.api import search_begin, search_step, search_release, search_end
+    from cg.api import to_observation_class, Observation
+
+    obs = to_observation_class(obs_dict)
+    select = obs.select
+    if select is None:
+        return list(range(60))
+
+    options = select.option
+    your_index = obs.current.yourIndex
+    deck_size = obs.current.players[your_index].deckCount
+
+    # Build guesses for hidden info (simplified fallback)
+    fixed = _get_fixed_deck_for_search()
+    your_deck = random.sample(fixed, min(deck_size, len(fixed))) if deck_size > 0 else []
+    your_prize = random.sample(fixed, 6)
+    opp_hand = random.sample(fixed, obs.current.players[1 - your_index].handCount)
+    opp_deck = random.sample(fixed, obs.current.players[1 - your_index].deckCount)
+    opp_prize = random.sample(fixed, 6)
+    opp_active = []
+
+    try:
+        state = search_begin(obs, your_deck, your_prize, opp_deck, opp_prize, opp_hand, opp_active)
+    except (ValueError, RuntimeError) as e:
+        logger.debug("search_begin failed in fallback: %s", e)
+        return [0]
+
+    root_id = state.searchId
+
+    best_option = 0
+    best_score = -1e9
+
+    for i in range(min(len(options), 32)):  # cap at 32 options for speed
+        try:
+            child = search_step(root_id, [i])
+        except (ValueError, RuntimeError):
+            continue
+
+        # Score: prefer states where opponent has fewer prizes (we're winning)
+        child_obs = child.observation
+        score = _score_state(child_obs, your_index)
+
+        if score > best_score:
+            best_score = score
+            best_option = i
+
+        try:
+            search_release(child.searchId)
+        except Exception:
+            pass
+
+    try:
+        search_release(root_id)
+    except Exception:
+        pass
+
+    return [best_option]
+
+
+def _score_state(obs: dict, your_index: int) -> float:
+    """Heuristic board evaluation for fallback search."""
+    current = obs.get("current", {})
+    players = current.get("players", [])
+    if len(players) < 2:
+        return 0.0
+
+    me = players[your_index]
+    opp = players[1 - your_index]
+
+    # Prize advantage (fewer remaining = winning)
+    my_prizes = len(me.get("prize", []))
+    opp_prizes = len(opp.get("prize", []))
+
+    # HP advantage on active Pokemon
+    my_hp = _active_hp(me)
+    opp_hp = _active_hp(opp)
+
+    # Bench presence
+    my_bench = len(me.get("bench", []))
+    opp_bench = len(opp.get("bench", []))
+
+    score = (
+        (6.0 - my_prizes) * 10.0        # we want fewer prizes
+        + (opp_prizes) * 10.0            # opponent having many prizes is good
+        + (my_hp - opp_hp) * 0.1         # HP advantage
+        + (my_bench - opp_bench) * 2.0   # bench advantage
+    )
+    return score
+
+
+def _active_hp(player: dict) -> float:
+    active = player.get("active", [])
+    if active and active[0] is not None and isinstance(active[0], dict):
+        return float(active[0].get("hp", 0))
+    return 0.0
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _find_libcg_path() -> str | None:
+    """Locate libcg.so on the filesystem."""
+    import os
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parent.parent
+        / "pokemon-tcg-ai-battle"
+        / "sample_submission"
+        / "sample_submission"
+        / "cg"
+        / "libcg.so",
+        Path("cg") / "libcg.so",
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _get_fixed_deck_for_search() -> list[int]:
+    """Try to load FIXED_DECK, or return a dummy."""
+    import json
+    import os
+    from pathlib import Path
+
+    data_dir = Path(os.environ.get("PTCG_DATA_DIR", "data"))
+    arch_path = data_dir / "archetypes.json"
+    if arch_path.exists():
+        with open(arch_path) as f:
+            arch = json.load(f)
+        fd = arch.get("FIXED_DECK") or arch.get("fixed_deck")
+        if fd:
+            return fd
+
+    logger.warning("No FIXED_DECK found for search planner — using dummy range(60)")
+    return list(range(1, 61))
+
+
+def _search_planner_deck() -> list[int]:
+    """Return FIXED_DECK for deck-selection step."""
+    return _get_fixed_deck_for_search()
 
 
 # ============================================================
