@@ -17,7 +17,7 @@ archive/
 python/wandb/
 checkpoints/
 python/checkpoints*/
-
+submission.tar.gz
 data/
 *.pyc
 .pytest_cache/

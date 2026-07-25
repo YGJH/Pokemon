@@ -106,7 +106,7 @@ except ImportError:
 from model import Policy, select_multi
 from model.featurizer import featurize
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
