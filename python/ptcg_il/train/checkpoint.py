@@ -10,6 +10,7 @@ identically at inference.
 
 from __future__ import annotations
 
+import json
 import random
 import shutil
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
+
+from ptcg_il.deck import DECK_KEY, write_deck_csv
 
 
 def _rng_state() -> dict[str, Any]:
@@ -46,6 +49,7 @@ def save_checkpoint(
     step: int,
     save_dir: str | Path,
     tag: str | None = None,
+    deck: dict[str, Any] | None = None,
 ) -> Path:
     """Save a training checkpoint (C.7).
 
@@ -63,6 +67,11 @@ def save_checkpoint(
         Output directory.
     tag : str or None
         Suffix for the filename (e.g. "best", "last", "step-0004000").
+    deck : dict, optional
+        Deck identity record from :func:`ptcg_il.deck.build_deck_metadata`,
+        stored under the ``"deck"`` key.  Without it a checkpoint does not say
+        which of the near-disjoint archetype decks it was trained to play, and a
+        wrong pairing fails silently (unseen cards just map to UNKNOWN).
 
     Returns
     -------
@@ -82,6 +91,8 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict(),
         "rng_state": _rng_state(),
     }
+    if deck is not None:
+        ckpt[DECK_KEY] = deck
 
     torch.save(ckpt, path)
     return path
@@ -172,7 +183,12 @@ def build_submission_bundle(
     # Model weights
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     # Strip optimizer/scheduler — we only need EMA weights
-    torch.save({"model_state_dict": ckpt["model_state_dict"]}, output_path / "weights.pt")
+    # Ship the deck label alongside the weights — weights.pt is the file that
+    # actually gets submitted, so it should say which deck it plays.
+    weights: dict[str, Any] = {"model_state_dict": ckpt["model_state_dict"]}
+    if ckpt.get(DECK_KEY):
+        weights[DECK_KEY] = ckpt[DECK_KEY]
+    torch.save(weights, output_path / "weights.pt")
 
     # Vocab + archetypes
     for f in ("vocab.json", "archetypes.json"):
@@ -186,11 +202,36 @@ def build_submission_bundle(
     if Path(main_py).exists():
         shutil.copy2(main_py, output_path / "main.py")
 
-    # deck.csv
-    if deck_csv is None:
-        deck_csv = data_path / "deck.csv"
-    if Path(deck_csv).exists():
+    # deck.csv — prefer the deck the checkpoint says it was trained on.
+    #
+    # An explicit ``deck_csv`` still wins, but the default must not be a bare
+    # path guess: shipping a deck that the policy was not trained for is a
+    # silent failure (every unseen card maps to UNKNOWN), and the old default
+    # (``data/deck.csv``, which is never produced by mining) shipped no deck at
+    # all.  The label written by ``save_checkpoint`` removes the guesswork.
+    if deck_csv is not None and Path(deck_csv).exists():
         shutil.copy2(deck_csv, output_path / "deck.csv")
+    else:
+        deck_meta = ckpt.get(DECK_KEY)
+        if deck_meta and deck_meta.get("deck"):
+            write_deck_csv(deck_meta, output_path / "deck.csv")
+            # Keep the full identity record beside the weights so the bundle is
+            # self-describing (which archetype, which vocab hash).
+            (output_path / "deck.json").write_text(
+                json.dumps(deck_meta, indent=2, ensure_ascii=False) + "\n"
+            )
+        else:
+            for cand in (data_path / "deck.csv", Path("deck.csv")):
+                if cand.exists():
+                    shutil.copy2(cand, output_path / "deck.csv")
+                    break
+            else:
+                raise FileNotFoundError(
+                    "No deck for the submission bundle: checkpoint carries no "
+                    f"'{DECK_KEY}' label and no deck.csv was found. Retrain with "
+                    "--archetype-self (which stamps the deck into the .pt) or pass "
+                    "deck_csv= explicitly."
+                )
 
     # cg/ engine lib
     cg_src = Path("cg")

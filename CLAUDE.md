@@ -50,6 +50,10 @@ uv run python -m ptcg_mine.mine --n-days 5 --target-episodes 500
 # Train the IL policy (Phase 3+)
 uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints
 
+# Train a per-deck specialist (one model per archetype deck)
+uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints_a2 \
+    --archetype-self 2 --batch-size 512 --total-steps 5000 --val-every 250
+
 # Resume from checkpoint
 uv run python -m ptcg_il.cli train --resume checkpoints/ckpt-step-0004000.pt
 
@@ -96,6 +100,7 @@ Pipeline phases: **Phase 0** (day sampling) → **Phase 1** (selective episode d
 | `train/checkpoint.py` | Save/load checkpoints (model, optimizer, scheduler, EMA state) |
 | `live_eval.py` | Live-engine evaluation against baseline opponents (random, frozen checkpoint, search planner) |
 | `qa.py` | QA gates: coverage, label sanity, deck legality checks before training |
+| `deck.py` | Deck identity for a trained policy — builds the record stamped into each `.pt` under the `"deck"` key, the `decks.json` sidecar, and `deck.csv` |
 | `shard_writer.py` | Write featurized decision points to sharded `.pt` files |
 
 **Model flow:** `obs_dict` → `featurize()` → tensor dict → `TokenEmbedder` → `Encoder` (self-attention over ~46 state tokens) → `PointerHead` (cross-attention: option tokens query state tokens) → per-option logits. Multi-select handled autoregressively with teacher-forcing at training time, greedy at inference.
@@ -110,6 +115,8 @@ Pipeline phases: **Phase 0** (day sampling) → **Phase 1** (selective episode d
 - **Vocab is decoupled from the archetype filter**: vocab built from all cards in the corpus (~300–500 ids) to limit live OOV; training games filtered to 𝒟_self/𝒟_opp archetypes only.
 - **Training uses both won and lost expert games**, with losses down-weighted (`w_lost=0.6`), not dropped. This preserves even-board-state data and reduces covariate shift.
 - **The deck is fixed, not learned** — no deck-generation head. `FIXED_DECK` is the representative of the best 𝒟_self archetype.
+- **One model per deck beats one model for all decks.** The six 𝒟_self archetypes are near-disjoint (pairwise multiset-Jaccard ≤ 0.17, *no* card common to all six, union only 89 cards), so a single policy fits several unrelated strategies at once. Training with `--archetype-self <id>` roughly doubles-to-quadruples non-trivial top-1 lift on held-out test (arch 0: +2.7 → +20.5 pts; arch 2: +8.8 → +49.4 pts).
+- **Every checkpoint is deck-labelled.** `save_checkpoint` stamps the `ptcg_il.deck` record under the `"deck"` key, and training writes a `decks.json` sidecar plus `deck.csv`. A wrong model/deck pairing otherwise fails *silently* — unseen cards just map to `UNKNOWN_CARD` — so the record also pins `vocab_sha1`/`archetypes_sha1`, since archetype ids are only cluster indices and get reassigned when mining is re-run.
 - **Value head is auxiliary** (MSE to game outcome ±1) — free warm-start critic for later RL.
 
 ### Test layout

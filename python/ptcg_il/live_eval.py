@@ -109,15 +109,10 @@ def make_agent_from_policy(
         ``agent(obs_dict) -> list[int]``.
     """
     import torch
-    from ptcg_il.featurizer import featurize
+    from ptcg_il.featurizer import featurize, normalize_vocab
     from ptcg_il.model.policy import select_multi
 
-    id_to_index = {int(k): int(v) for k, v in vocab.get("id_to_index", {}).items()}
-    attack_id_to_index = {int(k): int(v) for k, v in vocab.get("attack_id_to_index", {}).items()}
-    vocab_full = {
-        "id_to_index": id_to_index,
-        "attack_id_to_index": attack_id_to_index,
-    }
+    vocab_full = normalize_vocab(vocab)
 
     policy.eval()
     policy.to(device)
@@ -136,14 +131,14 @@ def make_agent_from_policy(
 
         with torch.no_grad():
             if max_count == 1:
-                logits, _value = policy(batch)
+                logits, _value, _hist = policy(batch)
                 logits = logits.masked_fill(~batch["opt_mask"], -1e9)
                 chosen = int(logits.argmax(dim=-1)[0].item())
                 return [chosen]
             else:
                 chosen = select_multi(policy, batch)  # [1, batch_max]
                 picks = chosen[0].tolist()
-                # Filter -1 padding from per-sample maxC and take up to maxCount
+                # Filter STOP (-2) and padding (-1); keep only regular picks
                 picks = [int(p) for p in picks if p >= 0]
                 picks = picks[:max_count]
                 return picks

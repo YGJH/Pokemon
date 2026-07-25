@@ -14,6 +14,9 @@ raw/
 archive/
 .serena/
 .claude/
+python/wandb/
+checkpoints/
+python/checkpoints*/
 
 data/
 *.pyc

@@ -125,7 +125,7 @@ def run_qa_checks(
 
     # --- Variable-length multi-select (D.5.3) ---
     if not meta.empty:
-        vl_report = check_variable_length_multi_select(meta)
+        vl_report = check_variable_length_multi_select(shard_dir, meta)
         results.update(vl_report)
     else:
         results["n_variable_length"] = 0
@@ -439,7 +439,22 @@ def check_oov_coverage_curve(
     return result
 
 
-def check_variable_length_multi_select(meta: pd.DataFrame) -> dict[str, Any]:
+def _shards_have_stop_column(shard_dir: str | Path) -> bool:
+    """Check whether shard files contain the ``stop_column`` key."""
+    shard_dir = Path(shard_dir)
+    shard_files = sorted(shard_dir.glob("train-*.npz"))
+    if not shard_files:
+        return False
+    try:
+        data = np.load(shard_files[0], mmap_mode="r")
+        return "stop_column" in data
+    except Exception:
+        return False
+
+
+def check_variable_length_multi_select(
+    shard_dir: str | Path, meta: pd.DataFrame,
+) -> dict[str, Any]:
     """Count multi-select samples where ``minCount < maxCount``.
 
     Returns a dict with ``n_variable_length`` count and ``variable_length_share``
@@ -454,13 +469,25 @@ def check_variable_length_multi_select(meta: pd.DataFrame) -> dict[str, Any]:
     share = n_var / len(multi) if len(multi) > 0 else 0.0
 
     if share > 0.0:
-        logger.warning(
-            "VARIABLE-LENGTH MULTI-SELECT: %d samples (%.2f%% of multi-select) "
-            "have minCount < maxCount.  v1 fixed-length loop (B.7) is NOT valid; "
-            "a STOP head is required in v1.",
-            n_var,
-            share * 100,
-        )
+        # Check if shards include STOP column (new featurizer)
+        has_stop = _shards_have_stop_column(shard_dir)
+        if has_stop:
+            logger.info(
+                "VARIABLE-LENGTH MULTI-SELECT: %d samples (%.2f%% of multi-select) "
+                "have minCount < maxCount.  STOP head IS active — these samples "
+                "will receive proper STOP supervision.",
+                n_var,
+                share * 100,
+            )
+        else:
+            logger.warning(
+                "VARIABLE-LENGTH MULTI-SELECT: %d samples (%.2f%% of multi-select) "
+                "have minCount < maxCount.  STOP head is in the model but shards "
+                "were generated with the old featurizer (no stop_column).  "
+                "Regenerate shards to enable STOP supervision.",
+                n_var,
+                share * 100,
+            )
     return {"n_variable_length": n_var, "variable_length_share": round(share, 6)}
 
 
@@ -573,6 +600,13 @@ def check_label_sanity(
         opt_mask = data["opt_mask"]        # [S, O_MAX]
         min_count = data["minCount"]       # [S]
         max_count = data["maxCount"]       # [S]
+        # ``_build_label`` appends the STOP pick after the last expert pick, so
+        # for those samples action_len == n_expert_picks + 1.  Subtract it back
+        # out before range-checking against minCount/maxCount.
+        stop_column = (
+            data["stop_column"] if "stop_column" in data.keys()
+            else np.full(action_idx.shape[0], -1, dtype=np.int64)
+        )
 
         for s in range(action_idx.shape[0]):
             n_opts = int(opt_mask[s].sum())
@@ -591,10 +625,11 @@ def check_label_sanity(
             if len(set(picks.tolist())) < len(picks):
                 details["not_distinct"] += 1
 
-            # Length
+            # Length — count only the expert picks, not the trailing STOP
             mc = int(min_count[s])
             xc = int(max_count[s])
-            if a_len < mc or a_len > xc:
+            n_picks = a_len - (1 if int(stop_column[s]) >= 0 else 0)
+            if n_picks < mc or n_picks > xc:
                 details["wrong_length"] += 1
 
             samples_checked += 1
@@ -735,10 +770,13 @@ def balance_report(meta: pd.DataFrame) -> dict[str, Any]:
 
 
 def _load_vocab(path: str | Path) -> dict:
-    """Load vocab from a JSON file."""
+    """Load vocab from a JSON file, with int-keyed id maps."""
     import json
+
+    from ptcg_il.featurizer import normalize_vocab
+
     with open(path) as f:
-        return json.load(f)
+        return normalize_vocab(json.load(f))
 
 
 def _load_card_properties() -> tuple[dict[int, int], set[int], set[int]]:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,9 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
+from ptcg_il.deck import build_deck_metadata
+from ptcg_il.deck import describe as describe_deck
+from ptcg_il.deck import update_sidecar, write_deck_csv
 from ptcg_il.model.policy import Policy, multiselect_ce
 from ptcg_il.train.checkpoint import save_checkpoint
 from ptcg_il.train.dataset import ShardDataset, collate_fn
@@ -214,10 +217,43 @@ class _EMA:
                 self.shadow[n].mul_(d).add_(p.data, alpha=1.0 - d)
 
     def apply(self, model: nn.Module) -> None:
-        """Copy EMA weights into *model* (in-place)."""
+        """Copy EMA weights into *model* (in-place).
+
+        Destructive — the raw training weights are lost unless they were
+        captured first with :meth:`backup`.  Prefer :meth:`applied`.
+        """
         for n, p in model.named_parameters():
             if n in self.shadow:
                 p.data.copy_(self.shadow[n])
+
+    def backup(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """Snapshot *model*'s current (raw) weights so they can be restored."""
+        return {
+            n: p.data.clone()
+            for n, p in model.named_parameters()
+            if n in self.shadow
+        }
+
+    def restore(self, model: nn.Module, backup: dict[str, torch.Tensor]) -> None:
+        """Copy a :meth:`backup` back into *model* (in-place)."""
+        for n, p in model.named_parameters():
+            if n in backup:
+                p.data.copy_(backup[n])
+
+    @contextmanager
+    def applied(self, model: nn.Module):
+        """Temporarily swap EMA weights into *model*, restoring on exit.
+
+        Checkpointing and eval want the EMA weights, but training must resume
+        from the raw weights — the optimizer's Adam moment estimates correspond
+        to those, so overwriting them in place corrupts the trajectory.
+        """
+        backup = self.backup(model)
+        self.apply(model)
+        try:
+            yield model
+        finally:
+            self.restore(model, backup)
 
     def state_dict(self) -> dict:
         return {"decay": self.decay, "shadow": self.shadow}
@@ -225,6 +261,92 @@ class _EMA:
     def load_state_dict(self, sd: dict) -> None:
         self.decay = sd["decay"]
         self.shadow = sd["shadow"]
+
+
+def _compute_loss(
+    policy: Policy,
+    batch: dict[str, torch.Tensor],
+    lambda_v: float = LAMBDA_V,
+    label_smoothing: float = LABEL_SMOOTH,
+    use_amp: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass + loss only (no backward, no optimizer step).
+
+    Returns ``(loss, ce, value_mse_loss)`` where *loss* is a scalar tensor
+    ready for ``.backward()``.  Caller is responsible for scaling, backward,
+    gradient clipping, and optimizer step.
+    """
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+    with (
+        torch.amp.autocast(device_type, dtype=torch.bfloat16)
+        if use_amp
+        else nullcontext()
+    ):
+        logits, value, _history_h = policy(batch)  # [B, O], [B], [B, D]
+
+        maxcount = batch["maxCount"]
+        single = maxcount == 1
+
+        # Single-select rows need exactly one pointer pass; multi-select rows
+        # need an autoregressive loop.  Run the AR loop on the multi-select
+        # *subset* only — routing the whole batch through it (the previous
+        # behaviour whenever any row was multi-select, i.e. nearly always) costs
+        # max(action_len) full-batch pointer passes with all activations
+        # retained, which is both wasted compute for the ~95% single-select
+        # majority and the reason batch_size=1024 exhausts a 16GB GPU.
+        # A few optional single-select rows (minCount == 0) record the expert
+        # declining, with no STOP column emitted — action_idx[:, 0] is -1 and
+        # there is no representable target, so they contribute zero loss.
+        # ``multiselect_ce`` already guards this via ``target >= 0``; the
+        # single-select path must too, or the CE gather indexes with -1 and
+        # trips a device-side assert.
+        has_target = batch["action_idx"][:, 0] >= 0
+        single_ok = single & has_target
+
+        if single.all() and bool(has_target.all()):
+            ce = masked_label_smoothed_ce(
+                logits,
+                batch["action_idx"][:, 0],
+                batch["opt_mask"],
+                label_smoothing=label_smoothing,
+            )
+        else:
+            ce = logits.new_zeros(logits.shape[0])
+            if single_ok.any():
+                s_idx = torch.where(single_ok)[0]
+                ce = ce.index_put(
+                    (s_idx,),
+                    masked_label_smoothed_ce(
+                        logits[s_idx],
+                        batch["action_idx"][s_idx, 0],
+                        batch["opt_mask"][s_idx],
+                        label_smoothing=label_smoothing,
+                    ),
+                )
+            m_idx = torch.where(~single)[0]
+            if m_idx.numel() > 0:
+                sub = {
+                    k: (
+                        v[m_idx]
+                        if isinstance(v, torch.Tensor) and v.shape[:1] == single.shape
+                        else v
+                    )
+                    for k, v in batch.items()
+                }
+                ce = ce.index_put(
+                    (m_idx,),
+                    multiselect_ce(policy, sub, label_smoothing=label_smoothing),
+                )
+
+        loss = (batch["sample_weight"] * ce).mean()
+        if lambda_v > 0:
+            value_mse_loss = F.mse_loss(value, batch["value_target"])
+            loss = loss + lambda_v * value_mse_loss
+        else:
+            value_mse_loss = torch.tensor(0.0, device=loss.device)
+
+    return loss, ce, value_mse_loss
 
 
 def train_step(
@@ -262,35 +384,11 @@ def train_step(
     Dict with ``loss, ce_loss, value_mse, grad_norm`` for logging.
     """
     use_amp = grad_scaler is not None
-    device_type = device.type if device.type in ("cuda", "cpu") else "cpu"
 
-    with (
-        torch.amp.autocast(device_type, dtype=torch.bfloat16)
-        if use_amp
-        else nullcontext()
-    ):
-        logits, value = policy(batch)  # [B, O], [B]
-
-        # Check if all samples in batch are single-select
-        maxcount = batch["maxCount"]
-        all_single = (maxcount == 1).all().item()
-
-        if all_single:
-            ce = masked_label_smoothed_ce(
-                logits,
-                batch["action_idx"][:, 0],
-                batch["opt_mask"],
-                label_smoothing=label_smoothing,
-            )
-        else:
-            ce = multiselect_ce(policy, batch, label_smoothing=label_smoothing)
-
-        loss = (batch["sample_weight"] * ce).mean()
-        if lambda_v > 0:
-            value_mse_loss = F.mse_loss(value, batch["value_target"])
-            loss = loss + lambda_v * value_mse_loss
-        else:
-            value_mse_loss = torch.tensor(0.0, device=loss.device)
+    loss, ce, value_mse_loss = _compute_loss(
+        policy, batch, lambda_v=lambda_v,
+        label_smoothing=label_smoothing, use_amp=use_amp,
+    )
 
     # Backward
     optimizer.zero_grad(set_to_none=True)
@@ -338,6 +436,8 @@ def train(
     ckpt_every: int = CKPT_EVERY,
     # Data
     num_workers: int = 8,
+    grad_accum: int = 1,
+    archetype_self: int | None = None,
     # Precision
     mixed_precision: bool = True,
     # W&B
@@ -392,6 +492,11 @@ def train(
         Save checkpoint every N steps.
     num_workers : int
         DataLoader workers.
+    grad_accum : int
+        Gradient accumulation steps (1 = no accumulation).  Loss is scaled
+        by ``1/grad_accum`` so the effective batch size is
+        ``batch_size × grad_accum`` while peak VRAM usage corresponds to
+        ``batch_size`` alone.
     mixed_precision : bool
         Use bf16 autocast + GradScaler.
     wandb_logger : WandbLogger or None
@@ -412,8 +517,21 @@ def train(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Deck identity — stamped into every checkpoint and the decks.json sidecar
+    # so a .pt always says which archetype deck it plays.
+    try:
+        deck_meta = build_deck_metadata(data_dir, archetype_self)
+        logger.info("Training %s", describe_deck(deck_meta))
+    except (FileNotFoundError, KeyError) as e:
+        if archetype_self is not None:
+            raise  # a specialist run without deck metadata is not shippable
+        logger.warning("Could not build deck metadata: %s", e)
+        deck_meta = None
+
     # Build datasets
-    train_ds = ShardDataset(data_dir, split="train", shuffle=True, seed=42)
+    train_ds = ShardDataset(
+        data_dir, split="train", shuffle=True, seed=42, archetype_self=archetype_self
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -426,9 +544,12 @@ def train(
     )
 
     val_loader = None
+    val_ds = None
     if run_val:
         try:
-            val_ds = ShardDataset(data_dir, split="val", shuffle=False)
+            val_ds = ShardDataset(
+                data_dir, split="val", shuffle=False, archetype_self=archetype_self
+            )
             val_loader = DataLoader(
                 val_ds,
                 batch_size=batch_size,
@@ -443,14 +564,63 @@ def train(
             logger.warning("Val split not available, skipping eval: %s", e)
             run_val = False
 
+    # Record the realised sample counts now, before the first checkpoint is
+    # written, so every .pt carries them and not just the sidecar.
+    if deck_meta is not None:
+        deck_meta["samples_used"] = {
+            "train": len(train_ds),
+            "val": len(val_ds) if val_ds is not None else 0,
+        }
+
     # Steps
     if total_steps is None:
         steps_per_epoch = len(train_ds) // batch_size
         total_steps = 10 * steps_per_epoch
 
-    # Optimizer & schedule
+    # Clamp the schedule/cadence knobs to the actual run length.  The module
+    # defaults (warmup=1000, val_every=1000, ckpt_every=2000) assume a large
+    # corpus; on a small one total_steps can be a few hundred, and unclamped
+    # they silently break the run — LR never leaves warmup, and offline eval /
+    # best-checkpoint selection / early stopping never fire at all.
+    opt_steps = max(1, total_steps // max(1, grad_accum))
+
+    if warmup >= opt_steps:
+        new_warmup = max(1, int(0.05 * opt_steps))
+        logger.warning(
+            "warmup=%d >= optimizer steps=%d — LR would never reach peak_lr. "
+            "Clamping warmup to %d (5%% of the run).",
+            warmup, opt_steps, new_warmup,
+        )
+        warmup = new_warmup
+
+    if run_val and val_every >= total_steps:
+        new_val_every = max(1, total_steps // 10)
+        logger.warning(
+            "val_every=%d >= total_steps=%d — offline eval would never run "
+            "(no ckpt-best.pt, no early stopping). Clamping val_every to %d.",
+            val_every, total_steps, new_val_every,
+        )
+        val_every = new_val_every
+
+    if ckpt_every >= total_steps:
+        new_ckpt_every = max(1, total_steps // 4)
+        logger.warning(
+            "ckpt_every=%d >= total_steps=%d — no periodic checkpoints would "
+            "be written. Clamping ckpt_every to %d.",
+            ckpt_every, total_steps, new_ckpt_every,
+        )
+        ckpt_every = new_ckpt_every
+
+    # Move model to device BEFORE creating optimizer/EMA so their
+    # internal state lands on the correct device.
+    policy.to(device)
+
+    # Optimizer & schedule.  ``scheduler.step()`` only fires on accumulation
+    # boundaries, so the cosine horizon is measured in *optimizer* steps —
+    # passing total_steps here would leave the decay unfinished (and never
+    # reach min_lr) whenever grad_accum > 1.
     optimizer = create_optimizer(policy, peak_lr, weight_decay, betas)
-    scheduler = create_schedule(optimizer, total_steps, warmup, peak_lr, min_lr)
+    scheduler = create_schedule(optimizer, opt_steps, warmup, peak_lr, min_lr)
 
     # EMA
     ema = _EMA(policy, ema_decay)
@@ -497,11 +667,17 @@ def train(
 
     best_val_metric = float(wandb_logger._best_macro) if wandb_logger._best_macro > 0 else best_val_metric
 
-    policy.to(device)
     policy.train()
 
     train_iter = iter(train_loader)
     data_start = time.perf_counter()
+
+    # ---- gradient accumulation state ----
+    use_amp = grad_scaler is not None
+    accum_loss = 0.0
+    accum_ce = 0.0
+    accum_value_mse = 0.0
+    optimizer.zero_grad(set_to_none=True)
 
     for step in range(start_step, total_steps):
         # Fetch next batch — cycle loader infinitely
@@ -520,18 +696,65 @@ def train(
                 continue  # kept on CPU as bool
             batch_gpu[k] = v.to(device, non_blocking=(device.type == "cuda"))
 
-        # Forward + backward
-        metrics = train_step(
-            policy, batch_gpu, optimizer, ema, device,
-            grad_scaler=grad_scaler,
+        # ---- micro-batch forward ----
+        loss, ce, value_mse_loss = _compute_loss(
+            policy, batch_gpu,
             lambda_v=lambda_v,
             label_smoothing=label_smoothing,
-            grad_clip=grad_clip,
+            use_amp=use_amp,
         )
 
-        # Scheduler step
-        scheduler.step()
+        # Scale loss for gradient accumulation
+        if grad_accum > 1:
+            loss = loss / grad_accum
+
+        # Backward (accumulate gradients)
+        if use_amp:
+            grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        accum_loss += loss.item()
+        accum_ce += ce.mean().item()
+        accum_value_mse += value_mse_loss.item()
+
+        # ---- optimizer step (every grad_accum micro-batches) ----
+        is_accum_boundary = (step + 1) % grad_accum == 0
+
+        if is_accum_boundary:
+            if use_amp:
+                grad_scaler.unscale_(optimizer)
+            grad_norm_val = nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
+            if use_amp:
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+            else:
+                optimizer.step()
+            scheduler.step()
+            ema.update(policy)
+            optimizer.zero_grad(set_to_none=True)
+
         lr = scheduler.get_last_lr()[0]
+
+        # Build metrics from accumulated losses
+        n = grad_accum if is_accum_boundary else (step + 1) % grad_accum
+        metrics = {
+            "loss": accum_loss / n,
+            "ce": accum_ce / n,
+            "value_mse": accum_value_mse / n,
+            "grad_norm": (
+                grad_norm_val.item() if isinstance(grad_norm_val, torch.Tensor) else float(grad_norm_val)
+            ) if is_accum_boundary else 0.0,
+        }
+
+        if is_accum_boundary:
+            accum_loss = 0.0
+            accum_ce = 0.0
+            accum_value_mse = 0.0
+
+        # Log / eval / checkpoint — only on accumulation boundaries
+        if not is_accum_boundary:
+            continue
 
         # Log
         if (step + 1) % log_every == 0 or step == 0:
@@ -556,19 +779,26 @@ def train(
             eval_metrics["step"] = step + 1
             wandb_logger.log_eval(**eval_metrics)
 
-            macro_top1 = eval_metrics.get("val/top1_macro", 0.0)
-            if macro_top1 > best_val_metric + 1e-4:
-                best_val_metric = macro_top1
+            # Select on non-trivial micro top-1, not top1_macro: the macro
+            # average weights near-degenerate sel_ctx buckets (a handful of
+            # forced 1-2 option decisions scoring 1.0) equally with the buckets
+            # holding almost all real decisions, so it tracks noise.
+            sel_metric = eval_metrics.get("val/top1_nontrivial")
+            if sel_metric is None:
+                sel_metric = eval_metrics.get("val/top1_macro", 0.0)
+            if sel_metric > best_val_metric + 1e-4:
+                best_val_metric = sel_metric
                 patience_counter = 0
-                wandb_logger.mark_best(step + 1, macro_top1)
+                wandb_logger.mark_best(step + 1, sel_metric)
 
-                ema.apply(policy)
-                ckpt_path = save_checkpoint(
-                    policy, optimizer, scheduler, ema,
-                    step=step + 1,
-                    save_dir=save_dir,
-                    tag="best",
-                )
+                with ema.applied(policy):
+                    ckpt_path = save_checkpoint(
+                        policy, optimizer, scheduler, ema,
+                        step=step + 1,
+                        save_dir=save_dir,
+                        tag="best",
+                        deck=deck_meta,
+                    )
                 policy.train()
                 # Log checkpoint as W&B artifact (C.9)
                 wandb_logger.log_artifact(str(ckpt_path), artifact_type="model", aliases=["best"])
@@ -586,13 +816,14 @@ def train(
 
         # Checkpoint
         if (step + 1) % ckpt_every == 0:
-            ema.apply(policy)
-            save_checkpoint(
-                policy, optimizer, scheduler, ema,
-                step=step + 1,
-                save_dir=save_dir,
-                tag=f"step-{step+1:07d}",
-            )
+            with ema.applied(policy):
+                save_checkpoint(
+                    policy, optimizer, scheduler, ema,
+                    step=step + 1,
+                    save_dir=save_dir,
+                    tag=f"step-{step+1:07d}",
+                    deck=deck_meta,
+                )
             policy.train()
 
         data_start = time.perf_counter()
@@ -604,6 +835,7 @@ def train(
         step=total_steps,
         save_dir=save_dir,
         tag="last",
+        deck=deck_meta,
     )
     # Log last checkpoint as W&B artifact (C.9)
     wandb_logger.log_artifact(str(last_ckpt_path), artifact_type="model", aliases=["last"])
@@ -613,6 +845,17 @@ def train(
         fp = _data_dir / fname
         if fp.exists():
             wandb_logger.log_artifact(str(fp), artifact_type=fname.split(".")[0])
+
+    # Deck sidecar — same record as the one inside the .pt, but readable
+    # without torch, and also emits deck.csv for the submission bundle.
+    if deck_meta is not None:
+        deck_meta["best_val_metric"] = float(best_val_metric)
+        available = [
+            p.name for p in sorted(save_dir.glob("ckpt-*.pt"))
+        ]
+        sidecar = update_sidecar(save_dir, deck_meta, checkpoints=available)
+        write_deck_csv(deck_meta, save_dir / "deck.csv")
+        logger.info("Wrote deck sidecar %s and deck.csv", sidecar)
 
     # Reload best if we had val
     if best_val_metric >= 0:

@@ -232,17 +232,18 @@ class TestSplitOf:
         assert _split_of("test_ep_0000") == "train"
 
     def test_split_ranges(self):
-        """Verify that the split distribution roughly follows the 96/2/2 plan."""
+        """Verify that the split distribution roughly follows the 80/10/10 plan."""
         counts: Counter = Counter()
-        for i in range(10000):
+        n = 10000
+        for i in range(n):
             counts[_split_of(f"ep_{i}")] += 1
         # Ranges are approximate due to hash distribution
         assert counts["train"] > counts["val"]
         assert counts["train"] > counts["test"]
-        # Train should be the vast majority
-        assert counts["train"] > 9000
-        assert counts["val"] > 50
-        assert counts["test"] > 50
+        # ~80 / ~10 / ~10, allowing generous slack for hash jitter
+        assert 0.76 * n < counts["train"] < 0.84 * n
+        assert 0.07 * n < counts["val"] < 0.13 * n
+        assert 0.07 * n < counts["test"] < 0.13 * n
 
     def test_valid_splits_only(self):
         """Only returns train/val/test."""

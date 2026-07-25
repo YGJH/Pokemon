@@ -29,14 +29,14 @@ _INT_KEYS = frozenset({
     "prize_ids", "tok_type", "tok_owner", "tok_zone",
     "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_card_id",
     "opt_attack_idx", "sel_type", "sel_ctx", "action_idx",
-    "minCount", "maxCount", "action_len",
+    "minCount", "maxCount", "action_len", "stop_column", "log_len",
 })
 
 # Keys that should be float32 (can be cast to bf16)
 _FLOAT_KEYS = frozenset({
     "cls_feat", "poke_feat", "hand_feat", "sum_feat",
     "stadium_present", "opt_scalar",
-    "value_target", "sample_weight",
+    "value_target", "sample_weight", "log_feat",
 })
 
 # Boolean masks
@@ -117,6 +117,13 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         If True, shuffle indices on init (used for training).
     seed : int
         RNG seed for shuffle.
+    archetype_self : int, optional
+        If given, keep only decision points whose ``archetype_self`` matches —
+        i.e. train a per-deck specialist.  The self archetypes are near-disjoint
+        decks (pairwise multiset-Jaccard <= 0.17, no card common to all), so a
+        single model trained across all of them is fitting several unrelated
+        policies at once.  ``None`` (default) keeps every deck, the original
+        behaviour.
     """
 
     def __init__(
@@ -125,9 +132,11 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         split: str = "train",
         shuffle: bool = False,
         seed: int = 42,
+        archetype_self: int | None = None,
     ):
         data_dir = Path(data_dir)
         self.split = split
+        self.archetype_self = archetype_self
 
         # Load meta
         meta_path = data_dir / "meta.parquet"
@@ -139,6 +148,23 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         self.meta = self.meta[self.meta["shard"].str.startswith(split)].reset_index(drop=True)
         if len(self.meta) == 0:
             raise ValueError(f"No samples found for split '{split}' in meta.parquet")
+
+        # Optional per-deck filter.  Applied after the split filter so the
+        # 80/10/10 episode-level split still holds within each deck.
+        if archetype_self is not None:
+            if "archetype_self" not in self.meta.columns:
+                raise ValueError(
+                    "meta.parquet has no 'archetype_self' column — rebuild shards "
+                    "with `ptcg_il.cli build-shards` to enable per-deck training"
+                )
+            self.meta = self.meta[
+                self.meta["archetype_self"] == archetype_self
+            ].reset_index(drop=True)
+            if len(self.meta) == 0:
+                raise ValueError(
+                    f"No samples for archetype_self={archetype_self} in split "
+                    f"'{split}'. Check `archetypes.json` for valid ids."
+                )
 
         # Compute sample weights from meta columns (C.3)
         self.sample_weights = compute_sample_weights(self.meta)
@@ -191,6 +217,10 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
                 sample[key] = torch.from_numpy(np.asarray(arr).copy()).long()
             else:
                 sample[key] = torch.from_numpy(np.asarray(arr).copy()).float()
+
+        # Backward compat: old shards lack stop_column
+        if "stop_column" not in sample:
+            sample["stop_column"] = torch.tensor(-1, dtype=torch.long)
 
         # Attach sample_weight and value_target from meta
         sample["sample_weight"] = torch.tensor(

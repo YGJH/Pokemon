@@ -107,13 +107,21 @@ def _active_decisions(ep: dict, p: int) -> Iterator[tuple[int, dict, list[int]]]
 def _split_of(episode_id: str | int) -> str:
     """Deterministic train/val/test split by episode hash.
 
-    SHA-256(episode_id) % 100 → 0-1 = "val", 2-3 = "test", 4-99 = "train".
+    SHA-256(episode_id) % 100 → 0-9 = "val", 10-19 = "test", 20-99 = "train"
+    (an 80/10/10 split).  Splitting on *episode_id* keeps every decision point
+    of a game — and both players' trajectories — inside one split, so
+    consecutive near-duplicate states cannot leak across the boundary.
+
+    The ratio matters for model selection: at the previous 96/2/2 this yielded
+    a val split of ~477 samples drawn from only 6 episodes, which is far too
+    noisy to drive early stopping or best-checkpoint selection.
+
     Uses hashlib for cross-run reproducibility (Python's hash() is randomized).
     """
     h = int(hashlib.sha256(str(episode_id).encode()).hexdigest(), 16) % 100
-    if h in (0, 1):
+    if h < 10:
         return "val"
-    elif h in (2, 3):
+    elif h < 20:
         return "test"
     else:
         return "train"
@@ -140,9 +148,15 @@ def _load_archetypes_from_json(path: str | Path) -> tuple[list[Archetype], list[
 
 
 def _load_vocab(path: str | Path) -> dict:
-    """Load the frozen vocab artifact."""
+    """Load the frozen vocab artifact, with int-keyed id maps.
+
+    ``normalize_vocab`` is mandatory: JSON keys are strings but engine card /
+    attack ids are ints, so an un-normalized vocab maps every card to UNKNOWN.
+    """
+    from ptcg_il.featurizer import normalize_vocab
+
     with open(path) as f:
-        return json.load(f)
+        return normalize_vocab(json.load(f))
 
 
 def _load_all_episodes(raw_dir: Path) -> tuple[list[tuple[str, dict]], int, int]:

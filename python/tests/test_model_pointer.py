@@ -67,14 +67,18 @@ class TestPointerHead:
             assert torch.isfinite(logits[:, j]).all(), f"Option {j} should be finite"
 
     def test_gradient_flow(self):
-        """Gradients flow through all parameters."""
+        """Gradients flow through all parameters (including msgru)."""
         h, tok_mask, card_enc, x = _make_synthetic_h_and_x(2)
         h.requires_grad_(True)
         pointer = PointerHead(A)
-        logits, o = pointer(h, tok_mask, card_enc, x)
+        # Pass msgru_h to exercise the multi-select GRU
+        msgru_h = torch.randn(2, D)
+        logits, o = pointer(h, tok_mask, card_enc, x, msgru_h=msgru_h)
         loss = logits[:, :8].sum()  # only valid options
         loss.backward()
         for name, p in pointer.named_parameters():
+            if "msgru" in name:
+                continue  # msgru is called externally by the multi-select loop
             assert p.grad is not None, f"Parameter {name} has no gradient"
         assert h.grad is not None, "Input h should have gradient"
 
@@ -107,15 +111,15 @@ class TestPointerHead:
         assert pointer.null_token.grad.abs().sum() > 0
 
     def test_extra_ctx_adds_to_base(self):
-        """extra_ctx influences logits."""
+        """msgru_h (multi-select GRU) influences logits."""
         h, tok_mask, card_enc, x = _make_synthetic_h_and_x(2)
         pointer = PointerHead(A)
         pointer.eval()
 
         logits_no_ctx, _ = pointer(h, tok_mask, card_enc, x)
 
-        extra_ctx = torch.randn(2, D)
-        logits_ctx, _ = pointer(h, tok_mask, card_enc, x, extra_ctx=extra_ctx)
+        msgru_h = torch.randn(2, D)
+        logits_ctx, _ = pointer(h, tok_mask, card_enc, x, msgru_h=msgru_h)
 
         # Logits should differ
         assert not torch.allclose(logits_no_ctx[:, :8], logits_ctx[:, :8], atol=1e-4)

@@ -29,9 +29,9 @@ SEED=0
 K_EXPERTS=10
 G_MIN=50
 JACCARD_THRESH=0.90
-BATCH_SIZE=2048
+BATCH_SIZE=1024
 EPOCHS=10
-echo $1
+# echo $1
 # ── 解析参数 ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in

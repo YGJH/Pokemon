@@ -350,6 +350,48 @@ class TestShardDataset:
 # ============================================================
 
 
+class TestPerDeckFilter:
+    """``archetype_self`` narrows the dataset to a single deck's decision points.
+
+    The synthetic builder assigns ``archetype_self = sample_idx % 3``.
+    """
+
+    def test_none_keeps_every_deck(self):
+        data_dir = _build_synthetic_data(n_train=90, n_val=20)
+        assert len(ShardDataset(data_dir, split="train", archetype_self=None)) == 90
+
+    def test_filter_selects_only_that_deck(self):
+        data_dir = _build_synthetic_data(n_train=90, n_val=20)
+        subsets = [
+            ShardDataset(data_dir, split="train", archetype_self=a) for a in (0, 1, 2)
+        ]
+        # Partition: the three specialists together cover the full split.
+        assert sum(len(s) for s in subsets) == 90
+        for s in subsets:
+            assert len(s) > 0
+            assert (s.meta["archetype_self"] == s.archetype_self).all()
+
+    def test_filter_applies_within_the_split(self):
+        # Filtering must not leak val rows into train.
+        data_dir = _build_synthetic_data(n_train=90, n_val=30)
+        train = ShardDataset(data_dir, split="train", archetype_self=1)
+        val = ShardDataset(data_dir, split="val", archetype_self=1)
+        assert train.meta["shard"].str.startswith("train").all()
+        assert val.meta["shard"].str.startswith("val").all()
+
+    def test_samples_are_still_well_formed(self):
+        data_dir = _build_synthetic_data(n_train=90, n_val=20)
+        ds = ShardDataset(data_dir, split="train", archetype_self=2)
+        sample = ds[0]
+        assert "opt_mask" in sample
+        assert "sample_weight" in sample
+
+    def test_absent_deck_raises_with_actionable_message(self):
+        data_dir = _build_synthetic_data(n_train=90, n_val=20)
+        with pytest.raises(ValueError, match="No samples for archetype_self=99"):
+            ShardDataset(data_dir, split="train", archetype_self=99)
+
+
 class TestCollateFn:
     def test_stacks_batch_dim(self):
         data_dir = _build_synthetic_data(n_train=10, n_val=2)

@@ -2,7 +2,7 @@
 
 Options gather encoded state-token rows, cross-attend into the full state
 sequence, and produce per-option logits.  A learned ``null_token`` handles
-index==-1 references.  ``extra_ctx`` enables multi-select re-scoring (B.7).
+index==-1 references.  ``msgru_h`` enables multi-select re-scoring (B.7).
 """
 
 import torch
@@ -13,7 +13,7 @@ from ptcg_il.model import MLP
 from ptcg_il.model.cards import AttackEncoder, CardEncoder
 
 L_STATE = 46
-O_MAX = 128
+O_MAX = 64
 F_OPT = 6
 
 
@@ -43,10 +43,11 @@ class PointerHead(nn.Module):
         attack_static_table: torch.Tensor | None = None,
     ):
         super().__init__()
-        self.opt_type_emb = nn.Embedding(17, D)  # OptionType 0..16
+        self.opt_type_emb = nn.Embedding(18, D)  # OptionType 0..16 + STOP=17
         self.card: CardEncoder | None = None      # bound externally by Policy
         self.attack = AttackEncoder(A, D, attack_static_table)
         self.null_token = nn.Parameter(torch.zeros(D))
+        self.msgru = nn.GRUCell(D, D)             # multi-select memory
         self.opt_in = nn.Linear(D + F_OPT, D)
         self.cross = nn.MultiheadAttention(D, heads, batch_first=True)
         self.ln_q = nn.LayerNorm(D)
@@ -80,7 +81,7 @@ class PointerHead(nn.Module):
         tok_mask: torch.Tensor,
         card_enc: CardEncoder,
         x: dict[str, torch.Tensor],
-        extra_ctx: torch.Tensor | None = None,
+        msgru_h: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score options given encoded state.
 
@@ -96,15 +97,16 @@ class PointerHead(nn.Module):
             Option tensors: opt_type [B,O], opt_src_idx [B,O], opt_tgt_idx [B,O],
             opt_card_id [B,O], opt_attack_idx [B,O], opt_scalar [B,O,F_OPT],
             opt_mask bool [B,O].
-        extra_ctx : Tensor[B, D] or None
-            Running sum of already-picked option reprs (multi-select B.7).
+        msgru_h : Tensor[B, D] or None
+            Multi-select GRU hidden state.  When None (single-select),
+            no extra context is added.
 
         Returns
         -------
         logits : Tensor[B, O]
             Per-option scores, padded options filled with -1e9.
         o : Tensor[B, O, D]
-            Per-option representations (for multi-select pooling).
+            Per-option representations (for GRU update).
         """
         B = h.shape[0]
         D = h.shape[-1]
@@ -123,8 +125,8 @@ class PointerHead(nn.Module):
             + self.attack(x["opt_attack_idx"])
         )  # [B, O, D]
 
-        if extra_ctx is not None:
-            base = base + extra_ctx.unsqueeze(1)  # [B, O, D]
+        if msgru_h is not None:
+            base = base + msgru_h.unsqueeze(1)  # [B, O, D]
 
         # Option query
         q_input = torch.cat([base, x["opt_scalar"]], dim=-1)             # [B, O, D+F_OPT]

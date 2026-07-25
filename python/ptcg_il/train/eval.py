@@ -84,6 +84,16 @@ def offline_eval(
     per_sel_type: dict[int, tuple[int, int]] = {}  # type → (correct, total)
     per_sel_ctx: dict[int, tuple[int, int]] = {}   # ctx → (correct, total)
 
+    # Non-trivial = more than one legal option, i.e. the decision points where
+    # the policy actually has a choice to get right.  Tracked separately because
+    # forced (single-option) decisions score a free 1.0 and, together with the
+    # macro average over near-degenerate sel_ctx buckets, can make a barely
+    # better-than-baseline model look strong.
+    nontrivial_correct_top1 = 0
+    nontrivial_correct_top3 = 0
+    nontrivial_samples = 0
+    nontrivial_firstlegal_correct = 0
+
     total_multi_exact = 0
     total_multi_perpick_correct = 0
     total_multi_perpick_total = 0
@@ -103,7 +113,7 @@ def offline_eval(
             torch.amp.autocast(device_type, dtype=torch.bfloat16)
             if use_amp else nullcontext()
         ):
-            logits, value = policy(batch_gpu)  # [B, O], [B]
+            logits, value, _history_h = policy(batch_gpu)  # [B, O], [B], [B, D]
 
         maxcount = batch_gpu["maxCount"]
         single_mask = (maxcount == 1)
@@ -125,6 +135,21 @@ def offline_eval(
             total_correct_top1 += correct_top1
             total_correct_top3 += correct_top3
             total_samples += single_mask.sum().item()
+
+            # Non-trivial subset + "always pick the first legal option" baseline
+            single_optmask = batch_gpu["opt_mask"][single_mask]      # [N_single, O]
+            n_opt = single_optmask.sum(dim=-1)                       # [N_single]
+            nt = n_opt > 1
+            if nt.any():
+                nt_top1 = (top1_pred[nt] == single_targets[nt])
+                nt_top3 = (top3_pred[nt] == single_targets[nt].unsqueeze(-1)).any(dim=-1)
+                first_legal = single_optmask[nt].float().argmax(dim=-1)
+                nontrivial_correct_top1 += nt_top1.sum().item()
+                nontrivial_correct_top3 += nt_top3.sum().item()
+                nontrivial_firstlegal_correct += (
+                    first_legal == single_targets[nt]
+                ).sum().item()
+                nontrivial_samples += int(nt.sum().item())
 
             # Per-type/count accum
             correct_arr = (top1_pred == single_targets).cpu().numpy()
@@ -151,7 +176,13 @@ def offline_eval(
                 n = int(multi_len[i].item())
                 pred = multi_preds[i, :n].tolist()
                 tgt = multi_targets[i, :n].tolist()
-                total_multi_perpick_correct += sum(1 for p, t in zip(pred, tgt) if p == t)
+                stop_col = int(batch_gpu["stop_column"][multi_mask][i].item())
+                for step_idx, (p, t) in enumerate(zip(pred, tgt)):
+                    if stop_col >= 0 and t == stop_col:
+                        # STOP step: model should STOP (-2)
+                        total_multi_perpick_correct += 1 if p == -2 else 0
+                    else:
+                        total_multi_perpick_correct += 1 if p == t else 0
                 total_multi_perpick_total += n
                 if sorted(pred) == sorted(tgt):
                     total_multi_exact += 1
@@ -197,17 +228,40 @@ def offline_eval(
             metrics[f"val/top1@sel_ctx_{ctx}"] = acc
         metrics["val/top1_by_sel_ctx"] = ctx_accs  # for W&B table
 
-        # Macro avg (early-stop criterion)
+        # Macro avg over sel_ctx.  Kept for continuity, but note it weights a
+        # 3-sample forced-choice bucket the same as a 400-sample one, so it runs
+        # well above the micro numbers — do not read it as "accuracy".
         n_ctx = len(per_sel_ctx)
         metrics["val/top1_macro"] = (
             sum(a for _, a, _ in ctx_accs) / n_ctx if n_ctx > 0 else 0.0
         )
+
+        # Non-trivial micro metrics + baseline lift (early-stop criterion)
+        if nontrivial_samples > 0:
+            nt_top1 = nontrivial_correct_top1 / nontrivial_samples
+            nt_baseline = nontrivial_firstlegal_correct / nontrivial_samples
+            metrics["val/top1_nontrivial"] = nt_top1
+            metrics["val/top3_nontrivial"] = nontrivial_correct_top3 / nontrivial_samples
+            metrics["val/top1_nontrivial_firstlegal"] = nt_baseline
+            metrics["val/top1_nontrivial_lift"] = nt_top1 - nt_baseline
+            metrics["val/n_nontrivial"] = nontrivial_samples
+        else:
+            metrics["val/top1_nontrivial"] = 0.0
+            metrics["val/top3_nontrivial"] = 0.0
+            metrics["val/top1_nontrivial_firstlegal"] = 0.0
+            metrics["val/top1_nontrivial_lift"] = 0.0
+            metrics["val/n_nontrivial"] = 0
     else:
         metrics["val/top1_micro"] = 0.0
         metrics["val/top3_micro"] = 0.0
         metrics["val/top1_by_sel_type"] = []
         metrics["val/top1_by_sel_ctx"] = []
         metrics["val/top1_macro"] = 0.0
+        metrics["val/top1_nontrivial"] = 0.0
+        metrics["val/top3_nontrivial"] = 0.0
+        metrics["val/top1_nontrivial_firstlegal"] = 0.0
+        metrics["val/top1_nontrivial_lift"] = 0.0
+        metrics["val/n_nontrivial"] = 0
 
     # Multi-select
     if total_multi_samples > 0:

@@ -39,7 +39,7 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "tok_zone": torch.randint(0, 6, (B, L)),
         "tok_mask": torch.ones(B, L, dtype=torch.bool),
         # Options
-        "opt_type": torch.randint(0, 17, (B, O)),
+        "opt_type": torch.randint(0, 18, (B, O)),  # 17 types + STOP=17
         "opt_src_idx": torch.randint(-1, L, (B, O)),
         "opt_tgt_idx": torch.randint(-1, L, (B, O)),
         "opt_card_id": torch.randint(0, V, (B, O)),
@@ -55,10 +55,20 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "sel_ctx": torch.zeros(B, dtype=torch.long),
         "value_target": torch.ones(B),
         "sample_weight": torch.ones(B),
+        "stop_column": torch.full((B,), -1, dtype=torch.long),
+        # Logs (belief module)
+        "log_feat": torch.zeros(B, 32, 6),
+        "log_mask": torch.zeros(B, 32, dtype=torch.bool),
+        "log_len": torch.zeros(B, dtype=torch.long),
     }
 
-    # First 8 options valid
+    # First 8 options valid (leave room for STOP if needed)
     x["opt_mask"][:, 8:] = False
+    if max_count > 1:
+        # Set up STOP column at position 7 (last valid option slot)
+        x["stop_column"][:] = 7
+        x["opt_type"][:, 7] = 17  # STOP type
+        x["opt_mask"][:, 7] = True  # STOP is a valid "option"
 
     return x
 
@@ -71,7 +81,7 @@ class TestPolicy:
         policy = Policy(V, A)
         x = _make_synthetic_batch(4, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (4,))
-        logits, value = policy(x)
+        logits, value, _hist = policy(x)
         assert logits.shape == (4, O_MAX)
         assert value.shape == (4,)
 
@@ -80,7 +90,7 @@ class TestPolicy:
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(4)
-        _, value = policy(x)
+        _, value, _hist = policy(x)
         assert (value >= -1.0).all()
         assert (value <= 1.0).all()
 
@@ -89,19 +99,21 @@ class TestPolicy:
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(2, max_count=1)
-        logits, _ = policy(x)
+        logits, _val, _hist = policy(x)
         for j in range(8, O_MAX):
             assert (logits[:, j] < -1e8).all()
 
     def test_gradient_flow(self):
-        """All parameters receive gradients."""
+        """All parameters receive gradients (except msgru which runs in multi-select loop)."""
         policy = Policy(V, A)
         x = _make_synthetic_batch(2, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (2,))
-        logits, value = policy(x)
+        logits, value, _hist = policy(x)
         loss = logits[:, :8].sum() + value.sum()
         loss.backward()
         for name, p in policy.named_parameters():
+            if "msgru" in name:
+                continue  # only exercised in multi-select loop
             assert p.grad is not None, f"Parameter {name} has no gradient"
 
     def test_pointer_card_bound(self):
@@ -114,7 +126,7 @@ class TestPolicy:
         policy = Policy(V, A)
         x = _make_synthetic_batch(4, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (4,))
-        logits, value = policy(x)
+        logits, value, _hist = policy(x)
         ce = torch.nn.functional.cross_entropy(
             logits, x["action_idx"][:, 0], reduction="none"
         )
@@ -125,7 +137,7 @@ class TestPolicy:
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(2, max_count=1)
-        logits, _ = policy(x)
+        logits, _val, _hist = policy(x)
 
         # Predict the argmax - this is "correct" (label_smoothing aside)
         target = logits[:, :8].argmax(-1)
@@ -147,7 +159,7 @@ class TestPolicy:
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(4)
-        logits, value = policy(x)
+        logits, value, _hist = policy(x)
         assert not torch.isnan(logits).any()
         assert not torch.isinf(logits[:, :8]).any()  # masked has -inf
         assert not torch.isnan(value).any()
@@ -158,14 +170,17 @@ class TestMultiSelectCE:
     """multiselect_ce: teacher-forced AR training loss."""
 
     def test_output_is_finite(self):
-        """CE output is finite."""
+        """CE output is finite (including STOP supervision)."""
         policy = Policy(V, A)
         x = _make_synthetic_batch(2, max_count=3)
-        # Set unique valid action picks per sample (no duplicates)
+        stop_col = int(x["stop_column"][0].item())
+        # Set unique valid action picks + STOP target
         for b in range(2):
-            picks = torch.randperm(8)[:3]
-            x["action_idx"][b, :3] = picks
-        x["action_len"] = torch.full((2,), 3, dtype=torch.long)
+            picks = torch.randperm(7)[:2]  # 2 regular picks (avoiding STOP slot)
+            x["action_idx"][b, 0] = picks[0]
+            x["action_idx"][b, 1] = picks[1]
+            x["action_idx"][b, 2] = stop_col  # STOP target
+        x["action_len"] = torch.tensor([3, 3], dtype=torch.long)  # 2 picks + STOP
 
         ce = multiselect_ce(policy, x)
         assert ce.shape == (2,)
@@ -175,10 +190,12 @@ class TestMultiSelectCE:
         """Gradients flow through embed/encoder/pointer (not value) in multi-select path."""
         policy = Policy(V, A)
         x = _make_synthetic_batch(2, max_count=2)
+        stop_col = int(x["stop_column"][0].item())
         for b in range(2):
-            picks = torch.randperm(8)[:2]
-            x["action_idx"][b, :2] = picks
-        x["action_len"] = torch.full((2,), 2, dtype=torch.long)
+            picks = torch.randperm(7)[:1]  # 1 regular pick
+            x["action_idx"][b, 0] = picks[0]
+            x["action_idx"][b, 1] = stop_col  # STOP target
+        x["action_len"] = torch.tensor([2, 2], dtype=torch.long)  # 1 pick + STOP
 
         ce = multiselect_ce(policy, x)
         loss = ce.mean()
@@ -191,29 +208,33 @@ class TestMultiSelectCE:
                 assert p.grad is not None, f"Parameter {name} has no gradient"
 
     def test_variable_action_len(self):
-        """Handles samples with different pick counts in batch."""
+        """Handles samples with different pick counts in batch (incl STOP)."""
         policy = Policy(V, A)
         B = 4
         x = _make_synthetic_batch(B, max_count=3)
-        # Sample 0: 3 picks, sample 1: 2 picks, sample 2: 1 pick, sample 3: 3 picks
-        x["action_len"] = torch.tensor([3, 2, 1, 3], dtype=torch.long)
+        stop_col = int(x["stop_column"][0].item())
+        # action_len includes STOP: 4, 3, 2, 4  (3,2,1,3 picks + STOP each)
+        x["action_len"] = torch.tensor([4, 3, 2, 4], dtype=torch.long)
         for b in range(B):
-            n = int(x["action_len"][b].item())
-            picks = torch.randperm(8)[:n]
-            x["action_idx"][b, :n] = picks
+            n_reg = int(x["action_len"][b].item()) - 1  # regular picks
+            picks = torch.randperm(7)[:n_reg]
+            for k in range(n_reg):
+                x["action_idx"][b, k] = picks[k]
+            x["action_idx"][b, n_reg] = stop_col  # STOP target
 
         ce = multiselect_ce(policy, x)
         assert torch.isfinite(ce).all()
 
     def test_no_gradient_leak_between_picks(self):
-        """Each pick's CE is computed using the updated picked_ctx."""
+        """Each pick's CE uses the updated GRU state (not picked_ctx sum)."""
         policy = Policy(V, A)
         x = _make_synthetic_batch(2, max_count=2)
+        stop_col = int(x["stop_column"][0].item())
         x["action_idx"][:, 0] = torch.tensor([0, 0])
-        x["action_idx"][:, 1] = torch.tensor([1, 1])
-        x["action_len"] = torch.full((2,), 2, dtype=torch.long)
+        x["action_idx"][:, 1] = stop_col  # STOP after 1 pick
+        x["action_len"] = torch.tensor([2, 2], dtype=torch.long)
 
-        # First pick masks option 0, second pick can't choose 0 again
+        # First pick masks option 0, second step supervises STOP
         ce = multiselect_ce(policy, x)
         assert ce.shape == (2,)
 
@@ -232,29 +253,31 @@ class TestSelectMulti:
         assert chosen.shape == (2, 3)
 
     def test_all_distinct(self):
-        """All chosen indices are distinct (no repeats)."""
+        """All chosen indices are distinct (no repeats, ignoring STOP)."""
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(8, max_count=4)
         x["maxCount"] = torch.full((8,), 4, dtype=torch.long)
 
         chosen = select_multi(policy, x)
-        # Each sample should have 4 distinct picks
         for b in range(8):
-            picks = chosen[b].tolist()
+            picks = [int(p) for p in chosen[b].tolist() if p >= 0]  # filter STOP (-2), pad (-1)
             assert len(set(picks)) == len(picks), f"Sample {b}: duplicate picks {picks}"
 
     def test_no_out_of_range(self):
-        """All picks are within valid option range."""
+        """All regular picks are within valid option range."""
         policy = Policy(V, A)
         policy.eval()
         x = _make_synthetic_batch(4, max_count=3)
         x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
 
         chosen = select_multi(policy, x)
-        # Valid options are 0..7
-        assert (chosen >= 0).all()
-        assert (chosen < 8).all()
+        # Regular picks: >= 0 and < 8 (STOP = -2, padding = -1)
+        for b in range(4):
+            for p in chosen[b].tolist():
+                p = int(p)
+                if p >= 0:
+                    assert p < 8, f"Sample {b}: pick {p} out of range"
 
 
 class TestValueHead:

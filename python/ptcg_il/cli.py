@@ -138,7 +138,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # Training hyperparameters
     train_hp = train_parser.add_argument_group("Training (C.10)")
     train_hp.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"],
-                          help="Decision points per step")
+                          help="Decision points per micro-batch")
+    train_hp.add_argument("--grad-accum", type=int, default=1,
+                          help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
+    train_hp.add_argument("--archetype-self", type=int, default=None,
+                          help="Train a per-deck specialist on this archetype id only "
+                               "(see archetypes.json self_ids). The archetype decks are "
+                               "near-disjoint, so a specialist avoids fitting several "
+                               "unrelated policies at once. Default: all decks.")
     train_hp.add_argument("--epochs", type=int, default=DEFAULTS["epochs"],
                           help="Training epochs (overridden by --total-steps)")
     train_hp.add_argument("--total-steps", type=int, default=None,
@@ -239,8 +246,10 @@ def _load_artifacts(data_dir: Path) -> dict:
 
     vocab_path = data_dir / "vocab.json"
     if vocab_path.exists():
+        from ptcg_il.featurizer import normalize_vocab
+
         with open(vocab_path) as f:
-            artifacts["vocab"] = json.load(f)
+            artifacts["vocab"] = normalize_vocab(json.load(f))
         artifacts["vocab_size"] = artifacts["vocab"].get("size", 0)
         artifacts["attack_size"] = len(artifacts["vocab"].get("attack_id_to_index", {})) + 1
     else:
@@ -388,6 +397,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         data_dir=data_dir,
         save_dir=out_dir,
         batch_size=args.batch_size,
+        grad_accum=args.grad_accum,
+        archetype_self=args.archetype_self,
         peak_lr=args.peak_lr,
         min_lr=args.min_lr,
         warmup=args.warmup,

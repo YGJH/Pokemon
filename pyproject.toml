@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=3.0.5",
     "pyarrow>=25.0.0",
     "torch>=2.8.0",
+    "wandb>=0.28.1",
 ]
 
 # CUDA 12.8 wheels — required for Blackwell (RTX 50xx, sm_120).

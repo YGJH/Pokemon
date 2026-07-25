@@ -42,7 +42,9 @@ SUM = 2
 STAD = 1
 CLS = 1
 L_STATE = 46  # CLS + P_MAX + H_MAX + SUM + STAD
-O_MAX = 128
+O_MAX = 64
+L_LOG_MAX = 32   # max log entries per decision
+LOG_FEAT_DIM = 6 # log_type, player_rel, card_id, area_from, area_to, scalar
 
 # ============================================================
 # Feature dims (A.1)
@@ -60,7 +62,8 @@ F_OPT = 6
 # ============================================================
 N_SELTYPE = 11
 N_SELCTX = 49
-N_OPTTYPE = 17
+N_OPTTYPE = 18  # 17 original types + STOP
+STOP_OPT_TYPE = 17
 N_COND = 5
 N_ENERGY = 12
 
@@ -77,6 +80,26 @@ TOK_ZONE = {"cls": 0, "active": 1, "bench": 2, "hand": 3, "summary": 4, "stadium
 PAD_CARD = 0
 UNKNOWN_CARD = 1
 PAD_ATTACK = 0
+
+
+def normalize_vocab(vocab: dict) -> dict:
+    """Return *vocab* with ``id_to_index`` / ``attack_id_to_index`` keyed by int.
+
+    ``vocab.json`` round-trips through JSON, which forces all object keys to
+    strings (``{"1152": 6}``).  Card and attack ids coming out of the engine
+    observation are **ints**, so a raw ``json.load`` result silently misses on
+    every lookup and maps every card to ``UNKNOWN_CARD`` / every attack to
+    ``PAD_ATTACK``.  Every caller that hands a vocab to :func:`featurize` must
+    pass it through here first.
+
+    Idempotent — safe to call on an already-normalized dict.
+    """
+    out = dict(vocab)
+    for key in ("id_to_index", "attack_id_to_index"):
+        mapping = vocab.get(key)
+        if mapping:
+            out[key] = {int(k): int(v) for k, v in mapping.items()}
+    return out
 
 # ============================================================
 # Helpers
@@ -443,7 +466,7 @@ def _build_option_tokens(
     id_to_index: dict,
     attack_id_to_index: dict,
     action: list[int] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
     """Build option tensors per A.4/A.7.
 
     When the raw option list exceeds O_MAX, the chosen actions are always
@@ -451,14 +474,23 @@ def _build_option_tokens(
     dropped.  Returns an *index_remap* dict mapping old option indices to new
     positions (identity when no reordering occurred).
 
+    For multi-select decisions (maxCount > 1), a STOP column is appended
+    after the regular options so the model can learn when to stop picking.
+    *stop_column* is the index of that column (or -1 for single-select).
+
     Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id, opt_attack_idx,
-             opt_scalar, opt_mask, index_remap).
+             opt_scalar, opt_mask, index_remap, stop_column).
     """
     options = select["option"]
     n_total = len(options)
+    max_count = int(select.get("maxCount", 1))
+    is_multi = max_count > 1
 
     # ---- choose which option indices to keep (old → new) ----
-    if n_total <= O_MAX:
+    # For multi-select, reserve one slot for the STOP column
+    max_regular = (O_MAX - 1) if is_multi else O_MAX
+
+    if n_total <= max_regular:
         indices_to_keep = list(range(n_total))
         index_remap = {i: i for i in range(n_total)}
     else:
@@ -471,7 +503,7 @@ def _build_option_tokens(
                     chosen.add(a_int)
         indices_to_keep = list(chosen)
         for i in range(n_total):
-            if len(indices_to_keep) >= O_MAX:
+            if len(indices_to_keep) >= max_regular:
                 break
             if i not in chosen:
                 indices_to_keep.append(i)
@@ -591,6 +623,14 @@ def _build_option_tokens(
             if cid is not None:
                 opt_card_id[new_j] = _remap_card(cid, id_to_index)
 
+    # ---- STOP column for multi-select ----
+    stop_column = -1
+    if is_multi and n_opts < O_MAX:
+        stop_column = n_opts
+        opt_type[n_opts] = STOP_OPT_TYPE
+        opt_mask[n_opts] = True
+        # src/tgt = -1, card_id = PAD, attack_idx = 0, scalar = 0 (all defaults)
+
     return (
         opt_type,
         opt_src_idx,
@@ -600,6 +640,7 @@ def _build_option_tokens(
         opt_scalar,
         opt_mask,
         index_remap,
+        stop_column,
     )
 
 
@@ -607,18 +648,19 @@ def _build_label(
     action: list[int],
     select: dict,
     index_remap: dict[int, int] | None = None,
+    stop_column: int = -1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build action_idx[O_MAX] int64 and action_len scalar int64.
 
     action_idx stores the expert's picks in order, padded with -1.
     When *index_remap* is provided, action indices are translated from
     original option positions to their new (possibly reordered) positions.
-    Any action whose original index is absent from the remap is skipped
-    (this can happen when the action's option was truncated away — which
-    *index_remap* is designed to prevent).
+
+    For multi-select with a STOP column, the STOP target is appended
+    after the last expert pick, so the model learns to stop after the
+    correct number of selections.
     """
     action_idx = np.full(O_MAX, -1, dtype=np.int64)
-    min_count = select["minCount"]
     max_count = select["maxCount"]
 
     n_picks = min(len(action), max_count)
@@ -634,8 +676,74 @@ def _build_label(
         action_idx[write_pos] = new_idx
         write_pos += 1
 
+    # Append STOP target for multi-select (after last expert pick)
+    if stop_column >= 0 and write_pos < O_MAX:
+        action_idx[write_pos] = stop_column
+        write_pos += 1
+
     action_len = np.int64(write_pos)
     return action_idx, action_len
+
+
+# ============================================================
+# Log tokens (belief module)
+# ============================================================
+
+
+def _build_log_tokens(
+    logs: list[dict],
+    your_index: int,
+    id_to_index: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build fixed-size log feature tensor for the belief module.
+
+    Each log entry is encoded as [log_type, player_rel, card_id, area_from,
+    area_to, scalar_value].  The sequence is truncated to L_LOG_MAX entries.
+
+    Returns (log_feat[L_LOG_MAX, LOG_FEAT_DIM], log_mask[L_LOG_MAX], log_len).
+    """
+    log_feat = np.zeros((L_LOG_MAX, LOG_FEAT_DIM), dtype=np.float32)
+    log_mask = np.zeros(L_LOG_MAX, dtype=bool)
+    n_logs = min(len(logs), L_LOG_MAX)
+
+    for i in range(n_logs):
+        log = logs[i]
+        lt = int(log.get("type", 0))
+
+        # player relative: -1=self, 1=opponent, 0=unknown
+        pidx = log.get("playerIndex")
+        player_rel = 0
+        if pidx is not None:
+            player_rel = 1 if int(pidx) != your_index else -1
+
+        # card id
+        cid = log.get("cardId")
+        card_idx = PAD_CARD
+        if cid is not None:
+            card_idx = id_to_index.get(int(cid), UNKNOWN_CARD)
+
+        # area from/to
+        area_from = log.get("fromArea", -1)
+        area_to = log.get("toArea", -1)
+        if area_from is None:
+            area_from = -1
+        if area_to is None:
+            area_to = -1
+
+        # scalar: pick the most informative numeric field
+        scalar = 0.0
+        if lt == 16:  # HP_CHANGE
+            scalar = _clip_norm(float(log.get("value", 0)), 200.0)
+        elif lt == 22:  # COIN
+            scalar = 1.0 if log.get("head") else -1.0
+        elif lt == 23:  # RESULT
+            scalar = float(log.get("result", 2)) / 2.0  # 0,1,2 → 0,0.5,1
+
+        log_feat[i] = [lt, player_rel, card_idx, area_from, area_to, scalar]
+        log_mask[i] = True
+
+    log_len = np.int64(n_logs)
+    return log_feat, log_mask, log_len
 
 
 # ============================================================
@@ -708,6 +816,10 @@ def featurize(
         state, your_index, id_to_index
     )
 
+    # --- Logs: belief-module input ---
+    logs = obs_dict.get("logs", [])
+    log_feat, log_mask, log_len = _build_log_tokens(logs, your_index, id_to_index)
+
     # --- State: categorical token attributes ---
     tok_type, tok_owner, tok_zone, tok_mask = _build_tok_attrs(
         poke_card_id, hand_card_id, stadium_present
@@ -723,13 +835,14 @@ def featurize(
         opt_scalar,
         opt_mask,
         index_remap,
+        stop_column,
     ) = _build_option_tokens(
         select, ref_map, your_index, id_to_index, attack_id_to_index, action
     )
 
     # --- Labels ---
     if action is not None:
-        action_idx, action_len = _build_label(action, select, index_remap)
+        action_idx, action_len = _build_label(action, select, index_remap, stop_column)
     else:
         action_idx = np.full(O_MAX, -1, dtype=np.int64)
         action_len = np.int64(0)
@@ -773,4 +886,9 @@ def featurize(
         "sel_ctx": np.int64(select["context"]),
         "value_target": np.float32(value_target),
         "sample_weight": np.float32(sample_weight),
+        "stop_column": np.int64(stop_column),
+        # Logs (belief module)
+        "log_feat": log_feat,
+        "log_mask": log_mask,
+        "log_len": log_len,
     }

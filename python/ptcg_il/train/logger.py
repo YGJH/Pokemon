@@ -73,6 +73,15 @@ class WandbLogger:
         # Respect WANDB_MODE env var; allow override
         run_mode = mode or os.environ.get("WANDB_MODE", "online")
 
+        # ``mode="disabled"`` makes wandb.init() succeed while dropping every
+        # metric.  Treating that as "active" would silence the console fallback
+        # too, so `--no-wandb` would print no train loss and no eval numbers at
+        # all.  Stay inactive instead and log to the console.
+        if run_mode == "disabled":
+            logger.info("wandb disabled — logging metrics to console")
+            self._run = None
+            return
+
         try:
             self._run = wandb.init(
                 project=project,
@@ -97,7 +106,12 @@ class WandbLogger:
         samples_per_sec: float,
     ) -> None:
         """Log per-step training scalars (C.9 ``LOG_EVERY``)."""
+        # Console fallback when wandb is unavailable
         if not self._active:
+            logger.info(
+                "step %d  loss=%.4f  ce=%.4f  grad=%.3f  lr=%.2e  samp/s=%d",
+                step, loss, ce, grad_norm, lr, int(samples_per_sec),
+            )
             return
         wandb = _get_wandb()
         if wandb is False:
@@ -121,6 +135,19 @@ class WandbLogger:
         directly; per-context lists are converted to ``wandb.Table``.
         """
         if not self._active:
+            # Console fallback
+            step = metrics.get("step", 0)
+            top1_macro = metrics.get("val/top1_macro", float("nan"))
+            top1_micro = metrics.get("val/top1_micro", float("nan"))
+            nt = metrics.get("val/top1_nontrivial", float("nan"))
+            nt_base = metrics.get("val/top1_nontrivial_firstlegal", float("nan"))
+            n_nt = metrics.get("val/n_nontrivial", 0)
+            logger.info(
+                "eval step %d  top1_macro=%.4f  top1_micro=%.4f  "
+                "nontrivial: top1=%.4f vs first-legal=%.4f (lift %+.4f, n=%d)",
+                step, top1_macro, top1_micro,
+                nt, nt_base, nt - nt_base, n_nt,
+            )
             return
         wandb = _get_wandb()
         if wandb is False:

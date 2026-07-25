@@ -880,6 +880,10 @@ class TestEndToEnd:
         "sel_ctx",
         "value_target",
         "sample_weight",
+        "stop_column",
+        "log_feat",
+        "log_mask",
+        "log_len",
     }
 
     def _iter_active_decisions(self, ep: dict):
