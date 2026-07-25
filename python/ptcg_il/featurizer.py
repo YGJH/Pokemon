@@ -13,7 +13,7 @@ Raises ``ValueError`` if ``select is None`` (deck-selection steps are excluded
 
 import numpy as np
 
-from ptcg_il.ref_map import build_ref_map
+from ptcg_il.ref_map import build_ref_map, card_id_at
 
 # ============================================================
 # Normalizers (A.2)
@@ -140,8 +140,19 @@ def _onehot(value: int | None, size: int) -> np.ndarray:
 
 
 def _clip_norm(value: float, norm: float) -> float:
-    """Clip value/norm to [0, 1] (float counts) or [-1, 1] (signed)."""
-    return float(np.clip(value / norm, -1.0, 1.0))
+    """Clip value/norm to [0, 1] (float counts) or [-1, 1] (signed).
+
+    Pure-Python arithmetic on purpose: this is the hottest function in the
+    featurizer (~125 calls per decision) and `np.clip` on a *scalar* pays the
+    full array-dispatch cost -- ~2.6 us a call, 69% of total featurize time.
+    The branch form is bitwise-identical, NaN and +-inf included.
+    """
+    x = value / norm
+    if x < -1.0:
+        return -1.0
+    if x > 1.0:
+        return 1.0
+    return float(x)
 
 
 # ============================================================
@@ -466,6 +477,7 @@ def _build_option_tokens(
     id_to_index: dict,
     attack_id_to_index: dict,
     action: list[int] | None = None,
+    state: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
     """Build option tensors per A.4/A.7.
 
@@ -543,16 +555,36 @@ def _build_option_tokens(
         def _ref(area, player_idx, idx):
             return ref_map.get((int(area), int(player_idx), int(idx)), -1)
 
+        def _set_card(area, player_idx, idx):
+            """Populate opt_card_id by dereferencing a location (A.7).
+
+            Options almost never carry `cardId` (measured 0.01% of the corpus),
+            so card identity has to come from the state.  Leaves the entry at
+            PAD when `card_id_at` reports the card is hidden -- deck slots and
+            face-down prizes must stay PAD or we leak.
+            """
+            if state is None or area is None or idx is None:
+                return
+            raw = card_id_at(state, area, player_idx, idx)
+            if raw is not None:
+                opt_card_id[new_j] = _remap_card(raw, id_to_index)
+
         # Resolve per option type (A.7)
         if otype == 7:  # PLAY
+            # Bare `index` into the actor's hand -- no area/playerIndex given.
             src = _ref(2, your_index, opt.get("index", -1))
             opt_src_idx[new_j] = src if src != -1 else -1
+            _set_card(2, your_index, opt.get("index"))
 
         elif otype == 8:  # ATTACH
             area = opt.get("area")
             index = opt.get("index")
             if area is not None and index is not None:
                 opt_src_idx[new_j] = _ref(area, your_index, index)
+                _set_card(area, your_index, index)
+            elif index is not None:
+                # Bare `index` is the actor's hand (the card being attached).
+                _set_card(2, your_index, index)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
@@ -563,6 +595,10 @@ def _build_option_tokens(
             index = opt.get("index")
             if area is not None and index is not None:
                 opt_src_idx[new_j] = _ref(area, your_index, index)
+                _set_card(area, your_index, index)
+            elif index is not None:
+                # Bare `index` is the actor's hand (the evolution card).
+                _set_card(2, your_index, index)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
@@ -574,6 +610,11 @@ def _build_option_tokens(
             index = opt.get("index")
             if area is not None and player_idx is not None and index is not None:
                 opt_src_idx[new_j] = _ref(area, player_idx, index)
+                _set_card(area, player_idx, index)
+            elif area is not None and index is not None:
+                # ABILITY often omits playerIndex -- it is the actor's own board.
+                opt_src_idx[new_j] = _ref(area, your_index, index)
+                _set_card(area, your_index, index)
 
         elif otype == 12:  # RETREAT
             opt_src_idx[new_j] = 1  # my active (row 1)
@@ -595,10 +636,14 @@ def _build_option_tokens(
             index = opt.get("index")
             if area is not None and index is not None:
                 opt_src_idx[new_j] = _ref(area, player_idx, index)
-            # Always set card_id for disambiguation (A.7)
+            # Always set card_id for disambiguation (A.7).  `cardId` is present
+            # on ~0% of real options, so the location dereference does the work;
+            # it stays PAD for deck slots and face-down prizes.
             cid = opt.get("cardId")
             if cid is not None:
                 opt_card_id[new_j] = _remap_card(cid, id_to_index)
+            else:
+                _set_card(area, player_idx, index)
 
         elif otype in (4, 5, 6):  # TOOL_CARD, ENERGY_CARD, ENERGY
             area = opt.get("area")
@@ -610,6 +655,8 @@ def _build_option_tokens(
             cid = opt.get("cardId")
             if cid is not None:
                 opt_card_id[new_j] = _remap_card(cid, id_to_index)
+            else:
+                _set_card(area, player_idx, index)
 
         elif otype in (1, 2, 14, 15, 16):  # YES, NO, END, SKILL, SPECIAL_CONDITION
             # src = -1, tgt = -1 (constant-type options)
@@ -837,7 +884,8 @@ def featurize(
         index_remap,
         stop_column,
     ) = _build_option_tokens(
-        select, ref_map, your_index, id_to_index, attack_id_to_index, action
+        select, ref_map, your_index, id_to_index, attack_id_to_index, action,
+        state=state,
     )
 
     # --- Labels ---

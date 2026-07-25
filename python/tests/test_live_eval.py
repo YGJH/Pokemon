@@ -19,7 +19,34 @@ _ENGINE_DIR = (
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
-from ptcg_il.live_eval import _count_oov_opponent_cards, wilson_interval
+import inspect
+import pickle
+from concurrent.futures import ProcessPoolExecutor
+
+import torch
+
+from ptcg_il.live_eval import (
+    PolicyAgent,
+    _count_oov_opponent_cards,
+    make_agent_from_policy,
+    random_agent,
+    search_planner_agent,
+    wilson_interval,
+)
+
+
+def _call_deck_step(agent):
+    """Invoke an agent in a worker process (must be module-level to be picklable)."""
+    return agent({"select": None})
+
+
+class _TinyPolicy(torch.nn.Module):
+    """Stand-in for Policy. Module-level for the same reason PolicyAgent is a class:
+    a class defined inside a function is a local object and will not pickle."""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(4, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -185,3 +212,68 @@ class TestWilsonInterval:
         center, lo, hi = wilson_interval(250, 500)
         assert 0.45 < center < 0.55
         assert lo < center < hi
+
+
+class TestAgentsArePicklable:
+    """Every agent must survive pickling.
+
+    `eval_vs_opponent` dispatches each game to a ProcessPoolExecutor, so agents
+    travel to the worker as pickled job arguments.  When `make_agent_from_policy`
+    returned a closure, *every* game died with
+
+        Can't pickle local object 'make_agent_from_policy.<locals>.agent'
+
+    and — because the failure was caught and logged per game rather than raised —
+    live eval reported a completed run with zero games played.  These tests exist
+    so that regression cannot be silent again.
+    """
+
+    @staticmethod
+    def _tiny_policy():
+        return _TinyPolicy()
+
+    @staticmethod
+    def _vocab():
+        return {"id_to_index": {"7": 2, "1152": 3}, "attack_id_to_index": {"1": 2}}
+
+    def test_policy_agent_pickles(self):
+        agent = make_agent_from_policy(
+            self._tiny_policy(), self._vocab(), list(range(60)))
+        restored = pickle.loads(pickle.dumps(agent))
+        assert isinstance(restored, PolicyAgent)
+
+    def test_factory_returns_picklable_not_closure(self):
+        """The factory must not hand back a local function."""
+        agent = make_agent_from_policy(
+            self._tiny_policy(), self._vocab(), list(range(60)))
+        assert not inspect.isfunction(agent), (
+            "make_agent_from_policy returned a plain function; if it is a closure "
+            "every live-eval game will fail to pickle")
+        assert callable(agent)
+
+    def test_baseline_agents_pickle(self):
+        """The top-level baseline agents must stay top-level."""
+        for fn in (random_agent, search_planner_agent):
+            assert pickle.loads(pickle.dumps(fn)) is fn
+
+    def test_unpickled_agent_is_eval_mode_and_usable(self):
+        """A worker-side agent must be in eval mode and answer the deck step."""
+        deck = list(range(60))
+        agent = make_agent_from_policy(self._tiny_policy(), self._vocab(), deck)
+        restored = pickle.loads(pickle.dumps(agent))
+
+        assert restored.policy.training is False
+        # select is None -> the deck-submission step, which needs no forward pass.
+        assert restored({"select": None}) == deck
+
+    def test_pickles_through_a_real_process_pool(self):
+        """End-to-end: the agent survives a genuine ProcessPoolExecutor dispatch.
+
+        A direct `pickle.dumps` round trip can pass while spawn-based dispatch
+        fails, so exercise the mechanism live eval actually uses.
+        """
+        agent = make_agent_from_policy(
+            self._tiny_policy(), self._vocab(), list(range(60)))
+        with ProcessPoolExecutor(max_workers=1) as ex:
+            got = ex.submit(_call_deck_step, agent).result()
+        assert got == list(range(60))

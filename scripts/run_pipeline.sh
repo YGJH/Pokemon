@@ -31,6 +31,14 @@ G_MIN=50
 JACCARD_THRESH=0.90
 BATCH_SIZE=1024
 EPOCHS=10
+# 每个牌组训练一个专家模型（archetype specialist）。
+# 六个 D_self 原型近乎互斥（pairwise multiset-Jaccard <= 0.17，没有任何一张卡同时
+# 出现在全部六个里），单一通才模型必须同时拟合数个互不相干的策略，因此
+# --archetype-self 的非平凡 top-1 提升是通才的 3~10 倍（arch 0: +2.7 -> +20.5；
+# arch 2: +8.8 -> +49.4）。详见 CLAUDE.md「Key design decisions」。
+# 每个原型输出到 ${CHECKPOINT_DIR}_a<id>/，各自带 decks.json / deck.csv 标签。
+# 设为空字符串（或传 --generalist）则退回旧行为：只训练一个通才模型。
+ARCHETYPES="0 2"
 # echo $1
 # ── 解析参数 ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -74,6 +82,12 @@ while [[ $# -gt 0 ]]; do
         --resume)
             RESUME_CKPT="--resume $2"; shift 2
             ;;
+        --archetypes)
+            ARCHETYPES="$2"; shift 2
+            ;;
+        --generalist)
+            ARCHETYPES=""; shift
+            ;;
         --help|-h)
             echo "用法: $0 [选项]"
             echo ""
@@ -95,6 +109,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch-size N         训练 batch size (默认: 2048)"
             echo "  --epochs N             训练 epoch 数 (默认: 10)"
             echo "  --resume PATH          从指定 checkpoint 恢复训练"
+            echo "  --archetypes \"0 2\"     为这些 archetype 各训练一个专家模型"
+            echo "                         (默认: \"0 2\"，输出到 ${CHECKPOINT_DIR}_a<id>/)"
+            echo "  --generalist           只训练单一通才模型 (旧行为，准确率明显较差)"
             echo "  --help, -h             显示此帮助"
             exit 0
             ;;
@@ -255,26 +272,58 @@ if ! uv run python -c "import torch" >/dev/null 2>&1; then
     exit 1
 fi
 
-TRAIN_CMD="uv run python -m ptcg_il.cli train \
+build_train_cmd() {
+    # $1 = 输出目录; $2 = archetype id（空字符串代表通才模型）
+    local out_dir="$1" arch="$2"
+    local cmd="uv run python -m ptcg_il.cli train \
     --data-dir $DATA_DIR \
-    --out-dir $CHECKPOINT_DIR \
+    --out-dir $out_dir \
     --batch-size $BATCH_SIZE \
     --epochs $EPOCHS"
+    if [[ -n "$arch" ]]; then
+        cmd="$cmd --archetype-self $arch"
+    fi
+    if [[ -n "${RESUME_CKPT:-}" ]]; then
+        cmd="$cmd $RESUME_CKPT"
+    fi
+    printf '%s' "$cmd"
+}
 
-if [[ -n "${RESUME_CKPT:-}" ]]; then
-    TRAIN_CMD="$TRAIN_CMD $RESUME_CKPT"
+# 收集要训练的 (输出目录, archetype) 组合
+TRAIN_TARGETS=()
+if [[ -z "${ARCHETYPES// /}" ]]; then
+    TRAIN_TARGETS+=("$CHECKPOINT_DIR|")
+else
+    for arch in $ARCHETYPES; do
+        TRAIN_TARGETS+=("${CHECKPOINT_DIR}_a${arch}|${arch}")
+    done
 fi
 
-echo "\$ $TRAIN_CMD"
-echo ""
-eval "$TRAIN_CMD"
+TRAINED_DIRS=()
+for target in "${TRAIN_TARGETS[@]}"; do
+    out_dir="${target%%|*}"
+    arch="${target##*|}"
+    TRAIN_CMD="$(build_train_cmd "$out_dir" "$arch")"
+
+    echo ""
+    if [[ -n "$arch" ]]; then
+        echo "--- 训练 archetype $arch 专家模型 -> $out_dir ---"
+    else
+        echo "--- 训练通才模型 -> $out_dir ---"
+    fi
+    echo "\$ $TRAIN_CMD"
+    echo ""
+    eval "$TRAIN_CMD"
+    TRAINED_DIRS+=("$out_dir")
+done
 
 echo ""
 echo "============================================"
 echo " 管线完成！"
 echo "============================================"
-echo "最佳模型: $CHECKPOINT_DIR/ckpt-best.pt"
-echo "训练产出: $CHECKPOINT_DIR/"
+for d in "${TRAINED_DIRS[@]}"; do
+    echo "最佳模型: $d/ckpt-best.pt   (牌组标签: $d/decks.json)"
+done
 echo "语料产物: $DATA_DIR/"
 echo ""
 echo "下一步 (需先 cd $PY_DIR):"

@@ -35,7 +35,7 @@ from ptcg_il.featurizer import (
     TURN_N,
     featurize,
 )
-from ptcg_il.ref_map import build_ref_map
+from ptcg_il.ref_map import build_ref_map, card_id_at
 
 # ---------------------------------------------------------------------------
 # Test fixtures
@@ -1122,6 +1122,247 @@ class TestRefMap:
 
         # No stadium in this step
         assert (7, -1, 0) not in rf
+
+
+# ---------------------------------------------------------------------------
+# Step: card_id_at location dereference
+# ---------------------------------------------------------------------------
+
+
+class TestCardIdAt:
+    """Test card_id_at resolves visible zones and refuses hidden ones."""
+
+    def test_hand_resolves(self):
+        """Area 2 index i returns the id of hand[i]."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        hand = state["players"][me]["hand"]
+        assert len(hand) > 0, "fixture must have a non-empty hand"
+        for i, card in enumerate(hand):
+            assert card_id_at(state, 2, me, i) == card["id"]
+
+    def test_active_resolves(self):
+        """Area 4 index 0 returns the active Pokemon's id."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        active = state["players"][me]["active"][0]
+        assert active is not None, "fixture must have a face-up active"
+        assert card_id_at(state, 4, me, 0) == active["id"]
+
+    def test_bench_resolves(self):
+        """Area 5 index i returns the id of bench[i]."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        for i, card in enumerate(state["players"][me]["bench"]):
+            if card is not None:
+                assert card_id_at(state, 5, me, i) == card["id"]
+
+    def test_discard_resolves(self):
+        """Area 3 index i returns the id of discard[i]."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        for i, card in enumerate(state["players"][me]["discard"]):
+            if card is not None:
+                assert card_id_at(state, 3, me, i) == card["id"]
+
+    def test_deck_never_resolves(self):
+        """Area 1 is the deck -- hidden by design, always None.
+
+        Returning an id here would leak the deck order to the policy.
+        """
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+
+        for i in range(60):
+            assert card_id_at(state, 1, state["yourIndex"], i) is None
+
+    def test_face_down_prize_returns_none(self):
+        """Area 6 slots that are None stay None -- face-down prizes are hidden."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        prize = state["players"][me]["prize"]
+        assert any(p is None for p in prize), "fixture must have a face-down prize"
+        for i, card in enumerate(prize):
+            got = card_id_at(state, 6, me, i)
+            if card is None:
+                assert got is None
+            else:
+                assert got == card["id"]
+
+    def test_out_of_range_returns_none(self):
+        """Indices past the end of a container return None, not an exception."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+        me = state["yourIndex"]
+
+        assert card_id_at(state, 2, me, 999) is None
+        assert card_id_at(state, 5, me, 999) is None
+        assert card_id_at(state, 2, me, -1) is None
+
+    def test_bad_args_return_none(self):
+        """Non-integer area/index and unknown areas return None."""
+        ep = _load_episode()
+        obs, _ = _get_active_step(ep, 8, 0)
+        state = obs["current"]
+
+        assert card_id_at(state, None, 0, 0) is None
+        assert card_id_at(state, 2, 0, None) is None
+        assert card_id_at(state, 99, 0, 0) is None
+        assert card_id_at(state, 2, 99, 0) is None
+
+
+# ---------------------------------------------------------------------------
+# Step: opt_card_id population (A.7 dereference)
+# ---------------------------------------------------------------------------
+
+
+class TestOptCardId:
+    """Test that options carry the identity of the card they reference.
+
+    Options almost never ship a `cardId` field, so `opt_card_id` is populated by
+    dereferencing `(area, playerIndex, index)` against the state.  Two things
+    must hold: visible references resolve, and hidden ones stay PAD.
+    """
+
+    def test_hand_referencing_options_populated(self):
+        """PLAY options that point into the hand get a real card id.
+
+        Type 7 carries a bare `index` with no `area`, which implicitly means the
+        acting player's hand -- the case that used to leave every option at PAD.
+        """
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+
+        n_checked = 0
+        for step_i in range(len(ep["steps"])):
+            for player_i in (0, 1):
+                try:
+                    obs, _ = _get_active_step(ep, step_i, player_i)
+                except (AssertionError, KeyError, IndexError, TypeError):
+                    continue
+                if obs is None or not (obs.get("select") or {}).get("option"):
+                    continue
+                state = obs["current"]
+                me = state["yourIndex"]
+                out = featurize(obs, vocab)
+                for j, opt in enumerate(obs["select"]["option"]):
+                    if j >= O_MAX or not out["opt_mask"][j]:
+                        continue
+                    if not isinstance(opt, dict) or int(opt["type"]) != 7:
+                        continue
+                    area, idx = opt.get("area"), opt.get("index")
+                    if area is not None or idx is None:
+                        continue
+                    raw = card_id_at(state, 2, me, idx)
+                    if raw is None:
+                        continue
+                    assert out["opt_card_id"][j] == _remap(raw, vocab["id_to_index"])
+                    assert out["opt_card_id"][j] != PAD_CARD
+                    n_checked += 1
+
+        assert n_checked > 0, "fixture offered no hand-referencing PLAY option"
+
+    def test_no_hidden_card_ids(self):
+        """Deck refs and face-down prize refs must stay PAD (information leak).
+
+        Writing an id for a card the live agent cannot see inflates offline
+        metrics and collapses at live-eval.
+        """
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+
+        n_hidden_seen = 0
+        for step_i in range(len(ep["steps"])):
+            for player_i in (0, 1):
+                try:
+                    obs, _ = _get_active_step(ep, step_i, player_i)
+                except (AssertionError, KeyError, IndexError, TypeError):
+                    continue
+                if obs is None or not (obs.get("select") or {}).get("option"):
+                    continue
+                state = obs["current"]
+                out = featurize(obs, vocab)
+                for j, opt in enumerate(obs["select"]["option"]):
+                    if j >= O_MAX or not out["opt_mask"][j]:
+                        continue
+                    if not isinstance(opt, dict):
+                        continue
+                    area, idx = opt.get("area"), opt.get("index")
+                    if area is None:
+                        continue
+                    if int(area) == 1:
+                        assert out["opt_card_id"][j] == PAD_CARD, (
+                            f"deck ref leaked at step {step_i} option {j}")
+                        n_hidden_seen += 1
+                    elif int(area) == 6 and idx is not None:
+                        pi = opt.get("playerIndex", state["yourIndex"])
+                        try:
+                            slot = state["players"][int(pi)]["prize"][int(idx)]
+                        except (KeyError, IndexError, TypeError, ValueError):
+                            continue
+                        if slot is None:
+                            assert out["opt_card_id"][j] == PAD_CARD, (
+                                f"face-down prize leaked at step {step_i} option {j}")
+                            n_hidden_seen += 1
+
+        assert n_hidden_seen > 0, "fixture contained no hidden-zone reference to check"
+
+    def test_populated_ids_match_their_location(self):
+        """Every non-PAD opt_card_id equals the vocab index of the card there."""
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+        id_to_index = vocab["id_to_index"]
+
+        n_populated = 0
+        for step_i in range(len(ep["steps"])):
+            for player_i in (0, 1):
+                try:
+                    obs, _ = _get_active_step(ep, step_i, player_i)
+                except (AssertionError, KeyError, IndexError, TypeError):
+                    continue
+                if obs is None or not (obs.get("select") or {}).get("option"):
+                    continue
+                state = obs["current"]
+                me = state["yourIndex"]
+                out = featurize(obs, vocab)
+                for j, opt in enumerate(obs["select"]["option"]):
+                    if j >= O_MAX or not out["opt_mask"][j]:
+                        continue
+                    if not isinstance(opt, dict) or opt.get("cardId") is not None:
+                        continue
+                    v = int(out["opt_card_id"][j])
+                    if v == PAD_CARD:
+                        continue
+                    n_populated += 1
+                    area, idx = opt.get("area"), opt.get("index")
+                    if area is None and idx is not None:
+                        raw = card_id_at(state, 2, me, idx)
+                    elif area is not None and idx is not None:
+                        raw = card_id_at(
+                            state, area, opt.get("playerIndex", me), idx)
+                    else:
+                        raw = None
+                    if raw is not None:
+                        assert v == _remap(raw, id_to_index)
+
+        assert n_populated > 0, "fixture produced no populated opt_card_id at all"
 
 
 # ---------------------------------------------------------------------------

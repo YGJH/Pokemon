@@ -77,6 +77,96 @@ def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float, f
 # ============================================================
 
 
+class PolicyAgent:
+    """Greedy-policy ``agent(obs_dict)`` callable (Section 6).
+
+    Deliberately a class with ``__call__`` rather than a closure.  ``eval_vs_opponent``
+    dispatches each game to a ``ProcessPoolExecutor``, and **every job argument is
+    pickled**.  A local function is not picklable, so returning a closure here made
+    every live-eval game die with::
+
+        Can't pickle local object 'make_agent_from_policy.<locals>.agent'
+
+    Behaviour:
+    1. If ``obs["select"] is None``, return ``FIXED_DECK`` (the deck-submission step).
+    2. Otherwise featurize, run the forward pass, and return the chosen option index
+       (or indices, for multi-select).
+
+    Parameters
+    ----------
+    policy : Policy (nn.Module)
+        EMA-averaged policy.  Moved to ``device`` and put in eval mode here.
+    vocab : dict
+        Vocab dict with ``id_to_index`` and ``attack_id_to_index``.
+    fixed_deck : list[int]
+        The FIXED_DECK (60 card ids).
+    device : str
+        Torch device string (default ``"cpu"`` for live eval — each game runs in its
+        own process, so GPU contention is avoided).
+    """
+
+    def __init__(
+        self,
+        policy: Any,
+        vocab: dict,
+        fixed_deck: list[int],
+        *,
+        device: str = "cpu",
+    ) -> None:
+        from ptcg_il.featurizer import normalize_vocab
+
+        # normalize_vocab is required: vocab.json keys are strings, engine card ids
+        # are ints, so the raw dict silently maps every card to UNKNOWN_CARD.
+        self.vocab_full = normalize_vocab(vocab)
+        self.fixed_deck = list(fixed_deck)
+        self.device = device
+
+        policy.eval()
+        policy.to(device)
+        self.policy = policy
+
+    def __call__(self, obs_dict: dict) -> list[int]:
+        import torch
+        from ptcg_il.featurizer import featurize
+        from ptcg_il.model.policy import select_multi
+
+        select = obs_dict.get("select")
+        if select is None:
+            return list(self.fixed_deck)
+
+        # Featurize (action=None handled natively for inference mode)
+        sample = featurize(
+            obs_dict, self.vocab_full, value_target=0.0, sample_weight=1.0)
+
+        # Build batch of size 1
+        batch = _sample_to_batch(sample, self.device)
+        max_count = int(sample["maxCount"])
+
+        with torch.no_grad():
+            if max_count == 1:
+                logits, _value, _hist = self.policy(batch)
+                logits = logits.masked_fill(~batch["opt_mask"], -1e9)
+                chosen = int(logits.argmax(dim=-1)[0].item())
+                return [chosen]
+            else:
+                chosen = select_multi(self.policy, batch)  # [1, batch_max]
+                picks = chosen[0].tolist()
+                # Filter STOP (-2) and padding (-1); keep only regular picks
+                picks = [int(p) for p in picks if p >= 0]
+                picks = picks[:max_count]
+                return picks
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore in a worker process: re-assert eval mode and device.
+
+        ``nn.Module.__reduce__`` preserves parameters but a worker must not inherit
+        the parent's autograd/training state assumptions.
+        """
+        self.__dict__.update(state)
+        self.policy.eval()
+        self.policy.to(self.device)
+
+
 def make_agent_from_policy(
     policy: Any,
     vocab: dict,
@@ -84,66 +174,11 @@ def make_agent_from_policy(
     *,
     device: str = "cpu",
 ) -> Callable[[dict], list[int]]:
-    """Wrap an EMA Policy as an ``agent(obs_dict)`` callable (Section 6).
+    """Wrap an EMA Policy as a picklable ``agent(obs_dict)`` callable.
 
-    The returned function:
-    1. If ``obs["select"] is None``, returns ``FIXED_DECK``.
-    2. Otherwise, featurizes the observation, runs the policy forward pass,
-       and returns the chosen option index (or indices for multi-select).
-
-    Parameters
-    ----------
-    policy : Policy (nn.Module)
-        EMA-averaged policy, already on the target device and in eval mode.
-    vocab : dict
-        Vocab dict with ``id_to_index`` and ``attack_id_to_index``.
-    fixed_deck : list[int]
-        The FIXED_DECK (60 card ids).
-    device : str
-        Torch device string (default ``"cpu"`` for live eval — each game runs
-        in its own process, so GPU contention is avoided).
-
-    Returns
-    -------
-    callable
-        ``agent(obs_dict) -> list[int]``.
+    Thin factory kept for API compatibility; see :class:`PolicyAgent`.
     """
-    import torch
-    from ptcg_il.featurizer import featurize, normalize_vocab
-    from ptcg_il.model.policy import select_multi
-
-    vocab_full = normalize_vocab(vocab)
-
-    policy.eval()
-    policy.to(device)
-
-    def agent(obs_dict: dict) -> list[int]:
-        select = obs_dict.get("select")
-        if select is None:
-            return list(fixed_deck)
-
-        # Featurize (action=None handled natively for inference mode)
-        sample = featurize(obs_dict, vocab_full, value_target=0.0, sample_weight=1.0)
-
-        # Build batch of size 1
-        batch = _sample_to_batch(sample, device)
-        max_count = int(sample["maxCount"])
-
-        with torch.no_grad():
-            if max_count == 1:
-                logits, _value, _hist = policy(batch)
-                logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-                chosen = int(logits.argmax(dim=-1)[0].item())
-                return [chosen]
-            else:
-                chosen = select_multi(policy, batch)  # [1, batch_max]
-                picks = chosen[0].tolist()
-                # Filter STOP (-2) and padding (-1); keep only regular picks
-                picks = [int(p) for p in picks if p >= 0]
-                picks = picks[:max_count]
-                return picks
-
-    return agent
+    return PolicyAgent(policy, vocab, fixed_deck, device=device)
 
 
 def _sample_to_batch(sample: dict[str, np.ndarray], device: str) -> dict:
