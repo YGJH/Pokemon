@@ -32,6 +32,11 @@ use mcts::MctsConfig;
 ///   empty array `[]` to fall back to mirror).
 /// * `iterations` — MCTS iteration budget (e.g. 300).
 /// * `seed` — Random seed for reproducibility.
+/// * `host_initialized` — Non-zero if the calling process has **already** called
+///   `GameInitialize` on this libcg.so (every Python caller has, via `cg.sim`'s
+///   import).  Getting this wrong is fatal, not recoverable: a second
+///   `GameInitialize` throws a C++ exception across the FFI boundary and aborts
+///   the process.  See [`Engine::load`].
 ///
 /// # Returns
 ///
@@ -54,9 +59,18 @@ pub unsafe extern "C" fn search_plan(
     opp_deck_json: *const c_char,
     iterations: c_int,
     seed: c_int,
+    host_initialized: c_int,
 ) -> *mut c_char {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        search_plan_impl(obs_json, lib_path, fixed_deck_json, opp_deck_json, iterations, seed)
+        search_plan_impl(
+            obs_json,
+            lib_path,
+            fixed_deck_json,
+            opp_deck_json,
+            iterations,
+            seed,
+            host_initialized,
+        )
     }));
 
     match result {
@@ -77,6 +91,7 @@ fn search_plan_impl(
     opp_deck_json: *const c_char,
     iterations: c_int,
     seed: c_int,
+    host_initialized: c_int,
 ) -> String {
     let obs_str = unsafe { cstr_to_str(obs_json) };
     let lib_str = unsafe { cstr_to_str(lib_path) };
@@ -107,8 +122,9 @@ fn search_plan_impl(
         .to_string();
     }
 
-    // Load engine
-    let engine = match unsafe { Engine::load(&lib_str) } {
+    // Load engine.  Only call GameInitialize if the host has not already done so —
+    // a second call aborts the process (see Engine::load).
+    let engine = match unsafe { Engine::load(&lib_str, host_initialized == 0) } {
         Ok(e) => e,
         Err(e) => return error_json(&format!("Engine::load: {e}")),
     };

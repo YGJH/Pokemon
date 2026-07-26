@@ -126,3 +126,7 @@ Two test directories:
 - `python/tests/` — comprehensive tests covering both `ptcg_mine` and `ptcg_il` (model components, featurizer, training loop, QA, live eval)
 
 `pyproject.toml` sets `pythonpath = ["."]` so both packages are importable without installing.
+
+## Working style
+
+- Don't explain too much at the end of a task, unless necessary.

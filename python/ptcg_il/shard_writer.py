@@ -18,7 +18,13 @@ from typing import Iterator
 import numpy as np
 import pandas as pd
 
-from ptcg_il.featurizer import featurize
+from ptcg_il.belief_labels import (
+    build_belief_labels,
+    empty_belief_labels,
+    hand_after,
+    opp_hand_timeline,
+)
+from ptcg_il.featurizer import featurize, normalize_vocab
 from ptcg_mine.archetype import Archetype, assign_archetype
 from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import (
@@ -370,6 +376,12 @@ def build_shards(
     self_id_set = set(self_ids)
     opp_id_set = set(opp_ids)
 
+    # Archetype ids in archetypes.json are global cluster indices (0..157 on the
+    # current corpus) but only a handful are retained as 𝒟_opp.  The belief head
+    # classifies over the retained set, so map global id -> contiguous index
+    # here; unmapped opponents get -1, which the loss ignores.
+    opp_arch_to_contig = {gid: i for i, gid in enumerate(opp_ids)}
+
     # Compute experts if not provided
     if experts is None:
         raw_eps = [ep for _, ep in ep_list]
@@ -438,6 +450,16 @@ def build_shards(
 
         split = _split_of(eid)
 
+        # Belief supervision, gathered once per (episode, player):
+        #   - the opponent's exact decklist is their step-0 action, constant all game
+        #   - their hand is read off their own ACTIVE steps
+        try:
+            opp_deck = deck_of(ep, 1 - p)
+        except (KeyError, IndexError, ValueError):
+            opp_deck = None
+        opp_hands = opp_hand_timeline(ep, 1 - p) if opp_deck is not None else []
+        opp_arch_contig = opp_arch_to_contig.get(opp_arch, -1)
+
         for step_i, obs, action in _active_decisions(ep, p):
             # Deck-selection steps are skipped (featurizer raises ValueError)
             if obs.get("select") is None:
@@ -448,6 +470,25 @@ def build_shards(
             except (ValueError, TypeError, KeyError) as exc:
                 logger.debug("Skipping sample %s/%d/%d: %s", eid, p, step_i, exc)
                 continue
+
+            # Belief labels are always written, valid or not — see
+            # empty_belief_labels() for why the key set has to be uniform.
+            state = obs.get("current") or {}
+            your_index = state.get("yourIndex")
+            if opp_deck is not None and your_index is not None:
+                sample.update(
+                    build_belief_labels(
+                        state=state,
+                        your_index=int(your_index),
+                        opp_deck=opp_deck,
+                        id_to_index=vocab["id_to_index"],
+                        vocab_size=vocab["size"],
+                        opp_arch_index=opp_arch_contig,
+                        opp_hand_ids=hand_after(opp_hands, step_i),
+                    )
+                )
+            else:
+                sample.update(empty_belief_labels())
 
             # sample_weight is NOT written into shards (spec D.4);
             # it is derived from meta.parquet columns at training time (C.3).

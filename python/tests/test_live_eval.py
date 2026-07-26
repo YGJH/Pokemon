@@ -19,12 +19,14 @@ _ENGINE_DIR = (
 if str(_ENGINE_DIR) not in sys.path:
     sys.path.insert(0, str(_ENGINE_DIR))
 
+import ctypes
 import inspect
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 
 import torch
 
+from ptcg_il import live_eval
 from ptcg_il.live_eval import (
     PolicyAgent,
     _count_oov_opponent_cards,
@@ -212,6 +214,109 @@ class TestWilsonInterval:
         center, lo, hi = wilson_interval(250, 500)
         assert 0.45 < center < 0.55
         assert lo < center < hi
+
+
+class TestYourIndexResolution:
+    """``yourIndex`` lives on ``obs["current"]``, never at the top level.
+
+    Reading it from the top level yielded 0 for every decision, so ``_run_one_game``
+    gave every turn to ``agent0`` and the opponent never played — measured over a
+    real game: 0/103 decisions had a top-level ``yourIndex`` while
+    ``current.yourIndex`` alternated 55/48.  A win rate measured that way is one
+    agent playing itself, and nothing about it looks wrong from the outside.
+    """
+
+    def test_reads_from_current(self):
+        assert live_eval._your_index({"current": {"yourIndex": 1}}) == 1
+        assert live_eval._your_index({"current": {"yourIndex": 0}}) == 0
+
+    def test_current_wins_over_absent_top_level(self):
+        """The real engine shape: current.yourIndex set, no top-level key."""
+        obs = {"current": {"yourIndex": 1, "result": -1}, "select": {"option": []}}
+        assert live_eval._your_index(obs) == 1, (
+            "returned 0 for a player-1 turn; agent0 would play both sides")
+
+    def test_top_level_fallback(self):
+        assert live_eval._your_index({"yourIndex": 1}) == 1
+
+    def test_defaults_to_zero_when_absent(self):
+        assert live_eval._your_index({}) == 0
+        assert live_eval._your_index({"current": {}}) == 0
+
+    def test_dispatch_alternates_between_agents(self):
+        """Both seats must get turns when current.yourIndex alternates."""
+        seen = []
+        for yi in (0, 1, 0, 1, 1):
+            seen.append(live_eval._your_index({"current": {"yourIndex": yi}}))
+        assert set(seen) == {0, 1}, (
+            "dispatch never selects player 1; the opponent agent would never act")
+
+
+class TestRustSearchPlannerFfiContract:
+    """The Rust ``search_plan`` FFI contract has two process-fatal footguns.
+
+    Neither one raises a catchable Python exception — both kill the process — so
+    they cannot be covered by a "does it work" test.  These tests pin the two
+    declarations that keep them from coming back.
+    """
+
+    @staticmethod
+    def _load_or_skip():
+        lib = live_eval._load_rust_search_lib()
+        if lib is None:
+            pytest.skip("libptcg_search.so not built")
+        return lib
+
+    def test_host_initialized_arg_is_declared(self):
+        """search_plan must take the trailing host_initialized flag.
+
+        libcg.so registers into a fixed-capacity global table; a second
+        ``GameInitialize()`` throws C++ ``std::runtime_error("buffer full.
+        capacity:7")``.  Rust cannot catch a foreign exception, so the worker dies
+        with SIGABRT and every game in it is lost.  Python callers have already
+        initialized the engine via ``cg.sim``'s import and must pass 1.
+        """
+        lib = self._load_or_skip()
+        assert len(lib.search_plan.argtypes) == 7, (
+            "search_plan lost its host_initialized argument; Rust will call "
+            "GameInitialize() a second time and abort the process")
+        assert lib.search_plan.argtypes[-1] is ctypes.c_int
+
+    def test_return_pointer_is_not_c_char_p(self):
+        """restype must keep the raw address so the right pointer can be freed.
+
+        With ``restype=c_char_p`` ctypes copies the string into Python bytes and
+        discards the pointer; passing that back to ``search_plan_free`` hands
+        ``CString::from_raw`` a pointer into Python's heap and glibc aborts with
+        "munmap_chunk(): invalid pointer".
+        """
+        lib = self._load_or_skip()
+        assert lib.search_plan.restype is not ctypes.c_char_p, (
+            "restype=c_char_p loses the Rust pointer; freeing it corrupts the heap")
+        assert lib.search_plan.restype is ctypes.c_void_p
+        assert lib.search_plan_free.argtypes == [ctypes.c_void_p]
+
+
+class TestFixedDeckLookupIsCwdIndependent:
+    """The search planner's deck must resolve without depending on cwd.
+
+    The old lookup used a bare ``Path("data")``, so running the CLI from anywhere
+    but python/ silently substituted an illegal ``range(1, 61)`` deck and every
+    search_planner win rate became meaningless without any error.
+    """
+
+    def test_resolves_from_an_unrelated_cwd(self, tmp_path, monkeypatch):
+        data_dir = (Path(live_eval.__file__).resolve().parent.parent / "data")
+        if not (data_dir / "archetypes.json").exists():
+            pytest.skip("data/archetypes.json not present")
+
+        monkeypatch.delenv("PTCG_DATA_DIR", raising=False)
+        monkeypatch.chdir(tmp_path)  # nothing named data/ here
+        deck = live_eval._get_fixed_deck_for_search()
+
+        assert deck != list(range(1, 61)), (
+            "fell back to the illegal dummy deck; the lookup is still cwd-relative")
+        assert len(deck) == 60
 
 
 class TestAgentsArePicklable:

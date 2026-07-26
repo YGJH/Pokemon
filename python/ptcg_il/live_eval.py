@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing
 import os
 import sys
 import time
@@ -41,6 +42,27 @@ _ENGINE_DIR = (
     / "sample_submission"
     / "sample_submission"
 )
+
+
+def _your_index(obs: dict) -> int:
+    """Index of the player who must act in ``obs``.
+
+    The field lives on ``obs["current"]`` -- ``current`` *is* the ``State``
+    dataclass (cg.api), and ``yourIndex`` is one of its fields.  It is **never**
+    present at the top level of the observation dict.
+
+    Reading ``obs.get("yourIndex", 0)`` therefore silently returned 0 for every
+    decision, so ``_run_one_game`` handed every turn to ``agent0`` and the
+    opponent never acted -- measured: 0/103 decisions had a top-level
+    ``yourIndex`` while ``current.yourIndex`` alternated 55/48.  Every win rate
+    produced that way describes one agent playing itself.
+    """
+    cur = obs.get("current")
+    if isinstance(cur, dict) and cur.get("yourIndex") is not None:
+        return int(cur["yourIndex"])
+    # Fall back to the top level in case a future engine build moves it there.
+    top = obs.get("yourIndex")
+    return int(top) if top is not None else 0
 
 
 def _add_engine_path() -> str:
@@ -241,6 +263,43 @@ def search_planner_agent(obs_dict: dict) -> list[int]:
     return _search_planner_fallback_python(obs_dict)
 
 
+class SearchPlannerAgent:
+    """:func:`search_planner_agent` with a belief-driven opponent model.
+
+    The plain function leaves the Rust determinizer to assume the opponent
+    mirrors our own deck.  Given an
+    :class:`~ptcg_il.belief_infer.OpponentDeckOracle`, this variant predicts
+    their decklist from the current observation instead, so the worlds MCTS
+    searches are drawn from a deck the opponent might actually be playing.
+
+    A class rather than a closure because live eval hands agents to a process
+    pool: ``make_agent_from_policy``'s inner function could not be pickled, and
+    a bound ``__call__`` can.
+    """
+
+    def __init__(self, oracle: Any = None, iterations: int = 200, seed: int = 42):
+        self.oracle = oracle
+        self.iterations = iterations
+        self.seed = seed
+
+    def __call__(self, obs_dict: dict) -> list[int]:
+        select = obs_dict.get("select")
+        if select is None:
+            return _search_planner_deck()
+
+        opp_deck = None
+        if self.oracle is not None:
+            opp_deck = self.oracle.predict(obs_dict) or None
+
+        result = _call_rust_search_planner(
+            obs_dict, opp_deck=opp_deck,
+            iterations=self.iterations, seed=self.seed,
+        )
+        if result is not None:
+            return result
+        return _search_planner_fallback_python(obs_dict)
+
+
 # ── Rust-backed search planner ──────────────────────────────────────────────
 
 _rust_search_lib = None
@@ -290,10 +349,17 @@ def _load_rust_search_lib():
         ctypes.c_char_p,  # opp_deck_json
         ctypes.c_int,     # iterations
         ctypes.c_int,     # seed
+        ctypes.c_int,     # host_initialized
     ]
-    lib.search_plan.restype = ctypes.c_char_p
+    # c_void_p, NOT c_char_p.  With restype=c_char_p, ctypes eagerly copies the
+    # returned char* into a Python bytes object and throws the original pointer
+    # away.  Handing that bytes object back to search_plan_free() gives
+    # CString::from_raw a pointer into Python's own heap, and glibc aborts the
+    # process with "munmap_chunk(): invalid pointer".  c_void_p keeps the address
+    # as a plain int so we can both read it and hand the real pointer back.
+    lib.search_plan.restype = ctypes.c_void_p
 
-    lib.search_plan_free.argtypes = [ctypes.c_char_p]
+    lib.search_plan_free.argtypes = [ctypes.c_void_p]
     lib.search_plan_free.restype = None
 
     _rust_search_lib = lib
@@ -301,8 +367,17 @@ def _load_rust_search_lib():
     return lib
 
 
-def _call_rust_search_planner(obs_dict: dict) -> list[int] | None:
-    """Try to get an action from the Rust MCTS planner.  Returns None on failure."""
+def _call_rust_search_planner(
+    obs_dict: dict,
+    opp_deck: list[int] | None = None,
+    iterations: int = 200,
+    seed: int = 42,
+) -> list[int] | None:
+    """Try to get an action from the Rust MCTS planner.  Returns None on failure.
+
+    *opp_deck* is a 60-card opponent decklist for determinization; ``None`` (or
+    an empty list) leaves the Rust side on its mirror-deck fallback.
+    """
     lib = _load_rust_search_lib()
     if lib is None:
         return None
@@ -319,21 +394,28 @@ def _call_rust_search_planner(obs_dict: dict) -> list[int] | None:
     try:
         obs_json = json.dumps(obs_dict, default=str)
         fixed_deck_json = json.dumps(_get_fixed_deck_for_search())
-        opp_deck_json = json.dumps([])  # empty → mirror fallback in Rust
+        opp_deck_json = json.dumps(opp_deck or [])  # empty → mirror fallback in Rust
 
         raw = lib.search_plan(
             obs_json.encode("utf-8"),
             cg_lib_path.encode("utf-8"),
             fixed_deck_json.encode("utf-8"),
             opp_deck_json.encode("utf-8"),
-            200,  # iterations
-            42,   # seed
+            iterations,
+            seed,
+            # host_initialized=1: importing cg.sim already ran GameInitialize() in
+            # this process, and dlopen hands Rust back that same object.  A second
+            # GameInitialize() throws the C++ std::runtime_error
+            # "buffer full. capacity:7" across the FFI boundary, which Rust cannot
+            # catch -- the worker dies with SIGABRT and every game in it is lost.
+            1,
         )
 
-        if raw is None:
+        # `raw` is now an integer address (or None/0 for NULL) — see restype above.
+        if not raw:
             return None
 
-        result_str = ctypes.c_char_p(raw).value.decode("utf-8")
+        result_str = ctypes.cast(raw, ctypes.c_char_p).value.decode("utf-8")
         lib.search_plan_free(raw)
 
         result = json.loads(result_str)
@@ -513,16 +595,32 @@ def _get_fixed_deck_for_search() -> list[int]:
     import os
     from pathlib import Path
 
-    data_dir = Path(os.environ.get("PTCG_DATA_DIR", "data"))
-    arch_path = data_dir / "archetypes.json"
-    if arch_path.exists():
-        with open(arch_path) as f:
-            arch = json.load(f)
-        fd = arch.get("FIXED_DECK") or arch.get("fixed_deck")
-        if fd:
-            return fd
+    # "data" alone is cwd-relative, so invoking the CLI from anywhere but python/
+    # silently fell through to the dummy deck below -- an *illegal* 60-card list
+    # that makes every search_planner number meaningless without failing loudly.
+    # Try the package-relative location too, so cwd stops mattering.
+    candidates = []
+    env_dir = os.environ.get("PTCG_DATA_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.append(Path("data"))
+    candidates.append(Path(__file__).resolve().parent.parent / "data")
 
-    logger.warning("No FIXED_DECK found for search planner — using dummy range(60)")
+    for data_dir in candidates:
+        arch_path = data_dir / "archetypes.json"
+        if arch_path.exists():
+            with open(arch_path) as f:
+                arch = json.load(f)
+            fd = arch.get("FIXED_DECK") or arch.get("fixed_deck")
+            if fd:
+                return fd
+
+    logger.warning(
+        "No FIXED_DECK found for search planner (looked in %s) — using dummy "
+        "range(60), which is NOT a legal deck; search_planner results will be "
+        "meaningless",
+        ", ".join(str(c) for c in candidates),
+    )
     return list(range(1, 61))
 
 
@@ -629,7 +727,7 @@ def _run_one_game(args: tuple) -> dict[str, Any]:
                     "error": "battle_start returned None"}
 
         # Count OOV opponent cards in the initial observation
-        initial_yi = obs.get("yourIndex", 0)
+        initial_yi = _your_index(obs)
         oov, total = _count_oov_opponent_cards(obs, initial_yi, vocab_id_to_index)
         oov_count += oov
         total_opp_card_count += total
@@ -652,9 +750,10 @@ def _run_one_game(args: tuple) -> dict[str, Any]:
                     winner = -1  # draw (result == 2) or unknown
                 break
 
-            # Read yourIndex reliably from the observation dict — the engine
-            # always includes this field per the State dataclass (cg.api).
-            current_player = obs.get("yourIndex", 0)
+            # yourIndex lives on obs["current"], not at the top level — see
+            # _your_index().  Reading it from the top level made agent0 play both
+            # sides of every game.
+            current_player = _your_index(obs)
 
             agent = agent0 if current_player == 0 else agent1
 
@@ -692,7 +791,7 @@ def _run_one_game(args: tuple) -> dict[str, Any]:
             steps += 1
 
             # Count OOV opponent cards in the new observation
-            new_yi = obs.get("yourIndex", 0)
+            new_yi = _your_index(obs)
             oov, total = _count_oov_opponent_cards(obs, new_yi, vocab_id_to_index)
             oov_count += oov
             total_opp_card_count += total
@@ -826,7 +925,24 @@ class LiveEvaluator:
 
             jobs.append((decks[0], decks[1], agent0, agent1, game_seeds[i], our_player, i, self._vocab_id_to_index))
 
-        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+        # MUST be "spawn", not the Linux default "fork".
+        #
+        # By this point the parent has already run torch forward passes (offline
+        # eval, building the frozen opponent), so torch's OpenMP thread pool is
+        # initialised.  fork() copies the memory but not the threads, leaving the
+        # child holding locks whose owners no longer exist -- the first torch op in
+        # the worker then blocks on a futex forever, at 0% CPU, and the pool's own
+        # shutdown blocks behind it.  Measured: fork deadlocks, spawn runs 4 jobs
+        # in 0.6 s.
+        #
+        # spawn requires every job argument to be picklable, which is why the agents
+        # are classes rather than closures (see PolicyAgent).
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(
+            max_workers=self.n_workers,
+            mp_context=ctx,
+            initializer=_worker_init,
+        ) as executor:
             futures = {
                 executor.submit(_run_one_game_worker, job): job[6]
                 for job in jobs
@@ -912,14 +1028,22 @@ class LiveEvaluator:
             start = time.perf_counter()
             results = self.eval_vs_opponent(opp, name, n_games=n_games, seed=seed + i * 1000)
             elapsed = time.perf_counter() - start
-            logger.info(
-                "  %s: %.1f%% [%.1f–%.1f%%], %d games in %.1fs",
+            # Always report completed/requested and the failure count.  A win rate
+            # computed from a handful of surviving games is indistinguishable from a
+            # valid one unless the dead games are visible: a pickling bug once killed
+            # *every* game and the summary still printed a confident-looking "39.7%".
+            # Escalate to WARNING when anything died so it cannot be skimmed past.
+            log = logger.warning if results.errors else logger.info
+            log(
+                "  %s: %.1f%% [%.1f–%.1f%%], %d/%d games in %.1fs (%d failed)",
                 name,
                 results.win_rate_center * 100,
                 results.win_rate_lo * 100,
                 results.win_rate_hi * 100,
                 results.n_games,
+                n_games,
                 elapsed,
+                results.errors,
             )
             all_results[name] = results
         return all_results
@@ -944,6 +1068,22 @@ class LiveEvaluator:
 # ============================================================
 # Worker entry point (for pickle-based process pool)
 # ============================================================
+
+
+def _worker_init() -> None:
+    """Per-worker setup, run once when a spawned process starts.
+
+    Pins torch to a single thread.  Workers are already the unit of parallelism, so
+    letting each of N processes start its own OpenMP pool oversubscribes the machine
+    badly (16 workers x 8 threads on a 16-core box) and makes every worker slower
+    than if it were alone.
+    """
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except Exception:  # pragma: no cover - torch always present in practice
+        pass
 
 
 def _run_one_game_worker(args: tuple) -> dict[str, Any]:

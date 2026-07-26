@@ -7,6 +7,7 @@ time from meta columns via the C.3 formula.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterator
 
@@ -42,7 +43,16 @@ _FLOAT_KEYS = frozenset({
 # Boolean masks
 _BOOL_KEYS = frozenset({
     "tok_mask", "opt_mask", "discard_mask",
+    "bel_valid", "bel_hand_valid",
 })
+
+# Belief labels are stored sparsely in the shards (index/count pairs) because a
+# 60-card decklist touches at most 26 of ~300 vocab slots, so dense float32[V]
+# rows would be ~97% zeros and would dominate shard size.  They are densified
+# per sample here, on the way into the batch.
+_BELIEF_SPARSE = (("bel_deck", "bel_deck_idx", "bel_deck_cnt"),
+                  ("bel_hidden", "bel_hidden_idx", "bel_hidden_cnt"),
+                  ("bel_hand", "bel_hand_idx", "bel_hand_cnt"))
 
 
 def compute_sample_weights(
@@ -138,6 +148,22 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         self.split = split
         self.archetype_self = archetype_self
 
+        # Vocab size, needed to densify the sparse belief labels.  Read from the
+        # artifact rather than inferred from the shards: the sparse label rows
+        # only reference the cards a deck actually contains, so the largest index
+        # seen is a lower bound on V, not V.
+        self.vocab_size: int | None = None
+        vocab_path = data_dir / "vocab.json"
+        if vocab_path.exists():
+            from ptcg_il.featurizer import normalize_vocab
+
+            # normalize_vocab, not a raw ["size"]: hand-written vocab files
+            # (tests, older artifacts) carry only id_to_index, and a missing
+            # key here would break loading for every dataset, belief or not.
+            with open(vocab_path) as fh:
+                size = normalize_vocab(json.load(fh)).get("size")
+            self.vocab_size = int(size) if size else None
+
         # Load meta
         meta_path = data_dir / "meta.parquet"
         if not meta_path.exists():
@@ -227,7 +253,49 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
             float(row["sample_weight"]), dtype=torch.float32
         )
 
+        self._densify_belief(sample)
         return sample
+
+    def _densify_belief(self, sample: dict[str, torch.Tensor]) -> None:
+        """Sparse belief labels -> normalised distributions over the vocab.
+
+        Replaces each ``bel_*_idx``/``bel_*_cnt`` pair with a single
+        ``float32[V]`` row summing to 1 (or to 0 when the label is absent, which
+        the ``bel_*_valid`` masks flag).  Rows are *not* renormalised when empty
+        -- an all-zero row must stay all-zero, or a missing label would silently
+        become a uniform target.
+
+        Shards written before belief labels existed simply have no ``bel_*``
+        keys; those samples get zero-filled rows and ``bel_valid=False``, so an
+        old corpus trains exactly as it did before.
+        """
+        V = self.vocab_size
+        for dense_key, idx_key, cnt_key in _BELIEF_SPARSE:
+            # No vocab.json => no way to size the row.  Fall through to the
+            # zero-fill branch and mark the label invalid below, rather than
+            # emitting a length-1 row the belief head would reject.
+            if idx_key not in sample or V is None:
+                sample[dense_key] = torch.zeros(V or 1, dtype=torch.float32)
+                sample.pop(idx_key, None)
+                sample.pop(cnt_key, None)
+                continue
+            idx = sample.pop(idx_key).long().clamp_(0, V - 1)
+            cnt = sample.pop(cnt_key).float()
+            row = torch.zeros(V, dtype=torch.float32)
+            row.scatter_add_(0, idx, cnt)
+            row[0] = 0.0  # PAD slot: padded entries land here carrying count 0
+            total = row.sum()
+            if total > 0:
+                row /= total
+            sample[dense_key] = row
+
+        for key, dtype in (("bel_valid", torch.bool), ("bel_hand_valid", torch.bool),
+                           ("bel_arch", torch.long)):
+            if key not in sample or V is None:
+                fill = -1 if dtype is torch.long else False
+                sample[key] = torch.tensor(fill, dtype=dtype)
+            else:
+                sample[key] = sample[key].to(dtype)
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         for i in range(len(self)):

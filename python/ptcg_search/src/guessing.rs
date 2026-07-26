@@ -97,14 +97,15 @@ pub fn build_guesses(
 
     let your_deck: Vec<i32> = deck_remaining[..deck_remaining.len().min(deck_count)].to_vec();
 
-    // Your prizes: random sample from the unknown pool
-    // Use everything in deck_remaining that wasn't assigned to deck, plus
-    // potentially other unknown cards
-    let mut unknown_pool = deck_remaining.clone();
-    // Add back the unrevealed prizes (they're part of the unknown pool)
-    let your_prize: Vec<i32> = if unrevealed_prize_count > 0 && !unknown_pool.is_empty() {
-        unknown_pool.shuffle(rng);
-        unknown_pool[..unknown_pool.len().min(unrevealed_prize_count)].to_vec()
+    // Your prizes: the tail of the same shuffled pool the deck was dealt from.
+    // This used to clone `deck_remaining`, which let one card land in both the
+    // deck and the prizes -- the determinized world then held more copies of it
+    // than the decklist allows, and every rollout that drew it explored a game
+    // that cannot happen.  Taking the leftover keeps the two disjoint, and since
+    // the pool was already shuffled the slice is still a uniform sample.
+    let leftover = &deck_remaining[your_deck.len()..];
+    let your_prize: Vec<i32> = if unrevealed_prize_count > 0 && !leftover.is_empty() {
+        leftover[..leftover.len().min(unrevealed_prize_count)].to_vec()
     } else {
         vec![0i32; unrevealed_prize_count] // fallback: will be ignored if len matches
     };
@@ -291,20 +292,9 @@ fn basic_pokemon_from_deck(deck: &[i32], rng: &mut impl Rng) -> Option<i32> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_subtract_multiset() {
-        let mut result = subtract_multiset(&[1, 1, 2, 3], &[1, 2]);
-        result.sort();
-        assert_eq!(result, vec![1, 3]);
-    }
-
-    #[test]
-    fn test_guesses_with_mirror_deck() {
-        use rand::rngs::StdRng;
-        use rand::SeedableRng;
-        let mut rng = StdRng::seed_from_u64(42);
-
-        let obs = r#"{
+    /// A mid-game observation used by several tests: we are player 0 with a
+    /// 45-card deck, six unrevealed prizes and one known card in play.
+    const OBS_MIRROR: &str = r#"{
             "select": {"type": 0, "context": 0, "minCount": 1, "maxCount": 1, "option": []},
             "current": {
                 "turn": 5, "turnActionCount": 3, "yourIndex": 0, "firstPlayer": 0,
@@ -331,6 +321,21 @@ mod tests {
             "search_begin_input": "dummy123"
         }"#;
 
+    #[test]
+    fn test_subtract_multiset() {
+        let mut result = subtract_multiset(&[1, 1, 2, 3], &[1, 2]);
+        result.sort();
+        assert_eq!(result, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_guesses_with_mirror_deck() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let obs = OBS_MIRROR;
+
         let fixed = (1..=60).collect::<Vec<i32>>();
         let result = build_guesses(obs, &fixed, &[], &mut rng).unwrap();
 
@@ -338,5 +343,38 @@ mod tests {
         assert_eq!(result.opponent_active.len(), 1);
         assert_eq!(result.opponent_hand.len(), 7);
         assert_eq!(result.opponent_prize.len(), 6);
+    }
+
+    #[test]
+    fn test_your_deck_and_prizes_are_disjoint() {
+        // Prizes used to be drawn from the whole unknown pool rather than what
+        // was left after the deck was dealt, so a card could sit in both at
+        // once and the determinized world held more copies of it than the
+        // decklist allows.  Every id here is distinct, so any card appearing
+        // twice across deck+prizes is that overlap.
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let obs = OBS_MIRROR;
+        let mut fixed = vec![101, 201, 202];
+        fixed.extend(1..=57);
+        assert_eq!(fixed.len(), 60);
+
+        // Seed-swept: one seed could get lucky, the bug is probabilistic.
+        for seed in 0..32u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let result = build_guesses(obs, &fixed, &[], &mut rng).unwrap();
+
+            let mut all = result.your_deck.clone();
+            all.extend(result.your_prize.iter().copied());
+            let n = all.len();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(
+                all.len(),
+                n,
+                "seed {seed}: a card is in both the deck and the prizes"
+            );
+        }
     }
 }

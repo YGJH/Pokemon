@@ -114,6 +114,8 @@ class TestPolicy:
         for name, p in policy.named_parameters():
             if "msgru" in name:
                 continue  # only exercised in multi-select loop
+            if name.startswith("belief_heads."):
+                continue  # auxiliary; only reached via forward_with_belief
             assert p.grad is not None, f"Parameter {name} has no gradient"
 
     def test_pointer_card_bound(self):
@@ -202,8 +204,8 @@ class TestMultiSelectCE:
         loss.backward()
         # Only embed/encoder/pointer are used in multiselect_ce; value head is unused
         for name, p in policy.named_parameters():
-            if "value" in name:
-                assert p.grad is None, f"Value parameter {name} should not have gradient in multiselect"
+            if "value" in name or name.startswith("belief_heads."):
+                assert p.grad is None, f"Auxiliary parameter {name} should not have gradient in multiselect"
             else:
                 assert p.grad is not None, f"Parameter {name} has no gradient"
 

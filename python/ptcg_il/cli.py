@@ -27,6 +27,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# belief_labels is deliberately torch-free, so importing the weight defaults
+# here does not drag torch into `--help`.
+from ptcg_il.belief_labels import BELIEF_WEIGHTS
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,6 +184,18 @@ def _build_parser() -> argparse.ArgumentParser:
     loss.add_argument("--ema-decay", type=float, default=DEFAULTS["ema_decay"],
                       help="EMA decay for parameter averaging")
 
+    # Opponent-card belief (auxiliary supervision for MCTS determinization)
+    bel = train_parser.add_argument_group("Belief heads")
+    bel.add_argument("--belief", action="store_true",
+                     help="Train the auxiliary opponent-card belief heads "
+                          "(archetype / deck / hidden pool / hand). Requires "
+                          "shards mined with belief labels; on an older corpus "
+                          "every row is masked and the term is a no-op.")
+    for name, default in BELIEF_WEIGHTS.items():
+        bel.add_argument(f"--belief-{name[2:]}", type=float, default=default,
+                         dest=f"belief_{name[2:]}",
+                         help=f"Weight of the belief {name[2:]} term (default {default})")
+
     # Cadence
     cadence = train_parser.add_argument_group("Logging & eval cadence (C.8–C.10)")
     cadence.add_argument("--log-every", type=int, default=DEFAULTS["log_every"],
@@ -260,10 +276,26 @@ def _load_artifacts(data_dir: Path) -> dict:
         with open(arch_path) as f:
             arch = json.load(f)
         artifacts["fixed_deck"] = arch.get("fixed_deck", list(range(60)))
+        # The belief head classifies over the retained 𝒟_opp set, in the same
+        # contiguous order shard_writer used when it wrote bel_arch.
+        artifacts["n_opp_arch"] = len(arch.get("opp_ids", []))
+        artifacts["archetypes"] = arch
     else:
         raise FileNotFoundError(f"archetypes.json not found at {arch_path}")
 
     return artifacts
+
+
+def _belief_weights(args: argparse.Namespace) -> dict[str, float] | None:
+    """CLI flags → the ``belief_weights`` dict, or None when disabled.
+
+    None (not a dict of zeros) is what turns the belief forward pass off
+    entirely, so a run without ``--belief`` never pays for the heads' [B, V]
+    matmuls.
+    """
+    if not getattr(args, "belief", False):
+        return None
+    return {name: float(getattr(args, f"belief_{name[2:]}")) for name in BELIEF_WEIGHTS}
 
 
 def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
@@ -297,6 +329,7 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
         ff=args.ff,
         card_static_table=card_static,
         attack_static_table=attack_static,
+        n_opp_arch=artifacts.get("n_opp_arch", 0),
     )
     # Apply spec B.8 weight init (trunc_normal std=0.02 for Linear/Embedding weights)
     from ptcg_il.model import init_weights
@@ -406,6 +439,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         label_smoothing=args.label_smoothing,
         ema_decay=args.ema_decay,
         lambda_v=args.lambda_v,
+        belief_weights=_belief_weights(args),
         weight_decay=args.weight_decay,
         betas=(args.beta1, args.beta2),
         total_steps=total_steps,
@@ -439,7 +473,8 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
     # Load checkpoint
     from ptcg_il.train.checkpoint import load_checkpoint
     ckpt = load_checkpoint(args.resume, device)
-    policy.load_state_dict(ckpt["model_state_dict"])
+    from ptcg_il.model.policy import load_policy_state
+    load_policy_state(policy, ckpt["model_state_dict"])
     policy.to(device)
     policy.eval()
 
@@ -461,7 +496,10 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
             pin_memory=(device.type == "cuda"),
             drop_last=False,
         )
-        eval_metrics = offline_eval(policy, val_loader, device, lambda_v=args.lambda_v)
+        eval_metrics = offline_eval(
+            policy, val_loader, device, lambda_v=args.lambda_v,
+            belief=_belief_weights(args) is not None,
+        )
         logger.info("Offline eval: top1_macro=%.4f, top1_micro=%.4f",
                     eval_metrics.get("val/top1_macro", 0.0),
                     eval_metrics.get("val/top1_micro", 0.0))
@@ -502,6 +540,28 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
         "search_planner": search_planner_agent,
     }
 
+    # A second planner whose determinization uses the belief heads' predicted
+    # opponent deck instead of the mirror assumption.  Kept alongside the plain
+    # planner rather than replacing it, so the two numbers measure what the
+    # belief model is actually worth.
+    if getattr(args, "belief", False):
+        try:
+            import copy
+
+            from ptcg_il.belief_infer import OpponentDeckOracle
+            from ptcg_il.live_eval import SearchPlannerAgent
+
+            # A CPU copy: the workers are forked, and a CUDA tensor cannot
+            # cross a fork.
+            oracle_policy = copy.deepcopy(policy).to("cpu").eval()
+            oracle = OpponentDeckOracle(
+                oracle_policy, artifacts["vocab"], artifacts["archetypes"],
+                device="cpu",
+            )
+            opponents["search_planner_belief"] = SearchPlannerAgent(oracle=oracle)
+        except Exception as e:
+            logger.warning("Could not build belief-backed search planner: %s", e)
+
     # Frozen checkpoint opponent — load from --resume if available
     if args.resume is not None:
         try:
@@ -510,7 +570,8 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
             frozen_policy.to("cpu")
             from ptcg_il.train.checkpoint import load_checkpoint
             ckpt = load_checkpoint(args.resume, device="cpu")
-            frozen_policy.load_state_dict(ckpt["model_state_dict"])
+            from ptcg_il.model.policy import load_policy_state
+            load_policy_state(frozen_policy, ckpt["model_state_dict"])
             frozen_agent = make_agent_from_policy(
                 frozen_policy, artifacts["vocab"], artifacts["fixed_deck"], device="cpu"
             )
@@ -525,17 +586,29 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
                 args.live_eval_games, len(opponents))
     results = evaluator.eval_vs_opponents(opponents, n_games=args.live_eval_games)
     for name, r in results.items():
-        logger.info(
-            "Live eval vs %s: win=%.1f%% [%.1f–%.1f%%], %d games, %.1f mean steps, %d illegal actions, oov=%.3f",
+        # Surface failed games here too -- this is the line users actually read.
+        log = logger.warning if r.errors else logger.info
+        log(
+            "Live eval vs %s: win=%.1f%% [%.1f–%.1f%%], %d/%d games (%d failed), "
+            "%.1f mean steps, %d illegal actions, oov=%.3f",
             name,
             r.win_rate_center * 100,
             r.win_rate_lo * 100,
             r.win_rate_hi * 100,
             r.n_games,
+            args.live_eval_games,
+            r.errors,
             r.mean_game_length,
             r.total_illegal_actions,
             r.oov_rate,
         )
+        if r.errors:
+            logger.warning(
+                "  ^ %d/%d games vs %s did not complete; treat this win rate as unreliable.",
+                r.errors,
+                args.live_eval_games,
+                name,
+            )
 
 
 # ============================================================

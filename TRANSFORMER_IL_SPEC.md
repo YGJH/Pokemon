@@ -1,9 +1,9 @@
 # Transformer Imitation-Learning Spec — Pokémon TCG AI Battle
 
 Behavior cloning of **top agents** on a **fixed set of meta decks**, with an entity-transformer
-encoder + pointer action head. **No history/GRU module in this version** (state-only policy; the
-`logs` belief module is deferred to a later spec). Builds on `AGENT_SPEC.md` (env I/O) and
-`IL_SPEC.md` (data format + the verified off-by-one pairing rule).
+encoder + pointer action head + **cross-turn history GRU** on the CLS token + **BeliefModule** over
+the logs stream with supervised opponent-card prediction heads. Builds on `AGENT_SPEC.md` (env I/O)
+and `IL_SPEC.md` (data format + the verified off-by-one pairing rule).
 
 Design informed by the `entity-transformer-policies` and `micro-step-action-factorization` skills.
 
@@ -37,7 +37,7 @@ The deck is the `action` at the `select=None` step (a 60-card id list). Canonica
 **sorted multiset key**, then **cluster near-duplicates into archetypes**: decks within a small edit
 distance (e.g. Jaccard ≥ 0.9 on the 60-card multiset, i.e. ≤ ~3 card swaps) are the same archetype.
 This stops "most frequent deck" from being fragmented by 1–2-card tech variants. Rank archetypes by
-frequency **among expert wins**.
+frequency **across all decks in the sampled corpus**.
 
 Separate two roles — critical because a submission pilots **one** fixed deck:
 - **𝒟_self = 3–8 candidate archetypes we might submit.** We train the policy to pilot *all* of them,
@@ -250,6 +250,12 @@ Ship `main.py` + `deck.csv` (FIXED_DECK) + `cg/` + weights; loaded from `/kaggle
   low.
 - **Deck sets sized M = 3–8**: `𝒟_self` = 3–8 candidate archetypes (train to pilot all; submit the
   single best-measured one), `𝒟_opp` = top ≈3–8 opponent archetypes (no mirror-only filter).
+- **Belief module + cross-turn GRU active from v1**: `BeliefModule` (GRU over log entries) and
+  `history_gru` (GRUCell on CLS token) provide history-aware state encoding. `BeliefHeads` with
+  supervised opponent-card prediction (archetype, deck, hidden, hand) adds an auxiliary belief loss.
+- **Multi-select memory uses GRU cell** (`PointerHead.msgru`): the "already-picked" context is
+  maintained by a learned GRUCell rather than an additive running sum, and a **STOP column**
+  (option type 17) handles variable-length termination unconditionally.
 
 **Still to confirm (defaults in bold):**
 1. **Expert set size / threshold**: **K=10 teams, G_min=50 games, rank by win-rate.**
@@ -294,7 +300,7 @@ real card ids are remapped to a contiguous `[2 .. V-1]` via the mined vocab. `PA
 | `N_STAGE` | 3 | basic / stage1 / stage2 |
 | `N_SELTYPE` | 11 | `SelectType` 0–10 |
 | `N_SELCTX` | 49 | `SelectContext` 0–48 |
-| `N_OPTTYPE` | 17 | `OptionType` 0–16 |
+| `N_OPTTYPE` | 18 | `OptionType` 0–16 + STOP=17 |
 | `N_COND` | 5 | poison/burn/sleep/paralyze/confuse |
 | `P_MAX` | 12 | ≤(1 active+5 bench)×2 players |
 | `H_MAX` | 30 | hand cap (obs max 8; draw effects → pad headroom; confirm vs corpus) |
@@ -460,26 +466,27 @@ active/bench of each player → rows 1–12; the acting player's hand → rows 1
 
 | OptionType | src_idx | tgt_idx | card_id | attack_idx |
 |---|---|---|---|---|
-| `PLAY(7)` | hand row `index` | −1 | PAD | 0 |
-| `ATTACH(8)` | `ref(area,me,index)` (hand/token) | `ref(inPlayArea,me,inPlayIndex)` | PAD | 0 |
-| `EVOLVE(9)` | `ref(area,me,index)` | `ref(inPlayArea,me,inPlayIndex)` | PAD | 0 |
-| `ABILITY(10)/DISCARD(11)` | `ref(area,player,index)` | −1 | PAD | 0 |
+| `PLAY(7)` | hand row `index` | −1 | **resolved from hand state** | 0 |
+| `ATTACH(8)` | `ref(area,me,index)` (hand/token) | `ref(inPlayArea,me,inPlayIndex)` | **resolved from source area state** | 0 |
+| `EVOLVE(9)` | `ref(area,me,index)` | `ref(inPlayArea,me,inPlayIndex)` | **resolved from source area state** | 0 |
+| `ABILITY(10)/DISCARD(11)` | `ref(area,player,index)` | −1 | **resolved from referenced area state** | 0 |
 | `RETREAT(12)` | row 1 (my active) | −1 | PAD | 0 |
 | `ATTACK(13)` | row 1 (my active) | −1 | PAD | `remap(attackId)` |
 | `CARD(3)` | `ref(area,playerIndex,index)` or −1 | −1 | **`id` of the referenced card** (always set when known) | 0 |
 | `TOOL_CARD(4)/ENERGY_CARD(5)/ENERGY(6)` | `ref(area,playerIndex,index)` | −1 | **`id` of the specific attached/selected card** | 0 |
 | `YES(1)/NO(2)/END(14)/NUMBER(0)/SKILL(15)/SPECIAL_CONDITION(16)` | −1 | −1 | `cardId` if present else PAD | 0 |
 
-**Attachment-targeting disambiguation (important).** Attachments (energies, tools) are *features* of a
-Pokémon token, **not** their own tokens (§2.1). So options that differ only by *which attachment on the
-same Pokémon* they touch — e.g. `ENERGY(6)`/`TOOL_CARD(4)` under `DISCARD`/move contexts, several legal
-"discard one energy from active" options — all resolve to the **same** `src_idx` (that Pokémon's row).
-To keep them distinguishable, `opt_card_id` is set to the **specific referenced card's id** for
-`CARD/TOOL_CARD/ENERGY_CARD/ENERGY` (not PAD), so the option token carries that card's identity via
-`card_embed` on top of the shared source token. `opt_scalar[energyIndex/toolIndex]` remains a secondary
-tiebreak. (If per-`sel_ctx` metrics later show these contexts are still accuracy sinks — options
-identical in both card id *and* source, e.g. two copies of the same basic energy — promote attachments
-to real tokens; deferred until the data shows it is needed.)
+**Disambiguation via `opt_card_id` (important).** Nearly all option types that reference a
+card — `PLAY, ATTACH, EVOLVE, ABILITY, DISCARD, CARD, TOOL_CARD, ENERGY_CARD, ENERGY` — resolve
+`opt_card_id` from the referenced card's identity via state dereference. This gives the pointer head a
+direct card-embedding signal on top of the gathered source/target token, which helps disambiguate
+options that share the same source token (e.g. two different tools on the same Pokémon). For
+`ENERGY(6)`/`TOOL_CARD(4)` under `DISCARD`/move contexts in particular, several legal "discard one
+energy from active" options may all resolve to the **same** `src_idx` (that Pokémon's row); the
+`opt_card_id` distinguishes them. `opt_scalar[energyIndex/toolIndex]` remains a secondary tiebreak.
+(If per-`sel_ctx` metrics later show these contexts are still accuracy sinks — options identical in
+both card id *and* source, e.g. two copies of the same basic energy — promote attachments to real
+tokens; deferred until the data shows it is needed.)
 
 When `src_idx == −1` and `card_id == PAD`, the option token is built from `optType_emb ⊕ opt_scalar`
 plus the CLS context only (constant-type options like END/YES/NO). Model gathers rows with a safe
@@ -509,7 +516,7 @@ gathered 256-d refs before the option MLP). Encoder sees `[B, L_STATE=46, 256]`;
 PyTorch reference. Every tensor name/shape matches **Appendix A**. `B` = batch of decision points.
 Recap of the dims used below: `D=256`, `L=L_STATE=46`, `O=O_MAX=64`, `P=P_MAX=12`, `H=H_MAX=30`,
 `SUM=2`, `V`, `A`, `F_CARD=52`, `F_ATK=14`, `F_POKE=26`, `F_HAND=2`, `F_SUM=11`, `F_GLOBAL=93`,
-`F_OPT=6`. Standard blocks are `batch_first=True`, `norm_first=True` (pre-norm), GELU, dropout 0.1.
+`F_OPT=6`. Standard blocks are `batch_first=True`, `norm_first=True` (pre-norm), GELU, dropout 0.0.
 
 ## B.0 Prebuilt lookup buffers (registered, not learned)
 `card_static_table : float32[V, 52]` and `attack_static_table : float32[A, 14]`, built once from
@@ -583,7 +590,7 @@ flags from `cls_feat[87:89]` (broadcast).
 ```python
 class Encoder(nn.Module):
     def __init__(self, D=256, heads=8, layers=4, ff=1024):
-        layer = nn.TransformerEncoderLayer(D, heads, ff, dropout=0.1,
+        layer = nn.TransformerEncoderLayer(D, heads, ff, dropout=0.0,
                     activation="gelu", batch_first=True, norm_first=True)
         self.enc = nn.TransformerEncoder(layer, layers)
     def forward(self, rows, tok_mask):              # rows[B,L,D], tok_mask bool[B,L]
@@ -597,15 +604,17 @@ Option tokens are built **after** the encoder from gathered rows (Appendix A.7 i
 `null_token` handles `idx == -1`. The option query is an **additive base** (opt-type + src + tgt +
 card + attack, each `D`-dim) concatenated with the `F_OPT` scalars and projected `D+F_OPT → D` by the
 single layer `opt_in`. All layers are real module fields — nothing is constructed inside `forward`.
-`extra_ctx` (default 0) is the "already-picked" context added to every query for multi-select (B.7);
-it returns the per-option reprs `o` so the caller can pool a chosen option back in.
+`msgru_h` (default None) is the multi-select GRU hidden state carrying "already-picked" context
+into every option query for multi-select (B.7); `forward` returns the per-option reprs `o` so the
+caller can update the GRU with the chosen option.
 ```python
 class PointerHead(nn.Module):
     def __init__(self, D=256, heads=8):
-        self.opt_type_emb = nn.Embedding(17, D)            # OptionType
+        self.opt_type_emb = nn.Embedding(18, D)            # OptionType 0..16 + STOP=17
         self.card   = None                                  # bound to parent CardEncoder (see B.6)
         self.attack = AttackEncoder(A, D)
         self.null_token = nn.Parameter(torch.zeros(D))
+        self.msgru = nn.GRUCell(D, D)                       # multi-select memory
         self.opt_in = nn.Linear(D + F_OPT, D)               # base(D) ⊕ opt_scalar(F_OPT) → D
         self.cross = nn.MultiheadAttention(D, heads, batch_first=True)
         self.ln_q, self.ln_o = nn.LayerNorm(D), nn.LayerNorm(D)
@@ -616,21 +625,21 @@ class PointerHead(nn.Module):
         idx = torch.where(idx < 0, torch.full_like(idx, L), idx)
         return torch.gather(h_aug, 1, idx.unsqueeze(-1).expand(-1,-1,D))   # [B,O,D]
 
-    def forward(self, h, tok_mask, card_enc, x, extra_ctx=None):
+    def forward(self, h, tok_mask, card_enc, x, msgru_h=None):
         B = h.shape[0]
         h_aug = torch.cat([h, self.null_token.expand(B,1,D)], 1)          # [B,L+1,D]
         src = self.gather(h_aug, x["opt_src_idx"])                        # [B,O,D]
         tgt = self.gather(h_aug, x["opt_tgt_idx"])
         base = self.opt_type_emb(x["opt_type"]) + src + tgt \
              + card_enc(x["opt_card_id"]) + self.attack(x["opt_attack_idx"])   # [B,O,D]
-        if extra_ctx is not None:                                         # multi-select: [B,D]→[B,1,D]
-            base = base + extra_ctx.unsqueeze(1)
+        if msgru_h is not None:                                           # multi-select: [B,D]→[B,1,D]
+            base = base + msgru_h.unsqueeze(1)
         q = self.ln_q(F.gelu(self.opt_in(torch.cat([base, x["opt_scalar"]], -1))))  # [B,O,D]
         # cross-attention: queries=options, keys/values=state tokens
         a,_ = self.cross(q, h, h, key_padding_mask=~tok_mask)            # [B,O,D]
         o = self.ln_o(q + a); o = o + self.ffn(o)                        # [B,O,D] per-option reprs
         logits = self.score(o).squeeze(-1).masked_fill(~x["opt_mask"], -1e9)   # [B,O]
-        return logits, o                                                 # o reused by B.7 pooling
+        return logits, o                                                 # o reused by B.7 GRU update
 ```
 
 ## B.5 `ValueHead`
@@ -643,59 +652,89 @@ class ValueHead(nn.Module):
 ## B.6 `Policy` — end-to-end
 ```python
 class Policy(nn.Module):
-    def __init__(self):
+    def __init__(self, V, A, D=256, heads=8, layers=4, ff=1024, n_opp_arch=0):
         self.embed = TokenEmbedder(); self.encoder = Encoder()
         self.pointer = PointerHead(); self.pointer.card = self.embed.card
         self.value = ValueHead()
-    def forward(self, x):
-        rows = self.embed(x)                       # [B,L,D]
-        h    = self.encoder(rows, x["tok_mask"])   # [B,L,D]
-        logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)   # [B,O] (single-select path)
-        value  = self.value(h[:,0])                # [B]
-        return logits, value
+        self.belief = BeliefModule(V, D)
+        self.belief.card_emb = self.embed.card          # share CardEncoder
+        # Supervised opponent predictions (optional: n_opp_arch=0 disables the auxiliary loss).
+        self.belief_heads = BeliefHeads(V, D, n_opp_arch, card_emb=self.embed.card)
+        self.history_gru = nn.GRUCell(D, D)             # cross-turn memory on CLS token
+    def _encode(self, x, history_h=None):
+        rows = self.embed(x)                            # [B,L,D]
+        h    = self.encoder(rows, x["tok_mask"])        # [B,L,D]
+        # Belief: encode logs into a belief vector, added to CLS before history GRU
+        belief = self.belief(x["log_feat"], x["log_mask"]) if "log_feat" in x else 0
+        cls_token = h[:,0] + belief
+        if history_h is None:
+            history_h = torch.zeros(B, D)
+        cls_out = self.history_gru(cls_token, history_h)
+        h = torch.cat([cls_out.unsqueeze(1), h[:,1:]], dim=1)   # replace CLS
+        return h, history_h
+    def forward(self, x, history_h=None):
+        h, history_h = self._encode(x, history_h)
+        logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)
+        value  = self.value(h[:,0])
+        return logits, value, history_h.detach()
 ```
 (`forward` returns single-select logits; multi-select re-scoring is driven by B.7, which needs the
-per-option reprs `o` that `PointerHead` also returns.)
+per-option reprs `o` that `PointerHead` also returns. The `BeliefModule` encodes the log stream into a
+belief vector via a GRU over log entries; `BeliefHeads` outputs 4 auxiliary opponent-card prediction
+heads — archetype, deck, hidden cards, hand — used for an auxiliary belief loss during training.)
 
 ## B.7 Multi-select (autoregressive pick-without-replacement)
 `maxCount==1` (common) → `Policy.forward` logits used directly. For `maxCount>1`, re-score after each
-pick, adding a pooled "already-picked" embedding to every option query and masking chosen options.
-`PointerHead.forward` (B.4) already accepts `extra_ctx` and returns `(logits, o)` where `o[B,O,D]` are
-the per-option reprs — pool the chosen ones into `picked_ctx`:
-```python
-def select_multi(pointer, h, tok_mask, card_enc, x, minC, maxC):   # inference (fixed length in v1)
-    B = h.shape[0]
-    chosen, picked_mask = [], x["opt_mask"].clone()
-    picked_ctx = torch.zeros(B, D, device=h.device)
-    for t in range(maxC):                                            # v1: minC==maxC ⇒ exactly maxC
-        logits, o = pointer(h, tok_mask, card_enc, x, extra_ctx=picked_ctx)
-        logits = logits.masked_fill(~picked_mask, -1e9)
-        j = logits.argmax(-1); chosen.append(j)                      # [B]
-        picked_mask[torch.arange(B), j] = False
-        picked_ctx = picked_ctx + o[torch.arange(B), j]              # running sum of chosen reprs
-    return torch.stack(chosen, 1)                                    # [B, maxC]
-```
-**Training** teacher-forces the expert order from `action_idx`: at step `t` re-score with the current
-`picked_ctx`, take masked CE against `action_idx[t]`, mask that true pick, and add the *true* option's
-`o[·, action_idx[t]]` into `picked_ctx`; loss = Σ_t CE.
+pick using a **GRU cell** to track "already-picked" context, and a **STOP column** for variable-length
+termination. The STOP column is inserted as option type 17 at index `stop_column`; when chosen, the
+sample is done picking and all subsequent columns are ignored.
 
-**Variable length (`minCount<maxCount`).** v1 assumes fixed length (`minCount==maxCount`) and loops
-exactly `maxCount`. This assumption is **QA-gated at mining time** (D.5: report the fraction of
-multi-select contexts with `minCount<maxCount`). If that fraction is non-trivial, add an explicit STOP
-logit (an extra option column scored each step, supervised to fire after the expert's last pick once
-`t≥minCount`) — bring it into **v1**, not v2. Do not ship the fixed-length loop while variable-length
-selects exist in the data.
+`PointerHead.forward` (B.4) accepts `msgru_h` (the GRU hidden state) and returns `(logits, o)` where
+`o[B,O,D]` are the per-option reprs — update the GRU from the chosen one:
+
+```python
+def select_multi(pointer, h, tok_mask, card_enc, x, minC, maxC, stop_col):
+    B = h.shape[0]
+    chosen, active = [], torch.ones(B, dtype=torch.bool)
+    picked_mask = x["opt_mask"].clone()
+    msgru_h = torch.zeros(B, D, device=h.device)
+    for t in range(maxC):
+        logits, o = pointer(h, tok_mask, card_enc, x, msgru_h=msgru_h)
+        logits = logits.masked_fill(~picked_mask, -1e9)
+        j = logits.argmax(-1); chosen.append(j)
+        # STOP column terminates the sample
+        stopped = (j == stop_col) & (t >= minC)
+        active = active & ~stopped
+        picked_mask[torch.arange(B), j] = False
+        # Update GRU with chosen option reprs
+        msgru_h[active] = pointer.msgru(o[active, j[active]].float(), msgru_h[active])
+    return torch.stack(chosen, 1)                    # [B, maxC], STOP picks = -2
+```
+**Training** (`multiselect_ce`) teacher-forces the expert order from `action_idx`: at step `t` re-score
+with the current `msgru_h`, take masked CE against `action_idx[t]`, mask that true pick, and update the
+GRU with the *true* option's `o[·, action_idx[t]]`; loss = Σ_t CE. The STOP column is supervised to
+fire after the expert's last pick (for `t ≥ minCount`); STOP picks are encoded as `-2` in `action_idx`.
+
+**Variable length.** The STOP column is always present (not conditional on data), supporting both
+fixed-length and variable-length selects. The `minCount` gate ensures STOP is only legal once the
+minimum pick count is satisfied.
 
 ## B.8 Loss & init
 ```python
-logits, value = policy(x)
+logits, value, _history_h = policy(x)
 if x.maxCount == 1:
     ce = F.cross_entropy(logits, x["action_idx"][:,0], label_smoothing=0.05, reduction="none")
 else:
-    ce = multiselect_ce(...)                       # B.7, teacher-forced
+    ce = multiselect_ce(policy, x)                 # B.7, teacher-forced
 loss = (x["sample_weight"] * ce).mean() + LAMBDA_V * F.mse_loss(value, x["value_target"])
+if n_opp_arch > 0:                                 # auxiliary belief loss (opponent card prediction)
+    belief_preds = policy.belief_heads(belief_h)
+    loss = loss + belief_loss(belief_preds, x)     # deck CE + hidden CE + hand CE + arch CE
 ```
 - **Per-context weighting** folded into `sample_weight` (Appendix A.4).
+- **Belief auxiliary loss**: when `n_opp_arch > 0`, the `BeliefHeads` module predicts opponent
+  archetype, deck contents, hidden cards, and hand cards from the belief state; the auxiliary loss
+  adds four CE terms (deck, hidden, hand, arch) with configurable per-term weights.
 - **No RL-style priors here** — BC needs no halt/full-send init biases (those were for the
   `micro-step` *RL* setting). Default init: `nn.init.trunc_normal_(emb, std=0.02)`, LN default,
   `null_token`/`no_stadium` zero-init.
@@ -783,29 +822,31 @@ Every tensor is already fixed-shape ⇒ **default collate = `torch.stack`**, no 
 | Weight EMA | decay `0.999`, evaluate & ship the **EMA** weights |
 | `LAMBDA_V` | **0.5 from v1** (both outcomes ⇒ informative `value_target ∈ {±1}`); `0.0` only in the wins-only ablation |
 | `W_LOST` | **0.6** — sample-weight multiplier on decisions from lost expert games (§1.1) |
-| Seed | fixed; `torch.use_deterministic_algorithms(False)` (perf) but log seed |
 
 ## C.6 Training step (pseudocode)
 ```python
 for step, batch in enumerate(loader):
     batch = to_device(batch)
     with autocast("cuda", dtype=torch.bfloat16):
-        logits, value = policy(batch)                         # [B,O], [B]
+        logits, value, _history_h = policy(batch)                # [B,O], [B]; cross-turn GRU on CLS
         if (batch["maxCount"] == 1).all():
             ce = F.cross_entropy(logits, batch["action_idx"][:,0],
                                  reduction="none", label_smoothing=0.05)
         else:
-            ce = multiselect_ce(policy, batch)                # Appendix B.7, teacher-forced
+            ce = multiselect_ce(policy, batch)                   # Appendix B.7, teacher-forced
         loss = (batch["sample_weight"] * ce).mean()
         if LAMBDA_V > 0:
             loss = loss + LAMBDA_V * F.mse_loss(value, batch["value_target"])
+        if n_opp_arch > 0:                                      # auxiliary belief loss (B.8)
+            loss = loss + belief_loss(policy.belief_heads(belief_h), batch)
     scaler_or_backward(loss); clip_grad_norm_(policy.parameters(), 1.0)
     opt.step(); sched.step(); opt.zero_grad(set_to_none=True); ema.update(policy)
     if step % LOG_EVERY == 0:   wandb.log(train_signals(loss, ce, value, grad_norm, sched), step=step)  # C.9
     if step % VAL_EVERY == 0:   offline_eval(ema, val_loader)      # C.8 → wandb.log(step)
     if step % CKPT_EVERY == 0:  save_ckpt(step, policy, ema, opt, sched)   # + wandb.Artifact (C.7)
-    if step % LIVE_EVERY == 0:  live_eval(ema)                     # C.8 (async pool) → wandb.log on return
 ```
+Live eval is run **after training completes** (not inline on the GPU step), wrapping the EMA policy as
+`agent()` and running head-to-head games against baseline opponents in a separate process pool.
 All logging goes through **Weights & Biases** (C.9): `train_signals` returns the per-step scalars,
 `offline_eval`/`live_eval` return dicts logged at the same global `step` so train/val/live curves share
 one x-axis.
@@ -833,10 +874,13 @@ Two tiers — cheap offline metrics often, expensive live games rarely.
   aggregate number hides rare-context collapse). Weighted and unweighted.
 - Multi-select: exact-set match & per-pick top-1.
 - Value MSE/AUC (from v1 — both outcomes trained, §1.1).
-- Early-stop / best-ckpt criterion: **macro-avg top-1 across contexts** (not micro) so rare decisions
-  count. Patience ~5 evals.
+- Early-stop / best-ckpt criterion: **non-trivial micro top-1** (`val/top1_nontrivial`, which excludes
+  near-degenerate `sel_ctx` buckets with ≤2 forced options). The macro average weights those
+  degenerate buckets equally with the buckets holding almost all real decisions, so it tracks noise.
+  Falls back to `val/top1_macro` if `top1_nontrivial` is unavailable. Patience ~5 evals.
 
-**Live-engine (`LIVE_EVERY = 10k` steps or per epoch)** — the only metric that really matters:
+**Live-engine** — the only metric that really matters, run **after training completes** (not inline
+during training, to avoid competing with the GPU for compute):
 - Wrap EMA policy as `agent()` piloting `FIXED_DECK`; run a **process pool** (the `cg` lib is one
   battle per process) of `≥500` games each vs: (a) the sample **random** agent (floor), (b) a **frozen
   previous checkpoint** (progress signal), (c) the **built-in `search_begin/step` planner**
@@ -844,55 +888,50 @@ Two tiers — cheap offline metrics often, expensive live games rarely.
   interactive game diverges from any recording once our policy deviates (see §5).
 - Fixed seed schedule across evals for comparability; report win-rate ± Wilson interval, plus mean
   game length and illegal-action rate (must be 0 — engine err 4/5/6).
-- Gate promotion of a checkpoint on live win-rate, not offline accuracy (imitation accuracy and
-  win-rate correlate loosely).
 
 ## C.9 Experiment tracking (Weights & Biases)
 All training signals stream to **W&B**. One `wandb.run` per training job; **everything is logged
 against the global `step`** so train/val/live curves overlay on a shared x-axis.
 
 **Init & config.** `wandb.init(project=WANDB_PROJECT, entity=WANDB_ENTITY, name=run_name, config=cfg)`
-where `cfg` is the full C.9(summary) hyperparameter dict **plus** the frozen-artifact provenance
-(`vocab.json` config-hash, `N_VOCAB`, `V`, `A`, 𝒟 sizes, corpus manifest hash — D.6) so every run is
-reproducible from its config. `wandb.watch(policy, log="gradients", log_freq=1000)` (optional) for
-weight/grad histograms. Respect `WANDB_MODE=offline` for air-gapped/Kaggle runs (sync later); never
-put credentials in the repo — read `WANDB_API_KEY` from env. **`wandb` is a training-only dependency
-(`uv add --group train wandb`)**: it is never imported by the submitted `agent()` / `main.py`, so the
-`/kaggle_simulations/agent/` bundle (C.7) stays wandb-free.
+where `cfg` is the full hyperparameter dict. Respect `WANDB_MODE=offline` for air-gapped/Kaggle runs
+(sync later); never put credentials in the repo — read `WANDB_API_KEY` from env. **`wandb` is a
+training-only dependency (`uv add --group train wandb`)**: it is never imported by the submitted
+`agent()` / `main.py`, so the `/kaggle_simulations/agent/` bundle (C.7) stays wandb-free.
 
 **Per-step (every `LOG_EVERY=50`):**
-- `train/loss`, `train/ce`, `train/value_mse` (when `LAMBDA_V>0`), `train/loss_total`
-- `train/grad_norm` (pre-clip), `train/lr`, `train/ema_decay`
-- `perf/samples_per_sec`, `perf/data_wait_frac` (dataloader stall), `perf/gpu_mem_gb`
-- `train/ce_by_maxcount` (single vs multi split) to catch one path dominating
+- `train/loss`, `train/ce`, `train/value_mse` (when `LAMBDA_V>0`)
+- `train/grad_norm` (pre-clip), `train/lr`
+- `perf/samples_per_sec`
+- Optional extras from auxiliary losses (e.g. `belief/*` when belief heads are active)
 
 **Per offline eval (`VAL_EVERY=1000`):** log **both** the scalars and the per-context table —
-- `val/top1_macro`, `val/top1_micro`, `val/top3_macro` (macro is the early-stop criterion, C.8)
+- `val/top1_macro`, `val/top1_micro`, `val/top1_nontrivial` (micro over non-degenerate contexts; primary early-stop criterion, C.8)
 - `val/top1@{sel_ctx}` and `val/top1@{sel_type}` as a `wandb.Table` (one row per context) — the
   aggregate hides rare-context collapse, so the table is the primary artifact, not the scalars
 - `val/multiselect_exact_set`, `val/multiselect_perpick_top1`
 - `val/value_mse`, `val/value_auc`
-- `val/best_top1_macro` + mark the best-val step; use `wandb.run.summary` for the best-so-far
+- `val/best_top1_nontrivial` + mark the best-val step; use `wandb.run.summary` for the best-so-far
 
-**Per live eval (`LIVE_EVERY=10000`):** for each opponent `o ∈ {random, frozen_ckpt, search}` —
+**Per live eval (post-training):** for each opponent `o ∈ {random, frozen_ckpt, search}` —
 - `live/winrate@{o}` with `live/winrate_ci_lo@{o}` / `_hi@{o}` (Wilson interval)
-- `live/game_len_mean@{o}`, `live/illegal_action_rate@{o}` (**must be 0** — alert if not)
+- `live/game_len_mean@{o}`, `live/illegal_action_rate@{o}` (**must be 0**)
 - `live/oov_rate` (fraction of opponent cards hitting `UNKNOWN`, §1.2/§5)
 
 **Checkpoints as artifacts:** log best-val and last as a `wandb.Artifact(type="model")` (C.7),
 aliasing the promoted one `best`; attach `vocab.json`/`archetypes.json` so the submission bundle is
 recoverable from W&B alone.
 
-**Alerts:** `wandb.alert` on NaN/Inf loss, `illegal_action_rate>0` at live eval, or macro top-1
-regressing for `>patience` evals (ties into early-stop, C.8).
+**Error handling:** NaN/Inf loss triggers an early-stop break. Illegal actions at live eval are
+logged as metrics; a non-zero rate is a hard bug (engine err 4/5/6) to fix before the next run.
 
 ## C.10 Hyperparameter summary
 ```
-D_MODEL=256  LAYERS=4  HEADS=8  FF=1024  DROPOUT=0.1
+D_MODEL=256  LAYERS=4  HEADS=8  FF=1024  DROPOUT=0.0
 BATCH=2048   EPOCHS=10  PEAK_LR=3e-4  WARMUP=1000  MIN_LR=3e-5
 WD=0.01  BETAS=(0.9,0.95)  GRAD_CLIP=1.0  LABEL_SMOOTH=0.05  EMA=0.999
 ALPHA_CTX=0.5  ALPHA_ARCH=0.5  LAMBDA_V=0.5  W_LOST=0.6
-LOG_EVERY=50  VAL_EVERY=1000  CKPT_EVERY=2000  LIVE_EVERY=10000
+LOG_EVERY=50  VAL_EVERY=1000  CKPT_EVERY=2000
 WANDB_PROJECT="pokemon-tcg-il"  WANDB_ENTITY=<team>  WANDB_MODE=online  # offline on Kaggle, sync later
 ```
 
@@ -905,8 +944,8 @@ WANDB_PROJECT="pokemon-tcg-il"  WANDB_ENTITY=<team>  WANDB_MODE=online  # offlin
   PointerHead` (all shapes fixed ⇒ no recompiles). Keep the **multi-select AR loop uncompiled**: its
   per-step count is data-dependent (`maxCount` varies) and would trigger graph breaks/recompiles.
   Bucketing by `maxCount==1` vs `>1` (C.6) keeps the compiled path pure.
-- Live eval is the wall-clock cost; run it on CPU worker processes **concurrently** with training
-  (it only needs a weights snapshot), not inline on the GPU step.
+- Live eval is the wall-clock cost; run it on CPU worker processes **after training** (it only needs
+  a weights snapshot), not inline on the GPU step.
 
 ## C.12 Failure modes to watch
 | Symptom | Likely cause / fix |
@@ -934,15 +973,17 @@ Key facts it relies on (all verified against a real episode):
 
 ## D.1 Phase 0 — Sampling plan (bounded, reproducible)
 ```
-budget: TARGET_EPISODES (first pass ≈ 8–15k), DAYS (recent, high top_avg_score from manifest)
+budget: TARGET_EPISODES (first pass ≈ 8–15k), DAYS (most recent from manifest)
 per_day = TARGET_EPISODES / |DAYS|
 for day in DAYS:
     ids = list_all_files(day)                 # paged API, see D.2
-    pick = deterministic_sample(ids, per_day, seed)   # hash(id, seed) < threshold
+    pick = deterministic_pick(ids, per_day, seed)    # hash-sort-take-exactly-k
     enqueue(day, pick)
 ```
-Deterministic hash-sampling makes the corpus reproducible and **resumable** (re-running picks the same
-ids). Bias `DAYS` toward recent + high `top_avg_score` rows of `archive/manifest.csv` (stronger meta).
+Deterministic hash-sort-take-k makes the corpus reproducible and **resumable** (re-running picks the
+same ids). Select the **most recent** days from `archive/manifest.csv` (recency is the primary signal;
+`top_avg_score` is available but not used for day filtering — the recency bias implicitly captures
+stronger meta as the competition matures).
 
 ## D.2 Phase 1 — Download (resumable, rate-limited)
 Verified CLI (via the project venv; `KAGGLE_CONFIG_DIR=~/.kaggle`):
@@ -977,9 +1018,10 @@ for ep in raw_cache:
 ```
 Then **freeze the decisions**:
 1. **EXPERTS** = top-`K` teams by `win_rate=wins/games` with `games>=G_min` (defaults K=10, G_min=50).
-2. **Archetype clustering** (over decks used by experts in their wins): greedy by descending freq —
+2. **Archetype clustering** (over all decks in the sampled corpus): greedy by descending frequency —
    assign a deck to an existing cluster if `jaccard_multiset(deck, centroid) >= 0.90`, else new
-   cluster; centroid/representative = the cluster's single most-frequent exact list.
+   cluster; centroid/representative = the cluster's single most-frequent exact list. Clustering over
+   the full corpus (not just expert wins) captures the complete meta for both 𝒟_self and 𝒟_opp.
    `jaccard_multiset = Σ min(a_c,b_c) / Σ max(a_c,b_c)` over card counts.
 3. **𝒟_self** = top 3–8 archetypes by expert frequency *as the expert's own deck* (across all expert
    games, won and lost).
@@ -991,14 +1033,17 @@ Then **freeze the decisions**:
    drives the `W_LOST` down-weight — it is *not* a filter.
 6. **vocab** (decoupled from the game filter, §1.2). Do **not** restrict vocab to kept-game cards, or
    live inference drowns in OOV opponent cards. Build it from a **wider** set: rank all card ids by
-   frequency across **every expert game in the sampled corpus** (both decks, regardless of archetype),
-   take the top `N_VOCAB` (target ~300–500) — plus `PAD=0`, `UNKNOWN=1` → contiguous remap `2..V-1`.
-   In-vocab covers all kept-game cards *and* a wide margin of the live meta; `UNKNOWN` catches the
-   long tail only. `A` = attacks referenced by vocab cards. Record the frequency-coverage curve so
-   `N_VOCAB` can be tuned against the live-OOV target (D.5).
-7. **Caps** — set `H_MAX,O_MAX,D_MAX` = `max(observed_in_kept_games, rule_bound)` + headroom; record
-   observed maxima. (Observed here: hand 8, opt 10, discard 9 — but corpus-wide will be larger; keep
-   defaults 30/64/60 unless corpus exceeds them.)
+   frequency across **every episode in the sampled corpus** (both decks, all players, regardless of
+   expert status or archetype), take the top `N_VOCAB` (target ~300–500) — plus `PAD=0`, `UNKNOWN=1`
+   → contiguous remap `2..V-1`. The vocab is built *before* the expert filter (Phase 2 step 1) so it
+   covers the full meta; in-vocab cards cover all kept-game cards *and* a wide margin of live opponent
+   cards. `UNKNOWN` catches the long tail only. `A` = attacks referenced by vocab cards. Record the
+   frequency-coverage curve so `N_VOCAB` can be tuned against the live-OOV target (D.5).
+7. **Caps** — `H_MAX,O_MAX,D_MAX` are set from the mining config defaults (30, 64, 60). These values
+   are generous enough to cover all observed game states in the current format (hand ≤8 by rules, options
+   ≤60 when picking from a full deck, discard ≤60 by deck size). The caps are written into `vocab.json`
+   as part of the frozen artifact and must match between training and inference. If a future format
+   exceeds these caps, update the config defaults and re-mine.
 8. Build `card_static_table[V,52]`, `attack_static_table[A,14]` from `all_card_data()`/`all_attack()`.
 9. **FIXED_DECK** = representative decklist of the 𝒟_self archetype with the highest expert win-rate
    (a *provisional* pick; the final submission deck is chosen among 𝒟_self candidates by **live**
@@ -1038,8 +1083,8 @@ which becomes optional/derived.)
   whole sampled corpus, that fall outside vocab at `N_VOCAB` = {200,300,400,500}. This is the
   train-time proxy for **live OOV rate** (§5); pick `N_VOCAB` so proxy OOV is small (target < a few %).
 - **Variable-length multi-select audit**: count contexts with `minCount < maxCount` and their sample
-  share. v1's fixed-length loop (B.7) is only valid if this share is ~0; if not, the STOP head is
-  **required in v1** — fail the gate and add it before training.
+  share. The STOP column (B.7) handles variable-length selects unconditionally; this audit is for
+  awareness only (reports the fraction of samples that use the STOP mechanism).
 - **Attachment-collision audit**: among `ENERGY/TOOL_CARD/CARD` selects, count options that share both
   `opt_src_idx` **and** `opt_card_id` (truly indistinguishable to the pointer head, e.g. two identical
   basic energies on one Pokémon). If this share is non-trivial, promote attachments to tokens (A.7).
@@ -1055,8 +1100,10 @@ which becomes optional/derived.)
 
 ## D.6 Provenance, refresh & determinism
 - `vocab.json`/`archetypes.json` are **frozen artifacts**; changing `DAYS`, `K`, `G_min`, `N_VOCAB`,
-  the Jaccard threshold, or 𝒟 sizes **re-mines vocab ⇒ requires retraining**. Stamp each artifact with
-  the config hash + corpus manifest (list of episode ids) for reproducibility. (Vocab now depends on
+  the Jaccard threshold, or 𝒟 sizes **re-mines vocab ⇒ requires retraining**. Artifacts capture the
+  parameter values used to produce them (id remaps, norm constants, caps, archetype definitions).
+  Reproducibility is achieved by re-running with the same config and seed; provenance tracking is
+  handled externally (e.g. W&B config, git hash of the mining config). (Vocab depends on
   `N_VOCAB` + corpus frequencies, *not* on 𝒟 membership — §1.2 decoupling.)
 - **Refresh**: new daily datasets can extend the raw cache and the featurized corpus *without* changing
   vocab (their cards simply map to existing ids or `UNKNOWN`); the archetype **game filter** (D.3.5)

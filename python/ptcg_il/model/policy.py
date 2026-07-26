@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ptcg_il.model.belief import BeliefModule
+from ptcg_il.model.belief import BeliefHeads, BeliefModule
 from ptcg_il.model.embed import TokenEmbedder
 from ptcg_il.model.encoder import Encoder
 from ptcg_il.model.pointer import PointerHead
@@ -51,6 +51,7 @@ class Policy(nn.Module):
         ff: int = 1024,
         card_static_table: torch.Tensor | None = None,
         attack_static_table: torch.Tensor | None = None,
+        n_opp_arch: int = 0,
     ):
         super().__init__()
         self.embed = TokenEmbedder(V, D, card_static_table)
@@ -60,6 +61,11 @@ class Policy(nn.Module):
         self.value = ValueHead(D)
         self.belief = BeliefModule(V, D)
         self.belief.card_emb = self.embed.card  # share CardEncoder
+        # Supervised opponent-card predictions.  Kept optional so existing
+        # checkpoints (whose state_dict has no belief_heads.* keys) still load,
+        # and so a run that does not want the auxiliary loss pays nothing.
+        self.belief_heads = BeliefHeads(V, D, n_opp_arch, card_emb=self.embed.card)
+        self.n_opp_arch = n_opp_arch
         self.history_gru = nn.GRUCell(D, D)  # cross-turn memory on CLS token
         self.D = D
 
@@ -118,6 +124,56 @@ class Policy(nn.Module):
         logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)  # [B, O]
         value = self.value(h[:, 0])                           # [B]
         return logits, value, history_h.detach()
+
+    def belief_logits(
+        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Opponent-card belief logits: ``arch``, ``deck``, ``hidden``, ``hand``.
+
+        Separate from :meth:`forward` because the two have different callers:
+        training needs the belief heads alongside the action logits and gets
+        them from :meth:`forward_with_belief`, which encodes once, whereas the
+        MCTS planner needs *only* the belief and would otherwise pay for the
+        pointer head on every determinization.
+        """
+        h, _ = self._encode(x, history_h)
+        return self.belief_heads(h[:, 0])
+
+    def forward_with_belief(
+        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """:meth:`forward` plus the belief logits, sharing a single encode pass.
+
+        Returns ``(logits, value, history_h, belief)``.  Calling ``forward`` and
+        ``belief_logits`` separately would run the transformer twice per step.
+        """
+        h, history_h = self._encode(x, history_h)
+        logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)
+        value = self.value(h[:, 0])
+        belief = self.belief_heads(h[:, 0])
+        return logits, value, history_h.detach(), belief
+
+
+def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
+    """``policy.load_state_dict`` that tolerates a pre-belief checkpoint.
+
+    Every checkpoint written before :class:`~ptcg_il.model.belief.BeliefHeads`
+    existed lacks the ``belief_heads.*`` parameters, and a strict load rejects
+    it outright.  Those are the *only* keys allowed to be missing: anything
+    else still raises, because a silently half-loaded policy evaluates as a
+    plausible-looking but randomly-initialised model.
+
+    Returns the list of belief keys that were left at their initial values.
+    """
+    missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+    belief_missing = [k for k in missing if k.startswith("belief_heads.")]
+    other = [k for k in missing if not k.startswith("belief_heads.")]
+    if other or unexpected:
+        raise RuntimeError(
+            f"checkpoint does not match this Policy: missing={other}, "
+            f"unexpected={list(unexpected)}"
+        )
+    return belief_missing
 
 
 def multiselect_ce(

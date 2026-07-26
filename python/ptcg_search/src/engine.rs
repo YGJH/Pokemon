@@ -22,7 +22,7 @@ pub struct SearchResult {
 /// # Lifecycle
 ///
 /// ```text
-/// Engine::load(path) → GameInitialize, AgentStart
+/// Engine::load(path, init_game) → [GameInitialize], AgentStart
 ///   search_begin(…) → root SearchResult
 ///     search_step(id, select) → next SearchResult  (repeat)
 ///     search_release(id)                            (cleanup unused branches)
@@ -34,16 +34,34 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Load libcg.so, call `GameInitialize` + `AgentStart`.
+    /// Load libcg.so, call `AgentStart`, and call `GameInitialize` only when
+    /// `init_game` is true.
+    ///
+    /// `GameInitialize` **must be called exactly once per process.** libcg.so
+    /// registers into a fixed-capacity global table, and a second call throws the
+    /// C++ `std::runtime_error("buffer full. capacity:7")`.  A C++ exception
+    /// crossing the FFI boundary is not something Rust can catch ("fatal runtime
+    /// error: Rust cannot catch foreign exceptions"), so the *whole process* dies
+    /// with SIGABRT — not a recoverable `Err`.
+    ///
+    /// When we are reached via `search_plan` from a Python host, `cg.sim` already
+    /// called `GameInitialize` at import time, and `dlopen` on the same path hands
+    /// back that same already-initialized object.  Such a host must pass
+    /// `init_game = false`.  A standalone Rust process that owns the library
+    /// passes `true`.
     ///
     /// # Safety
     ///
     /// `lib_path` must point to a valid libcg.so whose ABI matches.
-    pub unsafe fn load(lib_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub unsafe fn load(
+        lib_path: &str,
+        init_game: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let cg = unsafe { CgLib::load(lib_path)? };
 
-        // Per sim.py: lib.GameInitialize() is called once at import time.
-        unsafe { (cg.game_initialize)() };
+        if init_game {
+            unsafe { (cg.game_initialize)() };
+        }
 
         let agent = unsafe { (cg.agent_start)() };
         if agent.is_null() {

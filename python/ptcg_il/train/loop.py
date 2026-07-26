@@ -25,7 +25,9 @@ from torch.utils.data import DataLoader
 from ptcg_il.deck import build_deck_metadata
 from ptcg_il.deck import describe as describe_deck
 from ptcg_il.deck import update_sidecar, write_deck_csv
-from ptcg_il.model.policy import Policy, multiselect_ce
+from ptcg_il.belief_labels import BELIEF_WEIGHTS  # noqa: F401  (re-exported for the CLI)
+from ptcg_il.model.belief import belief_loss
+from ptcg_il.model.policy import Policy, load_policy_state, multiselect_ce
 from ptcg_il.train.checkpoint import save_checkpoint
 from ptcg_il.train.dataset import ShardDataset, collate_fn
 from ptcg_il.train.eval import offline_eval
@@ -49,6 +51,7 @@ BETAS: tuple[float, float] = (0.9, 0.95)
 LOG_EVERY: int = 50
 VAL_EVERY: int = 1000
 CKPT_EVERY: int = 2000
+
 
 # No-decay parameter name patterns
 _NO_DECAY_PATTERNS = (
@@ -258,9 +261,17 @@ class _EMA:
     def state_dict(self) -> dict:
         return {"decay": self.decay, "shadow": self.shadow}
 
-    def load_state_dict(self, sd: dict) -> None:
+    def load_state_dict(self, sd: dict, model: nn.Module | None = None) -> None:
         self.decay = sd["decay"]
         self.shadow = sd["shadow"]
+        if model is not None:
+            # A checkpoint written before a head existed carries no shadow
+            # entry for its parameters.  `update`/`apply` both skip unknown
+            # names, so without this back-fill those weights would never be
+            # averaged and `applied()` would evaluate a half-EMA model.
+            for n, p in model.named_parameters():
+                if p.requires_grad and n not in self.shadow:
+                    self.shadow[n] = p.data.clone().detach()
 
 
 def _compute_loss(
@@ -269,12 +280,15 @@ def _compute_loss(
     lambda_v: float = LAMBDA_V,
     label_smoothing: float = LABEL_SMOOTH,
     use_amp: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    belief_weights: dict[str, float] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     """Forward pass + loss only (no backward, no optimizer step).
 
-    Returns ``(loss, ce, value_mse_loss)`` where *loss* is a scalar tensor
-    ready for ``.backward()``.  Caller is responsible for scaling, backward,
-    gradient clipping, and optimizer step.
+    Returns ``(loss, ce, value_mse_loss, belief_parts)`` where *loss* is a
+    scalar tensor ready for ``.backward()`` and *belief_parts* holds the
+    per-term belief scalars for logging (empty when the belief loss is off).
+    Caller is responsible for scaling, backward, gradient clipping, and
+    optimizer step.
     """
     device_type = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -283,7 +297,14 @@ def _compute_loss(
         if use_amp
         else nullcontext()
     ):
-        logits, value, _history_h = policy(batch)  # [B, O], [B], [B, D]
+        # forward_with_belief shares the encode pass; calling policy() and then
+        # policy.belief_logits() would run the transformer twice per step.
+        want_belief = bool(belief_weights) and any(belief_weights.values())
+        if want_belief:
+            logits, value, _history_h, belief_preds = policy.forward_with_belief(batch)
+        else:
+            logits, value, _history_h = policy(batch)  # [B, O], [B], [B, D]
+            belief_preds = None
 
         maxcount = batch["maxCount"]
         single = maxcount == 1
@@ -346,7 +367,15 @@ def _compute_loss(
         else:
             value_mse_loss = torch.tensor(0.0, device=loss.device)
 
-    return loss, ce, value_mse_loss
+        belief_parts: dict[str, float] = {}
+        if belief_preds is not None:
+            # Every term is masked by bel_valid, so shards without labels
+            # contribute exactly 0 rather than a bogus gradient.
+            b_loss, belief_parts = belief_loss(belief_preds, batch, **belief_weights)
+            loss = loss + b_loss
+            belief_parts["belief/loss"] = float(b_loss.detach())
+
+    return loss, ce, value_mse_loss, belief_parts
 
 
 def train_step(
@@ -359,6 +388,7 @@ def train_step(
     lambda_v: float = LAMBDA_V,
     label_smoothing: float = LABEL_SMOOTH,
     grad_clip: float = GRAD_CLIP,
+    belief_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Run one optimizer step on *batch* (C.6).
 
@@ -385,9 +415,10 @@ def train_step(
     """
     use_amp = grad_scaler is not None
 
-    loss, ce, value_mse_loss = _compute_loss(
+    loss, ce, value_mse_loss, belief_parts = _compute_loss(
         policy, batch, lambda_v=lambda_v,
         label_smoothing=label_smoothing, use_amp=use_amp,
+        belief_weights=belief_weights,
     )
 
     # Backward
@@ -410,6 +441,7 @@ def train_step(
         "ce": ce.mean().item(),
         "value_mse": value_mse_loss.item(),
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
+        **belief_parts,
     }
 
 
@@ -427,6 +459,7 @@ def train(
     label_smoothing: float = LABEL_SMOOTH,
     ema_decay: float = EMA_DECAY,
     lambda_v: float = LAMBDA_V,
+    belief_weights: dict[str, float] | None = None,
     weight_decay: float = WEIGHT_DECAY,
     betas: tuple[float, float] = BETAS,
     total_steps: int | None = None,
@@ -635,10 +668,15 @@ def train(
     if resume_ckpt is not None:
         from ptcg_il.train.checkpoint import load_checkpoint
         ckpt = load_checkpoint(resume_ckpt, device)
-        policy.load_state_dict(ckpt["model_state_dict"])
+        stale = load_policy_state(policy, ckpt["model_state_dict"])
+        if stale:
+            logger.warning(
+                "Checkpoint predates the belief heads; %d belief parameters "
+                "start from scratch.", len(stale),
+            )
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        ema.load_state_dict(ckpt["ema_state_dict"])
+        ema.load_state_dict(ckpt["ema_state_dict"], model=policy)
         start_step = ckpt["step"]
         logger.info("Resumed from step %d", start_step)
 
@@ -697,11 +735,12 @@ def train(
             batch_gpu[k] = v.to(device, non_blocking=(device.type == "cuda"))
 
         # ---- micro-batch forward ----
-        loss, ce, value_mse_loss = _compute_loss(
+        loss, ce, value_mse_loss, belief_parts = _compute_loss(
             policy, batch_gpu,
             lambda_v=lambda_v,
             label_smoothing=label_smoothing,
             use_amp=use_amp,
+            belief_weights=belief_weights,
         )
 
         # Scale loss for gradient accumulation
@@ -745,6 +784,10 @@ def train(
             "grad_norm": (
                 grad_norm_val.item() if isinstance(grad_norm_val, torch.Tensor) else float(grad_norm_val)
             ) if is_accum_boundary else 0.0,
+            # Belief scalars come from the last micro-batch rather than the
+            # accumulation average: they are diagnostics, not the objective,
+            # and each is already a batch mean.
+            **belief_parts,
         }
 
         if is_accum_boundary:
@@ -766,6 +809,7 @@ def train(
                 grad_norm=metrics["grad_norm"],
                 lr=lr,
                 samples_per_sec=batch_size / max(data_wait, 0.001),
+                extra={k: v for k, v in metrics.items() if k.startswith("belief/")},
             )
 
         # Offline eval
@@ -775,6 +819,7 @@ def train(
                 ema=ema,
                 lambda_v=lambda_v,
                 label_smoothing=label_smoothing,
+                belief=belief_weights is not None,
             )
             eval_metrics["step"] = step + 1
             wandb_logger.log_eval(**eval_metrics)
@@ -863,8 +908,8 @@ def train(
         if best_path.exists():
             from ptcg_il.train.checkpoint import load_checkpoint
             ckpt = load_checkpoint(best_path, device)
-            policy.load_state_dict(ckpt["model_state_dict"])
-            ema.load_state_dict(ckpt["ema_state_dict"])
+            load_policy_state(policy, ckpt["model_state_dict"])
+            ema.load_state_dict(ckpt["ema_state_dict"], model=policy)
             ema.apply(policy)
 
     wandb_logger.finish()

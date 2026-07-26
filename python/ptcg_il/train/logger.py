@@ -104,13 +104,20 @@ class WandbLogger:
         grad_norm: float,
         lr: float,
         samples_per_sec: float,
+        extra: dict[str, float] | None = None,
     ) -> None:
-        """Log per-step training scalars (C.9 ``LOG_EVERY``)."""
+        """Log per-step training scalars (C.9 ``LOG_EVERY``).
+
+        *extra* carries already-namespaced scalars from optional loss terms
+        (``belief/*``), so a new auxiliary head does not need a new keyword
+        argument here.
+        """
         # Console fallback when wandb is unavailable
         if not self._active:
+            tail = "".join(f"  {k}={v:.4f}" for k, v in sorted((extra or {}).items()))
             logger.info(
-                "step %d  loss=%.4f  ce=%.4f  grad=%.3f  lr=%.2e  samp/s=%d",
-                step, loss, ce, grad_norm, lr, int(samples_per_sec),
+                "step %d  loss=%.4f  ce=%.4f  grad=%.3f  lr=%.2e  samp/s=%d%s",
+                step, loss, ce, grad_norm, lr, int(samples_per_sec), tail,
             )
             return
         wandb = _get_wandb()
@@ -124,6 +131,7 @@ class WandbLogger:
                 "train/grad_norm": grad_norm,
                 "train/lr": lr,
                 "perf/samples_per_sec": samples_per_sec,
+                **(extra or {}),
             },
             step=step,
         )
