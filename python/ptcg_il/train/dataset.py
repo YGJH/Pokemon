@@ -1,13 +1,30 @@
 """ShardDataset + collate_fn (TRANSFORMER_IL_SPEC.md C.1–C.4).
 
-mmap-based dataset reading fixed-shape .npz shard slices, joined with
-meta.parquet for per-sample metadata.  ``sample_weight`` is derived at load
-time from meta columns via the C.3 formula.
+mmap-based dataset reading fixed-shape shard slices, joined with meta.parquet
+for per-sample metadata.  ``sample_weight`` is derived at load time from meta
+columns via the C.3 formula.
+
+The shards on disk are ``np.savez_compressed`` archives, and ``np.load``'s
+``mmap_mode`` is **silently ignored** for ``.npz``: it returns an ``NpzFile``,
+and materialising it decompresses every array into anonymous RAM.  The
+compression ratio is ~94x (5.6 MB on disk -> 528 MB resident for a 50k-sample
+shard, because the padded feature tensors are mostly zeros), and with
+``num_workers=8`` every worker paid it independently — ~14 GB for the real
+187k-sample corpus.
+
+So each shard is decompressed **once** into a ``.npy``-per-key directory under
+``shards/.mmap-cache/`` and mmap'd from there.  Resident memory then comes from
+the OS page cache: shared between workers, evictable under pressure, and
+independent of corpus size.  The cache is built in ``__init__`` (parent process,
+one array at a time) so the workers only ever mmap.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Iterator
 
@@ -15,6 +32,11 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
+
+#: Subdirectory of ``shards/`` holding the decompressed, mmap-able copies.
+MMAP_CACHE_DIRNAME = ".mmap-cache"
 
 # ============================================================
 # Constants from C.3 / C.10
@@ -108,6 +130,81 @@ def compute_sample_weights(
     weights /= weights.mean()  # normalize to mean ≈ 1.0
 
     return weights.astype(np.float32)
+
+
+def _cache_stamp(npz_path: Path) -> dict:
+    """Identity of the shard a cache directory was built from."""
+    st = npz_path.stat()
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _cache_is_current(cache_dir: Path, npz_path: Path) -> bool:
+    """True only if the cache was built from *this* shard and is complete.
+
+    Completeness matters as much as freshness: an interrupted build leaves a
+    directory that exists but is missing keys, and reusing it would fail deep
+    inside ``__getitem__`` rather than here.
+    """
+    stamp_path = cache_dir / "_source.json"
+    if not stamp_path.is_file():
+        return False
+    try:
+        stamp = json.loads(stamp_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    if stamp.get("source") != _cache_stamp(npz_path):
+        return False
+    present = {p.stem for p in cache_dir.glob("*.npy")}
+    return present == set(stamp.get("keys", []))
+
+
+def build_mmap_cache(npz_path: Path, cache_root: Path) -> Path | None:
+    """Decompress *npz_path* into a ``.npy``-per-key directory, once.
+
+    Returns the directory, or ``None`` when it cannot be written — a read-only
+    or full corpus directory degrades to the old in-RAM path rather than
+    failing training outright.
+
+    Arrays are converted one at a time: ``dict(np.load(...))`` would hold all
+    45 of them at once (528 MB), which is the peak this whole mechanism exists
+    to avoid.  The build goes to a temporary sibling and is renamed into place,
+    so an interrupted run never leaves a half-cache that looks valid.
+    """
+    npz_path = Path(npz_path)
+    cache_dir = Path(cache_root) / npz_path.name
+
+    if _cache_is_current(cache_dir, npz_path):
+        return cache_dir
+
+    tmp_dir = cache_dir.with_name(f"{cache_dir.name}.tmp-{os.getpid()}")
+    try:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+        keys: list[str] = []
+        with np.load(npz_path, allow_pickle=False) as z:
+            for key in z.files:
+                np.save(tmp_dir / f"{key}.npy", z[key])
+                keys.append(key)
+        (tmp_dir / "_source.json").write_text(
+            json.dumps({"source": _cache_stamp(npz_path), "keys": keys})
+        )
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        os.replace(tmp_dir, cache_dir)
+    except OSError as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Another process may have finished the same cache while this one
+        # failed; use it if it is valid, otherwise fall back to in-RAM loading.
+        if _cache_is_current(cache_dir, npz_path):
+            return cache_dir
+        logger.warning(
+            "Cannot build mmap cache for %s (%s) — falling back to loading the "
+            "shard into RAM. Expect high memory use with num_workers > 0.",
+            npz_path.name, exc,
+        )
+        return None
+    return cache_dir
 
 
 class ShardDataset(Dataset[dict[str, torch.Tensor]]):
@@ -205,16 +302,69 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         # Lazily open shards — mmap each unique shard once
         self._shard_cache: dict[str, dict[str, np.ndarray]] = {}
         self._shards_dir = data_dir / "shards"
+        self._mmap_dirs: dict[str, Path] = {}
+        self._prepare_mmap_cache()
 
-    def _open_shard(self, shard_name: str) -> dict[str, np.ndarray]:
-        """Open a .npz file with mmap_mode='r' and cache it."""
-        if shard_name not in self._shard_cache:
+    def _prepare_mmap_cache(self) -> None:
+        """Decompress this split's shards to mmap-able form, before forking.
+
+        Done here rather than on first access because DataLoader workers are
+        forked after construction: a lazy build would have all 8 of them
+        decompress the same shard at the same time, which is precisely the
+        memory spike being avoided.  Only the shards this split references are
+        touched, so a val dataset does not pay for the train shards.
+        """
+        cache_root = self._shards_dir / MMAP_CACHE_DIRNAME
+        n_built = 0
+        for shard_name in sorted(set(self.meta["shard"].astype(str))):
             path = self._shards_dir / shard_name
             if not path.exists():
                 raise FileNotFoundError(f"Shard file not found: {path}")
-            self._shard_cache[shard_name] = dict(
-                np.load(path, mmap_mode="r", allow_pickle=False)
+            stale = not _cache_is_current(cache_root / path.name, path)
+            cache_dir = build_mmap_cache(path, cache_root)
+            if cache_dir is not None:
+                self._mmap_dirs[shard_name] = cache_dir
+                n_built += stale
+
+        # Drop caches whose shard is gone — rebuilding the corpus with a
+        # different shard count would otherwise strand GBs.  Keyed on the
+        # source file existing, so a train dataset never evicts val caches.
+        if cache_root.is_dir():
+            for orphan in cache_root.iterdir():
+                if orphan.is_dir() and not (self._shards_dir / orphan.name).exists():
+                    shutil.rmtree(orphan, ignore_errors=True)
+
+        if n_built:
+            # Not silent: this is why the first run pauses before step 0, and
+            # why shards/ grew by roughly the decompressed corpus size.
+            logger.info(
+                "Decompressed %d %s shard(s) to %s (%.1f GB total) for "
+                "memory-mapped access; reused on later runs.",
+                n_built, self.split, cache_root,
+                sum(p.stat().st_size for p in cache_root.rglob("*.npy")) / 1e9,
             )
+
+    def _open_shard(self, shard_name: str) -> dict[str, np.ndarray]:
+        """Return the shard's arrays, mmap'd when a cache is available.
+
+        The fallback branch reads the compressed archive into RAM — correct,
+        but ~94x its on-disk size and per-worker.  It only runs when the cache
+        could not be written.
+        """
+        if shard_name not in self._shard_cache:
+            cache_dir = self._mmap_dirs.get(shard_name)
+            if cache_dir is not None:
+                self._shard_cache[shard_name] = {
+                    p.stem: np.load(p, mmap_mode="r", allow_pickle=False)
+                    for p in cache_dir.glob("*.npy")
+                }
+            else:
+                path = self._shards_dir / shard_name
+                if not path.exists():
+                    raise FileNotFoundError(f"Shard file not found: {path}")
+                self._shard_cache[shard_name] = dict(
+                    np.load(path, allow_pickle=False)
+                )
         return self._shard_cache[shard_name]
 
     def __len__(self) -> int:

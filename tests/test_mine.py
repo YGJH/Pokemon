@@ -101,7 +101,7 @@ def test_run_raises_insufficient_data_on_empty_corpus(tmp_path):
 
 
 def test_main_reports_insufficient_data_cleanly(monkeypatch, capsys, tmp_path):
-    def boom(config, skip_download):
+    def boom(config, skip_download, force=False):
         raise mine.InsufficientDataError("corpus too thin")
 
     monkeypatch.setattr(mine, "run", boom)
@@ -109,3 +109,141 @@ def test_main_reports_insufficient_data_cleanly(monkeypatch, capsys, tmp_path):
     assert rc == 1
     captured = capsys.readouterr()
     assert "corpus too thin" in (captured.out + captured.err)
+
+
+# ============================================================
+# Phase 2 skip-when-unchanged (ptcg_mine.stamp)
+# ============================================================
+#
+# Phase 2 re-parses the whole corpus (~15 min over the real 9910 episodes) to
+# produce artifacts that are a pure function of (corpus, config, code).  These
+# tests pin *when* it is allowed to skip that work — a skip that fires on a
+# changed corpus would train the next stage on artifacts describing a corpus
+# that no longer exists.
+
+
+def _stamped_data_dir(tmp_path, config, summary=None):
+    """A data dir holding mine's four outputs plus a matching fresh stamp."""
+    from ptcg_mine import stamp
+
+    data = config.out_dir
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "vocab.json").write_text('{"size": 296}')
+    (data / "archetypes.json").write_text('{"self_ids": [0]}')
+    (data / "card_static_table.npy").write_bytes(b"card")
+    (data / "attack_static_table.npy").write_bytes(b"atk")
+    stamp.write("mine", raw_dir=config.raw_dir, data_dir=data,
+                params=stamp.params_from_config("mine", config),
+                summary=summary or {"vocab_size": 296, "n_attacks": 216,
+                                    "n_experts": 10, "n_archetypes": 179,
+                                    "self_ids": [0, 1], "opp_ids": [0, 1],
+                                    "out_dir": str(data), "episodes_loaded": 9910,
+                                    "episodes_valid": 9900, "expert_games": 500})
+    return data
+
+
+def _config_with_corpus(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _write_episode(raw, "a.json", n_steps=2, step_payload_cards=2)
+    return MineConfig(raw_dir=raw, out_dir=tmp_path / "data")
+
+
+def test_run_skips_phase2_when_nothing_changed(tmp_path, monkeypatch):
+    config = _config_with_corpus(tmp_path)
+    _stamped_data_dir(tmp_path, config)
+
+    def boom(*a, **k):
+        raise AssertionError("Phase 2 re-parsed the corpus despite a fresh stamp")
+
+    monkeypatch.setattr(mine, "load_raw_episodes", boom)
+    summary = mine.run(config, skip_download=True)
+    assert summary["cached"] is True
+    assert summary["vocab_size"] == 296
+    assert summary["self_ids"] == [0, 1]
+
+
+def _spy_phase2(monkeypatch):
+    """Record whether Phase 2 re-parsed the corpus, without stubbing it out.
+
+    The thin fixture corpus completes Phase 2 successfully (select_experts
+    falls back to a 1-game threshold on thin data), so "did it raise?" cannot
+    tell a skip from a run — the call itself has to be observed.
+    """
+    calls = []
+    real = mine.load_raw_episodes
+
+    def spy(raw_dir):
+        calls.append(raw_dir)
+        return real(raw_dir)
+
+    monkeypatch.setattr(mine, "load_raw_episodes", spy)
+    return calls
+
+
+def test_run_recomputes_when_the_corpus_grew(tmp_path, monkeypatch):
+    """The skip must key on corpus content, not merely on artifacts existing."""
+    config = _config_with_corpus(tmp_path)
+    _stamped_data_dir(tmp_path, config)
+    _write_episode(config.raw_dir, "b.json", n_steps=2, step_payload_cards=2)
+    calls = _spy_phase2(monkeypatch)
+
+    summary = mine.run(config, skip_download=True)
+    assert calls, "a grown corpus was served from the stamp"
+    assert summary["cached"] is False
+
+
+def test_run_recomputes_when_forced(tmp_path, monkeypatch):
+    config = _config_with_corpus(tmp_path)
+    _stamped_data_dir(tmp_path, config)
+    calls = _spy_phase2(monkeypatch)
+
+    mine.run(config, skip_download=True, force=True)
+    assert calls, "--force did not recompute"
+
+
+def test_run_recomputes_when_an_artifact_was_deleted(tmp_path, monkeypatch):
+    config = _config_with_corpus(tmp_path)
+    data = _stamped_data_dir(tmp_path, config)
+    (data / "vocab.json").unlink()
+    calls = _spy_phase2(monkeypatch)
+
+    mine.run(config, skip_download=True)
+    assert calls, "a missing artifact was served from the stamp"
+
+
+def test_a_completed_run_stamps_itself(tmp_path, monkeypatch):
+    """Second run is free only if the first one recorded its fingerprint."""
+    config = _config_with_corpus(tmp_path)
+    mine.run(config, skip_download=True)
+
+    calls = _spy_phase2(monkeypatch)
+    summary = mine.run(config, skip_download=True)
+    assert not calls, "the second identical run re-parsed the corpus"
+    assert summary["cached"] is True
+
+
+def test_download_still_runs_before_the_freshness_check(tmp_path, monkeypatch):
+    """The check is deliberately *after* Phase 1.  Skipping the whole stage
+    when artifacts look fresh would silently stop fetching new episodes."""
+    import sys
+    import types
+
+    from ptcg_mine import download as download_mod
+
+    config = _config_with_corpus(tmp_path)
+    _stamped_data_dir(tmp_path, config)
+
+    fake_kaggle = types.ModuleType("kaggle.api.kaggle_api_extended")
+    fake_kaggle.KaggleApi = lambda: types.SimpleNamespace(authenticate=lambda: None)
+    monkeypatch.setitem(sys.modules, "kaggle", types.ModuleType("kaggle"))
+    monkeypatch.setitem(sys.modules, "kaggle.api", types.ModuleType("kaggle.api"))
+    monkeypatch.setitem(sys.modules, "kaggle.api.kaggle_api_extended", fake_kaggle)
+
+    calls = []
+    monkeypatch.setattr(download_mod, "download_corpus",
+                        lambda cfg, api: calls.append(cfg))
+
+    summary = mine.run(config, skip_download=False)
+    assert calls, "Phase 1 was skipped along with Phase 2"
+    assert summary["cached"] is True

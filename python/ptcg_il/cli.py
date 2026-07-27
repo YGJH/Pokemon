@@ -71,10 +71,11 @@ DEFAULTS = {
     "patience": 5,
     # Live eval
     "live_eval_games": 500,
-    # W&B
+    # W&B.  Runs land in the `poken` team by default; override with
+    # --wandb-entity, or set it to your personal entity for a scratch run.
     "wandb_project": "pokemon-tcg-il",
-    "wandb_entity": None,
-    "wandb_name": None,
+    "wandb_entity": "poken",
+    "wandb_name": "pokemon-tcg-il",
     "wandb_mode": "online",
 }
 
@@ -112,6 +113,26 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Jaccard threshold for archetype clustering (default: 0.90)")
     bs_config.add_argument("--samples-per-shard", type=int, default=50000,
                          help="Max samples per .npz shard file (default: 50000)")
+    bs_parser.add_argument("--force", action="store_true",
+                         help="Rebuild even when the corpus, config, code and "
+                              "vocab/archetypes are unchanged since the last "
+                              "successful build (default: reuse existing shards)")
+
+    # ---- archetypes ----
+    # The pipeline calls this to decide which specialists to train.  Hardcoding
+    # ids in the shell is unsafe: they are cluster indices and get reassigned
+    # whenever mining is re-run.
+    arch_parser = sub.add_parser(
+        "archetypes",
+        help="Print the best-supported 𝒟_self archetype ids for this corpus",
+    )
+    arch_parser.add_argument("--data-dir", type=str, default="data",
+                             help="Directory with archetypes.json + meta.parquet")
+    arch_parser.add_argument("--top", type=int, default=2,
+                             help="How many ids to print (default: 2)")
+    arch_parser.add_argument("--describe", action="store_true",
+                             help="Print a row-count table for every 𝒟_self archetype "
+                                  "instead of the bare id list")
 
     # Paths
     paths = train_parser.add_argument_group("Paths")
@@ -184,13 +205,16 @@ def _build_parser() -> argparse.ArgumentParser:
     loss.add_argument("--ema-decay", type=float, default=DEFAULTS["ema_decay"],
                       help="EMA decay for parameter averaging")
 
-    # Opponent-card belief (auxiliary supervision for MCTS determinization)
+    # Opponent-card belief (auxiliary supervision for MCTS determinization).
+    # These heads always train: build-shards writes belief labels for every
+    # decision point unconditionally, and the RL stage's determinizer needs the
+    # heads to exist.  Set every weight to 0 to disable the term.
     bel = train_parser.add_argument_group("Belief heads")
-    bel.add_argument("--belief", action="store_true",
-                     help="Train the auxiliary opponent-card belief heads "
-                          "(archetype / deck / hidden pool / hand). Requires "
-                          "shards mined with belief labels; on an older corpus "
-                          "every row is masked and the term is a no-op.")
+    bel.add_argument("--no-belief", action="store_true",
+                     help="Disable the auxiliary opponent-card belief heads "
+                          "(archetype / deck / hidden pool / hand). They train by "
+                          "default; disabling them saves the heads' [B, V] matmuls "
+                          "but leaves the MCTS determinizer on its mirror-deck guess.")
     for name, default in BELIEF_WEIGHTS.items():
         bel.add_argument(f"--belief-{name[2:]}", type=float, default=default,
                          dest=f"belief_{name[2:]}",
@@ -247,6 +271,20 @@ def _build_parser() -> argparse.ArgumentParser:
     qa.add_argument("--skip-qa", action="store_true",
                     help="Skip QA gates (not recommended)")
 
+    # Baseline recording (pipeline stage 4c)
+    base = train_parser.add_argument_group("IL baselines (RL_SPEC §10.2 cond. 3)")
+    base.add_argument("--eval-split", type=str, default="val",
+                      choices=["train", "val", "test"],
+                      help="Split for --eval-only (default: val). Baselines are "
+                           "recorded from 'test' — RL_SPEC §10.2 condition 3 is a "
+                           "held-out check, and 'val' drove model selection.")
+    base.add_argument("--record-baseline", action="store_true",
+                      help="Write this checkpoint's offline-eval scores to "
+                           "<data-dir>/il_baselines.json, SHA-1-pinned to the "
+                           "checkpoint. The RL promotion gate reads this and "
+                           "refuses to run against a baseline from a different "
+                           "model. Use with --eval-only.")
+
     return parser
 
 
@@ -290,10 +328,16 @@ def _belief_weights(args: argparse.Namespace) -> dict[str, float] | None:
     """CLI flags → the ``belief_weights`` dict, or None when disabled.
 
     None (not a dict of zeros) is what turns the belief forward pass off
-    entirely, so a run without ``--belief`` never pays for the heads' [B, V]
+    entirely, so a run with ``--no-belief`` never pays for the heads' [B, V]
     matmuls.
+
+    The heads are on by default.  They used to be opt-in via ``--belief``,
+    guarding against shards mined without belief labels — but ``shard_writer``
+    writes those labels for every decision point unconditionally, so the guard
+    protected against a corpus that no longer exists, while the *default* left
+    the MCTS determinizer on its mirror-deck guess.
     """
-    if not getattr(args, "belief", False):
+    if getattr(args, "no_belief", False):
         return None
     return {name: float(getattr(args, f"belief_{name[2:]}")) for name in BELIEF_WEIGHTS}
 
@@ -338,7 +382,13 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
 
 
 def cmd_build_shards(args: argparse.Namespace) -> int:
-    """Execute the ``build-shards`` subcommand (Phase 3 featurization)."""
+    """Execute the ``build-shards`` subcommand (Phase 3 featurization).
+
+    Featurizing the whole corpus takes ~35 min and is a pure function of
+    (corpus, config, featurizer/selection code, vocab.json + archetypes.json),
+    so an unchanged run reuses the existing shards.  ``--force`` recomputes.
+    """
+    from ptcg_mine import stamp
     from ptcg_mine.config import MineConfig
     from ptcg_il.shard_writer import build_shards
 
@@ -349,6 +399,24 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
         g_min=args.g_min,
         jaccard_thresh=args.jaccard_thresh,
     )
+    params = stamp.params_from_config(
+        "shards", config, **{"samples-per-shard": args.samples_per_shard}
+    )
+
+    if not args.force:
+        fresh, reason = stamp.check(
+            "shards", raw_dir=config.raw_dir, data_dir=config.out_dir,
+            params=params, require_summary=True,
+        )
+        rec = stamp.read("shards", config.out_dir) if fresh else None
+        if rec and rec.get("summary"):
+            summary = rec["summary"]
+            logger.info(
+                "Phase 3: shards up to date (%s) — skipping. %d samples in %d shards.",
+                reason, summary["total_samples"], summary["n_shards"],
+            )
+            return 0
+        logger.info("Phase 3: rebuilding shards — %s", reason)
 
     logger.info("Phase 3: building shards from %s → %s", config.raw_dir, config.out_dir)
     summary = build_shards(config, samples_per_shard=args.samples_per_shard)
@@ -363,6 +431,11 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
     if summary["total_samples"] == 0:
         logger.error("No samples produced! Check that experts, D_self/D_opp, and raw data are available.")
         return 1
+
+    # Stamped only on a run that produced samples, so a failed build never
+    # blesses a partial shards/ directory.
+    stamp.write("shards", raw_dir=config.raw_dir, data_dir=config.out_dir,
+                params=params, summary=summary)
     return 0
 
 
@@ -412,11 +485,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             return 1
         return _cmd_eval_only(policy, artifacts, args)
 
-    # Set W&B mode
-    if args.no_wandb:
-        os.environ["WANDB_MODE"] = "disabled"
-    elif args.wandb_mode:
-        os.environ["WANDB_MODE"] = args.wandb_mode
+    os.environ["WANDB_MODE"] = _wandb_mode(args)
 
     # Determine total steps
     total_steps = args.total_steps
@@ -450,7 +519,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         mixed_precision=args.mixed_precision and not args.fp32,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
-        wandb_name=args.wandb_name,
+        wandb_name=_wandb_run_name(args),
         resume_ckpt=args.resume,
         run_val=True,
         patience=args.patience,
@@ -462,6 +531,32 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     logger.info("Training complete.  Best checkpoint at %s/ckpt-best.pt", out_dir)
     return 0
+
+
+def _wandb_mode(args: argparse.Namespace) -> str:
+    """Effective ``WANDB_MODE``.
+
+    ``--no-wandb`` wins over ``--wandb-mode``: it was declared as an off switch
+    but never read anywhere, so passing it used to log online regardless.
+    """
+    return "disabled" if getattr(args, "no_wandb", False) else args.wandb_mode
+
+
+def _wandb_run_name(args: argparse.Namespace) -> str | None:
+    """Run name, suffixed with the archetype when training a specialist.
+
+    Pipeline stage 4a trains one model per 𝒟_self archetype in the same
+    project, so the bare default would produce several identically-named runs
+    that can only be told apart by opening their config.  An explicit
+    ``--wandb-name`` is honoured verbatim — the suffix is only added to the
+    default.
+    """
+    name = args.wandb_name
+    if name is None or name != DEFAULTS["wandb_name"]:
+        return name
+    if getattr(args, "archetype_self", None) is None:
+        return f"{name}-generalist"
+    return f"{name}-a{args.archetype_self}"
 
 
 def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> int:
@@ -485,10 +580,24 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
     from ptcg_il.train.eval import offline_eval
     from torch.utils.data import DataLoader
 
+    split = getattr(args, "eval_split", "val")
+    # A baseline is a held-out claim, so it must not come from the split that
+    # chose the checkpoint.  Fail rather than silently recording a val number
+    # under a name the gate will read as "test".
+    if getattr(args, "record_baseline", False) and split != "test":
+        logger.error(
+            "--record-baseline requires --eval-split test (got %r): RL_SPEC "
+            "§10.2 condition 3 is a held-out check, and 'val' selected this "
+            "checkpoint", split,
+        )
+        return 1
+
+    eval_metrics: dict[str, Any] = {}
     try:
-        val_ds = ShardDataset(args.data_dir, split="val", shuffle=False)
-        val_loader = DataLoader(
-            val_ds,
+        eval_ds = ShardDataset(args.data_dir, split=split, shuffle=False,
+                               archetype_self=args.archetype_self)
+        eval_loader = DataLoader(
+            eval_ds,
             batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
@@ -497,14 +606,38 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
             drop_last=False,
         )
         eval_metrics = offline_eval(
-            policy, val_loader, device, lambda_v=args.lambda_v,
+            policy, eval_loader, device, lambda_v=args.lambda_v,
             belief=_belief_weights(args) is not None,
         )
-        logger.info("Offline eval: top1_macro=%.4f, top1_micro=%.4f",
-                    eval_metrics.get("val/top1_macro", 0.0),
-                    eval_metrics.get("val/top1_micro", 0.0))
+        logger.info(
+            "Offline eval (%s): top1_macro=%.4f, top1_micro=%.4f, "
+            "top1_nontrivial=%.4f, value_corr=%.4f, value_std=%.4f",
+            split,
+            eval_metrics.get("val/top1_macro", 0.0),
+            eval_metrics.get("val/top1_micro", 0.0),
+            eval_metrics.get("val/top1_nontrivial", 0.0),
+            eval_metrics.get("val/value_corr", 0.0),
+            eval_metrics.get("val/value_std", 0.0),
+        )
     except (ValueError, FileNotFoundError) as e:
         logger.warning("Cannot run offline eval: %s", e)
+
+    if getattr(args, "record_baseline", False):
+        if not eval_metrics:
+            logger.error("--record-baseline: offline eval produced no metrics")
+            return 1
+        from ptcg_il.baselines import record_baseline
+
+        record = record_baseline(
+            args.data_dir, args.archetype_self, args.resume, eval_metrics
+        )
+        logger.info(
+            "Recorded IL baseline for archetype %s: nontrivial_top1=%.4f "
+            "(sha1 %s)",
+            args.archetype_self if args.archetype_self is not None else "generalist",
+            record.get("nontrivial_top1", 0.0),
+            record["ckpt_sha1"][:12],
+        )
 
     # Live eval
     if args.live_eval:
@@ -544,7 +677,7 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
     # opponent deck instead of the mirror assumption.  Kept alongside the plain
     # planner rather than replacing it, so the two numbers measure what the
     # belief model is actually worth.
-    if getattr(args, "belief", False):
+    if _belief_weights(args) is not None:
         try:
             import copy
 
@@ -611,6 +744,36 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
             )
 
 
+def cmd_archetypes(args: argparse.Namespace) -> int:
+    """Print the archetype ids the pipeline should train specialists for.
+
+    Writes to stdout only, so the pipeline can capture it directly:
+    ``ARCHETYPES=$(uv run python -m ptcg_il.cli archetypes --top 2)``.
+    Diagnostics go to stderr via the logger so they never pollute that capture.
+    """
+    from ptcg_il.archetype_select import describe, pick_archetypes
+
+    if args.describe:
+        print(describe(args.data_dir))
+        return 0
+
+    ids = pick_archetypes(args.data_dir, top=args.top)
+    if not ids:
+        logger.error(
+            "No 𝒟_self archetype in %s has enough held-out data to train a "
+            "specialist. Run `ptcg_il.cli archetypes --describe` to see the "
+            "row counts.", args.data_dir,
+        )
+        return 1
+    if len(ids) < args.top:
+        logger.warning(
+            "Only %d of the requested %d archetypes have enough held-out data; "
+            "training %s", len(ids), args.top, ids,
+        )
+    print(" ".join(str(i) for i in ids))
+    return 0
+
+
 # ============================================================
 # Entry point
 # ============================================================
@@ -631,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train(args)
     elif args.command == "build-shards":
         return cmd_build_shards(args)
+    elif args.command == "archetypes":
+        return cmd_archetypes(args)
     else:
         parser.print_help()
         return 0

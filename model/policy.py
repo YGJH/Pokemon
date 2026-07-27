@@ -9,11 +9,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ptcg_il.model.belief import BeliefHeads, BeliefModule
-from ptcg_il.model.embed import TokenEmbedder
-from ptcg_il.model.encoder import Encoder
-from ptcg_il.model.pointer import PointerHead
-from ptcg_il.model.value import ValueHead
+from model.belief import BeliefHeads, BeliefModule
+from model.embed import TokenEmbedder
+from model.encoder import Encoder
+from model.pointer import PointerHead
+from model.value import ValueHead
 
 
 class Policy(nn.Module):

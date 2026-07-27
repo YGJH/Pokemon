@@ -297,6 +297,8 @@ def offline_eval(
     else:
         metrics["val/value_auc"] = 0.5  # chance
 
+    metrics.update(_value_health(all_values, all_targets))
+
     metrics["val/best_top1_macro"] = 0.0  # placeholder, filled by loop
 
     if belief:
@@ -356,6 +358,45 @@ def _belief_metrics(acc: dict[str, list[float]]) -> dict[str, float]:
         out[name] = total / n if n else 0.0
         out[f"{name}_n"] = float(n)
     return out
+
+
+def _value_health(predictions: list[float], targets: list[float]) -> dict[str, float]:
+    """Diagnostics for a collapsed value head (RL_SPEC §3).
+
+    A dead critic is not visible in ``value_mse``: predicting a constant ~0
+    against ±1 labels scores ~1.0, which looks like a merely-mediocre head
+    rather than one carrying no signal at all.  ``value_std`` is what
+    distinguishes them, and ``value_corr`` is the quantity R1 gates on
+    (≥ 0.35 to proceed).
+
+    Returns zeros when there is nothing to measure, and a correlation of 0.0
+    when either side is constant — ``np.corrcoef`` would return NaN there, and a
+    NaN silently poisons every downstream comparison.
+    """
+    if len(predictions) < 2:
+        return {"val/value_std": 0.0, "val/value_corr": 0.0, "val/value_sign_agree": 0.0}
+
+    pred = np.asarray(predictions, dtype=np.float64)
+    targ = np.asarray(targets, dtype=np.float64)
+
+    pred_std = float(pred.std())
+    targ_std = float(targ.std())
+    if pred_std <= 0.0 or targ_std <= 0.0:
+        corr = 0.0
+    else:
+        corr = float(((pred - pred.mean()) * (targ - targ.mean())).mean() / (pred_std * targ_std))
+
+    # Sign agreement excludes zero-valued targets, which have no sign to match.
+    signed = targ != 0.0
+    sign_agree = (
+        float((np.sign(pred[signed]) == np.sign(targ[signed])).mean()) if signed.any() else 0.0
+    )
+
+    return {
+        "val/value_std": pred_std,
+        "val/value_corr": corr,
+        "val/value_sign_agree": sign_agree,
+    }
 
 
 def _compute_auc(predictions: list[float], targets: list[float]) -> float:

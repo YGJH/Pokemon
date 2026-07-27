@@ -115,6 +115,17 @@ pub struct SearchPlan {
     pub indices: Vec<i32>,
     /// Per-option visit counts for diagnostics.
     pub visit_counts: Vec<(i32, u32)>,
+    /// Mean backpropagated value at the root, from our perspective, in [-1, 1].
+    ///
+    /// This is the `Ṽ` of RL_SPEC §8.3: the regression target for the
+    /// search-distillation value term.
+    ///
+    /// `None` means *no estimate was produced*, not "the estimate was zero" —
+    /// the two are very different to a regression target, and a bare 0.0 would
+    /// quietly train the critic toward a draw on every multi-select decision
+    /// point.  `multi_select_greedy` has no tree to average over and always
+    /// reports `None`.
+    pub root_value: Option<f64>,
     /// Total iterations performed.
     pub iterations: u32,
     /// Number of tree nodes created.
@@ -145,6 +156,7 @@ pub fn search(
         return Ok(SearchPlan {
             indices: vec![],
             visit_counts: vec![],
+            root_value: None,
             iterations: 0,
             nodes_created: 0,
         });
@@ -318,6 +330,18 @@ fn single_select_mcts(
 
     let best_action = visit_counts.first().map(|(a, _)| *a).unwrap_or(0);
 
+    // Root mean value.  The root is seeded with `visits: 1.0, total_value: 0.0`
+    // and every backpropagation increments both, so after N iterations
+    // `visits == 1.0 + N`.  Dividing by `visits` would therefore pull the mean
+    // toward zero by a factor N/(N+1); dividing by the *playout* count is the
+    // unbiased average this is meant to be.
+    let playouts = root_node.visits - 1.0;
+    let root_value = if playouts > 0.0 {
+        Some((root_node.total_value / playouts).clamp(-1.0, 1.0))
+    } else {
+        None
+    };
+
     // Cleanup engine states
     for sid in tree.all_search_ids() {
         engine.search_release(sid);
@@ -326,6 +350,7 @@ fn single_select_mcts(
     Ok(SearchPlan {
         indices: vec![best_action],
         visit_counts,
+        root_value,
         iterations: config.iterations,
         nodes_created: tree.nodes.len(),
     })
@@ -464,9 +489,14 @@ fn multi_select_greedy(
 
     engine.search_release(current_search_id);
 
+    // No tree, therefore no root value.  See `SearchPlan::root_value` for why
+    // this is `None` rather than the best pick's rollout score: that score is a
+    // single-playout maximum, and a max over noisy samples is a biased estimate
+    // of the mean this field is supposed to carry.
     Ok(SearchPlan {
         indices: chosen,
         visit_counts: vec![],
+        root_value: None,
         iterations: config.iterations,
         nodes_created: 0,
     })

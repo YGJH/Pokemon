@@ -11,12 +11,13 @@ disagree on hyperparameters, tensor layout, or gate thresholds, `RL_SPEC.md` win
 
 Turn `scripts/run_pipeline.sh` into a five-stage pipeline that runs end to end:
 build the Rust engine, collect the corpus, featurize it, train two per-deck IL
-specialists plus the opponent-belief models, and then improve one specialist by
-PPO self-play anchored to its IL prior.
+specialists plus the opponent-belief models, and then improve each specialist by
+PPO self-play anchored to its own IL prior.
 
 This delivers `RL_SPEC.md` phases **R0c** (rebuild shards, retrain specialists,
-re-record baselines), **R1** (critic repair), and **R2** (PPO + KL anchor, one
-deck, self-play, no MCTS in the loss).
+re-record baselines), **R1** (critic repair), and **R2** (PPO + KL anchor,
+self-play, no MCTS in the loss) — R1→R2 run once per deck, sequentially and
+independently.
 
 Out of scope, deferred to follow-up specs:
 
@@ -41,10 +42,11 @@ leaves R3 with nothing to build but the loss term itself.
 [2/5] Collect data    ptcg_mine.mine (download → stats → archetypes → vocab)
 [3/5] Build shards    ptcg_il.cli build-shards, belief labels unconditional
 [4/5] Train
-      4a  per-deck IL specialists (arch 0, arch 2)  → checkpoints_a{0,2}/
-      4b  belief heads (--belief), trained in the same runs as 4a
+      4a  per-deck IL specialists (ids derived, see §9) → checkpoints_a<id>/
+      4b  belief heads, trained in the same runs as 4a
       4c  offline eval                              → data/il_baselines.json
 [5/5] RL              budgeted by --rl-steps, skipped by --no-rl
+      per trained specialist, sequentially:
       5a  R1 critic repair
       5b  R2 PPO + KL anchor
 ```
@@ -60,7 +62,7 @@ and all relative paths resolved against `python/`.
 |---|---|---|
 | `--no-rl` | off | skip stage 5 entirely |
 | `--rl-steps N` | 50000 | PPO optimizer-step budget for stage 5b |
-| `--rl-archetype ID` | 2 | which specialist RL trains; must appear in `--archetypes` |
+| `--rl-archetype ID` | *(all)* | restrict RL to one specialist; default runs every archetype in `--archetypes`, one after another |
 | `--rl-workers N` | 6 | rollout worker processes (§6.5: base rollout saturates the GPU at ~6) |
 | `--belief` | **removed** | belief heads now always train; see §4.2 |
 
@@ -69,7 +71,7 @@ Removing `--belief` follows from §4.2: once labels are unconditional there is n
 The per-term `--belief-<name>` weight flags stay for tuning, and setting them all
 to zero remains the way to disable the heads.
 
-`--archetypes "0 2"`, `--live-eval`, `--verbose`, `--skip-download`, `--skip-rust`,
+`--archetypes`, `--live-eval`, `--verbose`, `--skip-download`, `--skip-rust`,
 `--no-train`, `--no-eval` and the directory flags keep their present meaning.
 
 ### 2.2 Stage 5 always runs
@@ -434,7 +436,57 @@ caught two convincing-looking wrong answers.
 
 ---
 
-## 9. Success criteria
+## 9. Implementation notes (added after the build)
+
+Six things came out differently from the design, all recorded here rather than
+silently absorbed.
+
+**Archetype ids had to become dynamic.** The design assumed archetypes 0 and 2
+per RL_SPEC. The corpus's actual `self_ids` are `[0, 1, 11, 3, 4, 5]` — **there is
+no archetype 2**, and `run_pipeline.sh`'s hardcoded `ARCHETYPES="0 2"` would have
+failed outright. Added `ptcg_il/archetype_select.py`, which intersects
+`archetypes.json` with `meta.parquet`, drops archetypes too thin to hold out, and
+ranks by training rows. The pipeline calls it; the current corpus yields `0 1`.
+
+**`visit_counts` already existed** in the Rust searcher, so stage 1 reduced to
+adding `root_value`. It is `Option<f64>`/`null` rather than `0.0` when no tree was
+built (multi-select decisions), because a regression target cannot distinguish
+"no estimate" from "a draw".
+
+**Belief labels were already unconditional** in `shard_writer`, so stage 3 needed
+no change; the work was removing the training-side `--belief` gate.
+
+**`recompute_logp` and `sample_action` take a pre-encoded state.** Both the PPO
+update and the rollout actor need the value head as well, and encoding twice
+doubled the cost of every minibatch.
+
+**β is driven by Schulman's k3 estimator, not the raw mean.** The unbiased
+estimator `E[log π_θ(a) − log π_IL(a)]` is not itself non-negative on a finite
+minibatch. A real 128-decision rollout produced raw **−0.0204** against k3
+**+0.0362** — the raw value would have pushed β *down* precisely when the policy
+had drifted past the budget. The loss keeps the unbiased term; only the dual
+update uses k3.
+
+**The gate balances seats but not seeds.** §5.6 specified paired games sharing a
+seed and determinization stream. The engine shuffles internally, so only the seat
+is controllable: the implementation plays equal games from each side with
+`DuelActor` routing θ and π_IL to their respective seats. The comparison stays
+unbiased but is higher-variance than the spec assumes, which makes the Wilson
+bound mildly optimistic at a given *n*. Recorded in `_play_gate_games`'s
+docstring.
+
+### Bugs the tests caught during the build
+
+| bug | how it would have failed |
+|---|---|
+| `torch.where(finite, p·log p, 0)` in masked entropy | Correct value, **NaN gradient** — `where` differentiates both branches. Entropy is a loss term, so every parameter inherits the NaN on the first step. |
+| Double `battle_finish()` on worker shutdown | glibc `double free or corruption` — a native abort no Python `except` can catch. |
+| `logp_old` recomputed per-minibatch at epoch 0 | The epoch loop drops a ragged tail, so tail samples kept their *rollout-precision* log-prob and could be drawn into a full minibatch at epoch 1 — §7's mixed-precision ratio, on a small shifting subset. Now one pass over the whole buffer up front. |
+| Ratio canary checked on every epoch-0 minibatch | Fires on correct behaviour after the first optimizer step. Now scoped to the first minibatch only. |
+| Both gate seats driven by θ | θ-vs-θ sits at 50% by construction and reads as "the candidate did not improve". |
+| CPU generator with CUDA tensors | `torch.multinomial` rejects the mismatch rather than falling back. |
+
+## 10. Success criteria
 
 1. `./scripts/run_pipeline.sh --skip-download` runs all five stages to completion.
 2. Stage 4c writes `il_baselines.json` with arch 0 and arch 2 non-trivial top-1 at

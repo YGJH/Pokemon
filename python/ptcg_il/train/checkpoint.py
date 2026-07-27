@@ -90,6 +90,10 @@ def save_checkpoint(
         "optimizer_state_dict": _cpu_state_dict(optimizer.state_dict()),
         "scheduler_state_dict": scheduler.state_dict(),
         "rng_state": _rng_state(),
+        # Architecture sizes, so a loader never has to infer V/A/D/heads/layers/ff
+        # from tensor shapes.  ``Policy`` records these itself at construction;
+        # anything else (a test double, say) simply gets an empty dict.
+        "config": dict(getattr(policy, "config", {})),
     }
     if deck is not None:
         ckpt[DECK_KEY] = deck
@@ -188,6 +192,10 @@ def build_submission_bundle(
     weights: dict[str, Any] = {"model_state_dict": ckpt["model_state_dict"]}
     if ckpt.get(DECK_KEY):
         weights[DECK_KEY] = ckpt[DECK_KEY]
+    # Carry the architecture through to the shipped file, so the packed main.py
+    # can build the exact model instead of inferring it from tensor shapes.
+    if ckpt.get("config"):
+        weights["config"] = ckpt["config"]
     torch.save(weights, output_path / "weights.pt")
 
     # Vocab + archetypes

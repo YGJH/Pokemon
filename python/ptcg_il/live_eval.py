@@ -378,6 +378,31 @@ def _call_rust_search_planner(
     *opp_deck* is a 60-card opponent decklist for determinization; ``None`` (or
     an empty list) leaves the Rust side on its mirror-deck fallback.
     """
+    plan = call_rust_search_plan(obs_dict, opp_deck, iterations, seed)
+    if plan is None:
+        return None
+    return [int(i) for i in plan.get("indices", [])]
+
+
+def call_rust_search_plan(
+    obs_dict: dict,
+    opp_deck: list[int] | None = None,
+    iterations: int = 200,
+    seed: int = 42,
+) -> dict | None:
+    """The full planner result, or ``None`` on any failure.
+
+    ``{"indices": [...], "visit_counts": [[option, n], ...],
+       "root_value": float | None, "iterations": int, "nodes_created": int}``
+
+    :func:`_call_rust_search_planner` wants only ``indices``; RL_SPEC §8.3's
+    search distillation wants ``visit_counts`` and ``root_value`` as well, so the
+    FFI call lives here and the acting path is a thin projection of it.  Keeping
+    one call site matters because the result string must be freed exactly once.
+
+    ``root_value`` is ``None`` when the searcher built no tree (multi-select
+    decisions), which is **not** the same as a value of ``0.0``.
+    """
     lib = _load_rust_search_lib()
     if lib is None:
         return None
@@ -423,8 +448,7 @@ def _call_rust_search_planner(
             logger.debug("Rust search planner error: %s", result["error"])
             return None
 
-        indices = result.get("indices", [])
-        return [int(i) for i in indices]
+        return result
 
     except Exception as e:
         logger.debug("Rust search planner call failed: %s", e)

@@ -13,6 +13,7 @@ Sections:
 """
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -169,13 +170,32 @@ _card_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "card_static.npy"
 _attack_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "attack_static.npy")))
 
 _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+# n_opp_arch sizes the belief arch head.  Omitting it built the head at [1, D]
+# against a [n_opp_arch, D] checkpoint, and a *shape* mismatch is fatal even
+# under strict=False — so the agent raised at import and forfeited every game.
 _model = Policy(
     V=_ckpt["V"], A=_ckpt["A"],
     D=_ckpt.get("D", 256), heads=_ckpt.get("heads", 8),
     layers=_ckpt.get("layers", 4), ff=_ckpt.get("ff", 1024),
+    n_opp_arch=_ckpt.get("n_opp_arch", 1),
     card_static_table=_card_static, attack_static_table=_attack_static,
 )
-_model.load_state_dict(_ckpt["model_state_dict"], strict=False)
+_missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
+# Loud about what strict=False swallowed: silently dropped tensors mean an
+# agent that plays with partly random weights and simply loses.  Two classes of
+# "missing" are expected and filtered out, or the warning cries wolf every run:
+#   * tied aliases — pointer.card *is* embed.card, so the shadow/checkpoint
+#     stores the shared tensor once and the alias resolves to the same object;
+#   * `.static` buffers — supplied from card_static.npy / attack_static.npy.
+# data_ptr(), not id(): state_dict() detaches, so tied parameters come back as
+# distinct Python objects sharing one storage.
+_sd = _model.state_dict()
+_loaded_ptrs = {_sd[k].data_ptr() for k in _ckpt["model_state_dict"] if k in _sd}
+_real_missing = [k for k in _missing
+                 if not k.endswith(".static") and _sd[k].data_ptr() not in _loaded_ptrs]
+if _real_missing:
+    print(f"[agent] WARNING: {len(_real_missing)} weights absent from the "
+          f"checkpoint and left at init: {_real_missing[:6]}")
 _model.to(_device)
 _model.eval()
 
@@ -276,6 +296,67 @@ def build_main_py(dst_dir: Path) -> None:
 # Section 2: Model weights — extract EMA weights from checkpoint
 # ============================================================
 
+def _infer_n_opp_arch(model_state: dict) -> int:
+    """Recover n_opp_arch from the belief arch head's output width.
+
+    Checkpoints written before `Policy.config` existed carry no record, and
+    guessing 1 produces a bundle that raises on load.
+    """
+    for key, tensor in model_state.items():
+        if key.endswith("belief_heads.arch_head.2.bias"):
+            return int(tensor.shape[0])
+    return 1
+
+
+def check_artifact_pairing(deck_record: dict | None, data_dir: Path,
+                           force: bool = False) -> None:
+    """Abort if the checkpoint was trained against different artifacts.
+
+    ``save_checkpoint`` pins ``vocab_sha1``/``archetypes_sha1`` precisely so
+    this can be checked, but the builder only ever *printed* them.  The failure
+    it guards is silent by construction: the model's card embedding is indexed
+    by vocab position, so a vocab of the same length with a different id→index
+    assignment produces a bundle that loads, imports, plays every game to the
+    end, and loses nearly all of them.  Nothing raises at any point.
+
+    A stale checkpoint from an earlier mining run is the normal way to hit
+    this — archetype ids and vocab indices are both reassigned whenever mining
+    re-runs.
+    """
+    if deck_record is None:
+        return  # build_data_files already refuses an unlabelled checkpoint
+
+    mismatches = []
+    for key, fname in (("vocab_sha1", "vocab.json"),
+                       ("archetypes_sha1", "archetypes.json")):
+        pinned = deck_record.get(key)
+        if not pinned:
+            continue
+        path = data_dir / fname
+        if not path.exists():
+            continue
+        # ptcg_il.deck._sha1 truncates to 12 chars; compare on the pinned
+        # length so a full digest and a truncated pin still agree.
+        actual = hashlib.sha1(path.read_bytes()).hexdigest()
+        if actual[:len(pinned)] != pinned:
+            mismatches.append(f"    {fname}: checkpoint pins {pinned}, "
+                              f"{data_dir}/{fname} is {actual[:len(pinned)]}")
+
+    if not mismatches:
+        return
+    msg = ("Checkpoint was trained against different artifacts than the ones "
+           "being packaged:\n" + "\n".join(mismatches) +
+           "\n  The shipped vocab decides which embedding row each card id "
+           "reads, so this bundle would play with scrambled card identities "
+           "and lose almost every game — without erroring.\n"
+           "  Point --ckpt at a checkpoint trained on this data/, or rebuild "
+           "the corpus and retrain. Use --force to package anyway.")
+    if force:
+        print(f"WARNING: {msg}")
+        return
+    raise SystemExit(f"ERROR: {msg}")
+
+
 def build_model_weights(ckpt_path: Path, dst_dir: Path,
                         deck_record: dict | None = None) -> None:
     """Extract EMA weights + metadata from checkpoint into submission model.pt.
@@ -326,15 +407,27 @@ def build_model_weights(ckpt_path: Path, dst_dir: Path,
 
     print(f"  V={V}  A={A}")
 
-    submission_pt = {
-        "model_state_dict": model_state,
-        "V": V,
-        "A": A,
-        "D": 256,
-        "heads": 8,
-        "layers": 4,
-        "ff": 1024,
+    # Architecture comes from the checkpoint's own record when present.
+    # Hardcoding it meant a model trained with non-default --d-model/--layers
+    # was rebuilt at the wrong shape on the Kaggle side; the loader uses
+    # strict=False, so the mismatched tensors are simply dropped and the agent
+    # plays with partly random weights.
+    cfg = ckpt.get("config") or {}
+    arch = {
+        "D": int(cfg.get("D", 256)),
+        "heads": int(cfg.get("heads", 8)),
+        "layers": int(cfg.get("layers", 4)),
+        "ff": int(cfg.get("ff", 1024)),
+        # Sizes the belief arch head.  Must round-trip: a wrong value is a shape
+        # mismatch, which raises at load time even under strict=False.
+        "n_opp_arch": int(cfg.get("n_opp_arch", _infer_n_opp_arch(model_state))),
     }
+    if cfg:
+        print(f"  Architecture from checkpoint config: {arch}")
+    else:
+        print(f"  Checkpoint has no config record — assuming defaults {arch}")
+
+    submission_pt = {"model_state_dict": model_state, "V": V, "A": A, **arch}
     # Keep the deck label with the weights so the shipped model.pt is
     # self-describing and a wrong pairing is auditable after the fact.
     if deck_record is not None:
@@ -434,8 +527,14 @@ def verify_model_imports(dst_dir: Path) -> bool:
 
     Returns True if the import succeeds, False otherwise.
     """
+    # Import main.py, not just the model package: main.py is where Policy is
+    # actually constructed and model.pt loaded, and that is where the bundle
+    # breaks.  Verifying only `from model import ...` passed a submission whose
+    # agent raised at import (wrong n_opp_arch => belief-head shape mismatch,
+    # fatal even under strict=False) and therefore forfeited every game.
     result = subprocess.run(
-        [sys.executable, "-c", "from model import Policy, select_multi, CardEncoder, AttackEncoder; print('OK')"],
+        [sys.executable, "-c",
+         "import main; assert callable(main.agent); print('OK')"],
         cwd=str(dst_dir),
         capture_output=True,
         text=True,
@@ -481,6 +580,9 @@ def main():
     p.add_argument("--data-dir", required=True, help="Path to training data/ directory")
     p.add_argument("--ckpt", required=True, help="Path to checkpoint .pt file")
     p.add_argument("--out", default="submission.tar.gz", help="Output tar.gz path")
+    p.add_argument("--force", action="store_true",
+                   help="Package even when the checkpoint's pinned vocab/archetypes "
+                        "SHAs disagree with --data-dir (produces a silently broken bundle)")
     p.add_argument("--work-dir", default="/tmp/submission-build", help="Temp build directory")
     p.add_argument("--deck-csv", default=None,
                    help="Override the deck with this csv (one card id per line). "
@@ -517,6 +619,8 @@ def main():
             print("  WARNING: --deck-csv disagrees with the checkpoint's own deck "
                   "label; using --deck-csv as instructed.")
         deck = override
+
+    check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force)
 
     print("Building data files...")
     build_data_files(Path(args.data_dir), data_dir, deck=deck)

@@ -310,3 +310,56 @@ class TestValueHead:
         loss.backward()
         for name, p in head.named_parameters():
             assert p.grad is not None, f"Parameter {name} has no gradient"
+
+
+class TestMultiSelectCEScale:
+    """The STOP column is suppressed by writing -1e9 into the logits, while the
+    mask handed to the CE still marks it valid.  Label smoothing averages
+    log-probs over *valid* positions, so it averaged in log_prob = -1e9 and
+    returned ~eps * 1e9 / n_valid per step — 2.5e7 on a real batch, against a
+    plausible value of ~9.  It stayed finite, so `isfinite` assertions above
+    passed the whole time.
+    """
+
+    def _batch(self, B=2, max_count=3, min_count=2):
+        x = _make_synthetic_batch(B, max_count=max_count)
+        x["minCount"] = torch.full((B,), min_count, dtype=torch.long)
+        stop_col = int(x["stop_column"][0].item())
+        for b in range(B):
+            picks = torch.randperm(7)[:max_count - 1]
+            for k, p in enumerate(picks):
+                x["action_idx"][b, k] = p
+            x["action_idx"][b, max_count - 1] = stop_col
+        x["action_len"] = torch.full((B,), max_count, dtype=torch.long)
+        return x
+
+    def test_smoothing_does_not_dominate_the_loss(self):
+        """Label smoothing adds at most eps * (mean surprisal over valid
+        options).  At init that is well under 1 nat per pick."""
+        torch.manual_seed(0)
+        policy = Policy(V, A)
+        x = self._batch()
+        plain = multiselect_ce(policy, x, label_smoothing=0.0)
+        smoothed = multiselect_ce(policy, x, label_smoothing=0.05)
+        assert torch.isfinite(smoothed).all()
+        assert (smoothed <= plain + 5.0).all(), (
+            f"smoothing inflated CE: {plain.tolist()} -> {smoothed.tolist()}"
+        )
+
+    def test_ce_is_on_a_plausible_scale_at_init(self):
+        """An untrained pointer over O options costs ~log(O) nats per pick."""
+        torch.manual_seed(0)
+        policy = Policy(V, A)
+        ce = multiselect_ce(policy, self._batch(max_count=3))
+        assert (ce < 100).all(), f"CE at init should be a few nats per pick, got {ce.tolist()}"
+
+    def test_suppressing_stop_costs_nothing_extra(self):
+        """min_count only decides *when* STOP becomes legal.  Raising it must
+        not change the loss scale — the suppressed column simply drops out."""
+        torch.manual_seed(0)
+        policy = Policy(V, A)
+        free = multiselect_ce(policy, self._batch(min_count=0))
+        forced = multiselect_ce(policy, self._batch(min_count=2))
+        assert (forced < free + 10.0).all(), (
+            f"suppressing STOP inflated CE: {free.tolist()} -> {forced.tolist()}"
+        )

@@ -430,3 +430,144 @@ class TestCollateFn:
         ds = ShardDataset(data_dir, split="train")
         batch = collate_fn([ds[0]])
         assert batch["sel_type"].shape == (1,)
+
+
+# ============================================================
+# Tests — memory-mapped shard cache
+# ============================================================
+#
+# The shards are written with np.savez_compressed, and np.load's mmap_mode is
+# silently ignored for .npz archives: `dict(np.load(path, mmap_mode="r"))`
+# decompresses every array into anonymous RAM (a 5.6 MB shard inflates to
+# 528 MB) and the dataset then held it for the process lifetime.  With
+# num_workers=8 each worker paid that independently.  These tests pin the
+# behaviour that replaced it: decompress once to a .npy-per-key cache on disk,
+# then genuinely mmap, so pages are shared and evictable.
+
+
+class TestMmapCache:
+    def _shard_keys(self, data_dir, shard_name):
+        with np.load(Path(data_dir) / "shards" / shard_name) as z:
+            return set(z.files)
+
+    def test_cache_built_on_init(self):
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="train")
+        cache = Path(data_dir) / "shards" / ".mmap-cache" / "train-00000.npz"
+        assert cache.is_dir()
+        names = {p.stem for p in cache.glob("*.npy")}
+        assert names == self._shard_keys(data_dir, "train-00000.npz")
+
+    def test_cache_only_covers_the_requested_split(self):
+        """A val-split dataset must not spend disk decompressing train shards."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="val")
+        cache = Path(data_dir) / "shards" / ".mmap-cache"
+        assert (cache / "val-00000.npz").is_dir()
+        assert not (cache / "train-00000.npz").exists()
+
+    def test_arrays_are_memmaps_not_ram(self):
+        """The actual laziness guarantee: nothing is materialised on open."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ds = ShardDataset(data_dir, split="train")
+        shard = ds._open_shard("train-00000.npz")
+        assert shard
+        for key, arr in shard.items():
+            assert isinstance(arr, np.memmap), f"{key} is {type(arr)}, not mmap'd"
+
+    def test_values_match_the_npz(self):
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ds = ShardDataset(data_dir, split="train")
+        with np.load(Path(data_dir) / "shards" / "train-00000.npz") as z:
+            for i in (0, 3, 9):
+                raw = ds.get_raw(i)
+                row = int(ds.meta.iloc[int(ds._indices[i])]["row"])
+                for key in raw:
+                    np.testing.assert_array_equal(
+                        raw[key], z[key][row], err_msg=f"{key} row {row}"
+                    )
+
+    def test_cache_reused_not_rebuilt(self):
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="train")
+        probe = Path(data_dir) / "shards" / ".mmap-cache" / "train-00000.npz" / "tok_mask.npy"
+        before = probe.stat().st_mtime_ns
+        ShardDataset(data_dir, split="train")
+        assert probe.stat().st_mtime_ns == before
+
+    def test_cache_rebuilt_when_shard_changes(self):
+        """A rebuilt corpus must not be read through a cache of the old one —
+        card ids are vocab indices, so stale rows are silently mislabelled."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ds = ShardDataset(data_dir, split="train")
+        before = ds.get_raw(0)["poke_card_id"].copy()
+
+        shard_path = Path(data_dir) / "shards" / "train-00000.npz"
+        with np.load(shard_path) as z:
+            arrays = {k: z[k].copy() for k in z.files}
+        arrays["poke_card_id"] = arrays["poke_card_id"] + 1
+        np.savez_compressed(shard_path, **arrays)
+
+        ds2 = ShardDataset(data_dir, split="train")
+        after = ds2.get_raw(0)["poke_card_id"]
+        np.testing.assert_array_equal(after, before + 1)
+
+    def test_falls_back_when_cache_cannot_be_written(self):
+        """A read-only corpus (shared/NFS) must still train, just without the
+        cache — degraded memory, not a crash."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        shards_dir = Path(data_dir) / "shards"
+        mode = shards_dir.stat().st_mode
+        shards_dir.chmod(0o555)
+        try:
+            ds = ShardDataset(data_dir, split="train")
+            sample = ds[0]
+            assert sample["tok_mask"].shape[0] > 0
+            assert not (shards_dir / ".mmap-cache").exists()
+        finally:
+            shards_dir.chmod(mode)
+
+    def test_partial_cache_is_rebuilt(self):
+        """An interrupted build leaves a directory that exists but is missing
+        keys; reusing it would raise KeyError deep inside __getitem__."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="train")
+        cache = Path(data_dir) / "shards" / ".mmap-cache" / "train-00000.npz"
+        (cache / "tok_mask.npy").unlink()
+        ds = ShardDataset(data_dir, split="train")
+        assert (cache / "tok_mask.npy").exists()
+        assert ds[0]["tok_mask"].shape[0] > 0
+
+    def test_two_shards_do_not_share_rows(self):
+        data_dir = _build_synthetic_data(n_train=100, n_val=10, samples_per_shard=60)
+        ds = ShardDataset(data_dir, split="train")
+        shards = {str(s) for s in ds.meta["shard"]}
+        assert len(shards) > 1, "fixture must span >1 shard for this to test anything"
+        with np.load(Path(data_dir) / "shards" / "train-00001.npz") as z:
+            rows = ds.meta.index[ds.meta["shard"] == "train-00001.npz"].tolist()
+            assert rows
+            pos = int(np.where(ds._indices == rows[0])[0][0])
+            raw = ds.get_raw(pos)
+            np.testing.assert_array_equal(
+                raw["poke_card_id"], z["poke_card_id"][int(ds.meta.iloc[rows[0]]["row"])]
+            )
+
+    def test_orphan_cache_is_removed(self):
+        """A rebuilt corpus with fewer shards must not strand GBs of cache."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="train")
+        cache_root = Path(data_dir) / "shards" / ".mmap-cache"
+        orphan = cache_root / "train-09999.npz"
+        orphan.mkdir()
+        (orphan / "junk.npy").write_bytes(b"x")
+        ShardDataset(data_dir, split="train")
+        assert not orphan.exists()
+        assert (cache_root / "train-00000.npz").is_dir()
+
+    def test_other_splits_cache_is_not_evicted(self):
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ShardDataset(data_dir, split="val")
+        cache_root = Path(data_dir) / "shards" / ".mmap-cache"
+        assert (cache_root / "val-00000.npz").is_dir()
+        ShardDataset(data_dir, split="train")
+        assert (cache_root / "val-00000.npz").is_dir()

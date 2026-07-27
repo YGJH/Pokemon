@@ -42,8 +42,15 @@ use mcts::MctsConfig;
 ///
 /// A JSON string (caller must free with `search_plan_free`):
 /// ```json
-/// {"indices": [0], "iterations": 300, "nodes_created": 42, "error": null}
+/// {"indices": [0], "visit_counts": [[0, 210], [3, 90]], "root_value": 0.31,
+///  "iterations": 300, "nodes_created": 42, "error": null}
 /// ```
+///
+/// `visit_counts` is `[[option_index, visits], ...]` sorted by descending visits,
+/// and `root_value` is the mean playout outcome at the root in `[-1, 1]`.  Both
+/// feed RL_SPEC §8.3's search-distillation targets.  `root_value` is `null` when
+/// no tree was built (multi-select decisions, or an empty option list) — that is
+/// distinct from a value of `0.0`, and a consumer must not conflate them.
 ///
 /// On error, `"indices"` is `[]` and `"error"` contains the message.
 ///
@@ -78,7 +85,7 @@ pub unsafe extern "C" fn search_plan(
             CString::new(json).unwrap_or_else(|_| CString::new("{}").unwrap()).into_raw()
         }
         Err(_) => {
-            let err = r#"{"indices":[],"error":"panic in search_plan"}"#;
+            let err = r#"{"indices":[],"visit_counts":[],"root_value":null,"iterations":0,"nodes_created":0,"error":"panic in search_plan"}"#;
             CString::new(err).unwrap().into_raw()
         }
     }
@@ -115,6 +122,8 @@ fn search_plan_impl(
     if obs.get("select").and_then(|s| s.as_object()).is_none() {
         return serde_json::json!({
             "indices": fixed_deck,
+            "visit_counts": [],
+            "root_value": null,
             "iterations": 0,
             "nodes_created": 0,
             "error": null
@@ -176,6 +185,7 @@ fn search_plan_impl(
             serde_json::json!({
                 "indices": plan.indices,
                 "visit_counts": plan.visit_counts,
+                "root_value": plan.root_value,
                 "iterations": plan.iterations,
                 "nodes_created": plan.nodes_created,
                 "error": null
@@ -210,6 +220,8 @@ unsafe fn cstr_to_str(ptr: *const c_char) -> String {
 fn error_json(msg: &str) -> String {
     serde_json::json!({
         "indices": [],
+        "visit_counts": [],
+        "root_value": null,
         "iterations": 0,
         "nodes_created": 0,
         "error": msg

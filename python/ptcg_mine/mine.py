@@ -8,12 +8,14 @@ populated raw_dir). Phase 2 (stats -> archetypes -> vocab -> static tables
 
 import argparse
 import json
+import logging
 import sys
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
+from ptcg_mine import stamp
 from ptcg_mine.archetype import canon, cluster_decks, pick_fixed_deck, select_self_opp
 from ptcg_mine.artifacts import write_archetypes_json, write_mining_report, write_vocab_json
 from ptcg_mine.cards import build_static_tables, load_engine
@@ -21,6 +23,9 @@ from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import deck_of, load_episode, project_for_selection, validate_episode
 from ptcg_mine.stats import select_experts, team_leaderboard
 from ptcg_mine.vocab import build_vocab
+
+
+logger = logging.getLogger(__name__)
 
 
 class InsufficientDataError(RuntimeError):
@@ -73,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-download",
         action="store_true",
         help="Skip Phase 0/1 download; mine directly from episodes already present under --raw-dir.",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute Phase 2 even when the corpus, config and code are unchanged "
+             "since the last successful run (default: reuse the existing artifacts).",
     )
     return p
 
@@ -128,10 +139,21 @@ def load_raw_episodes(raw_dir) -> tuple[list[dict], int]:
     return episodes, n_loaded
 
 
-def run(config: MineConfig, skip_download: bool) -> dict:
+def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
     """Run Phases 0-2 for `config`; returns a summary dict. Side effects:
     writes vocab.json, archetypes.json, mining_report.md, and the .npy static
-    tables into config.out_dir."""
+    tables into config.out_dir.
+
+    Phase 2 re-parses every episode under raw_dir (~15 min over the real
+    9910-episode corpus) to produce artifacts that are a pure function of
+    (corpus, config, this package's code). When none of those changed since the
+    last successful run it is skipped and the existing artifacts are reused;
+    pass `force=True` to recompute regardless.
+
+    The check runs *after* the download deliberately: Phase 1 is what changes
+    the corpus, so a run that fetches new episodes still recomputes, while one
+    that fetches nothing does not.
+    """
     if not skip_download:
         from kaggle.api.kaggle_api_extended import KaggleApi
 
@@ -140,6 +162,18 @@ def run(config: MineConfig, skip_download: bool) -> dict:
         api = KaggleApi()
         api.authenticate()
         download_corpus(config, api)
+
+    params = stamp.params_from_config("mine", config)
+    if not force:
+        fresh, reason = stamp.check(
+            "mine", raw_dir=config.raw_dir, data_dir=config.out_dir,
+            params=params, require_summary=True,
+        )
+        rec = stamp.read("mine", config.out_dir) if fresh else None
+        if rec and rec.get("summary"):
+            logger.info("Phase 2: artifacts up to date (%s) — skipping", reason)
+            return {**rec["summary"], "cached": True}
+        logger.info("Phase 2: recomputing — %s", reason)
 
     episodes, n_loaded = load_raw_episodes(config.raw_dir)
 
@@ -205,16 +239,22 @@ def run(config: MineConfig, skip_download: bool) -> dict:
     np.save(out_dir / "card_static_table.npy", card_table)
     np.save(out_dir / "attack_static_table.npy", attack_table)
 
-    return {
+    summary = {
         "vocab_size": vocab["size"],
-        "n_attacks": attack_table.shape[0],
+        "n_attacks": int(attack_table.shape[0]),
         "n_experts": len(experts),
         "n_archetypes": len(archetypes),
-        "self_ids": self_ids,
-        "opp_ids": opp_ids,
+        "self_ids": list(self_ids),
+        "opp_ids": list(opp_ids),
         "out_dir": str(out_dir),
         **counts,
     }
+
+    # Stamped only now, with every artifact on disk: a run that died partway
+    # must leave no stamp, so the next one recomputes rather than trusting it.
+    stamp.write("mine", raw_dir=config.raw_dir, data_dir=out_dir,
+                params=params, summary=summary)
+    return {**summary, "cached": False}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -229,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = config_from_args(args)
     try:
-        summary = run(config, skip_download=args.skip_download)
+        summary = run(config, skip_download=args.skip_download, force=args.force)
     except DownloadError as exc:
         print(f"[ptcg_mine] download failed: {exc}", file=sys.stderr)
         return 2
@@ -237,7 +277,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ptcg_mine] insufficient data: {exc}", file=sys.stderr)
         return 1
 
-    print("=== Corpus mining summary ===")
+    print("=== Corpus mining summary ==="
+          + (" (cached — Phase 2 skipped)" if summary.get("cached") else ""))
     print(f"episodes loaded:    {summary['episodes_loaded']}")
     print(f"episodes valid:     {summary['episodes_valid']}")
     print(f"experts:            {summary['n_experts']}")
