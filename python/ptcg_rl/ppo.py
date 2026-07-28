@@ -32,6 +32,7 @@ failed run unattributable, which is why it stays at 0.02 through R2 by decision
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 import math
 from dataclasses import dataclass, field
 
@@ -41,7 +42,7 @@ import torch.nn.functional as F
 from ptcg_rl.actor import recompute_logp
 from ptcg_rl.config import RLConfig
 from ptcg_rl.rollout import normalize_advantages
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 
@@ -134,29 +135,19 @@ def check_ratio_canary(ratio: torch.Tensor, tol: float) -> float:
 
 def ppo_losses(
     policy,
-    reference_policy,
+    # 🌟 修正 1：拔除 reference_policy 參數，直接使用下面傳進來的 logp_ref
     batch: dict[str, torch.Tensor],
     *,
     advantage: torch.Tensor,
     value_target: torch.Tensor,
     value_old: torch.Tensor,
     logp_old: torch.Tensor,
+    logp_ref: torch.Tensor,  # 🌟 已經在外部算好傳進來的
     beta: float,
     cfg: RLConfig,
     check_canary: bool = False,
 ) -> tuple[torch.Tensor, PPOStats]:
-    """One minibatch's total loss and its diagnostics.
-
-    *reference_policy* is the frozen π_IL for this deck: loaded once, never
-    updated, evaluated under ``no_grad``.  Pass ``None`` to drop the anchor —
-    useful for ablations, but it removes the forgetting guard entirely.
-
-    *logp_old* must have been produced by :func:`recompute_logp` under **this**
-    precision path, not restored from the rollout buffer (§7).
-    """
-    # One encode serves both heads. `recompute_logp` and the value head each
-    # need the encoded state, and running the transformer twice would double the
-    # cost of every PPO minibatch for nothing.
+    """One minibatch's total loss and its diagnostics."""
     h, _history = policy._encode(batch)
     logp, entropy = recompute_logp(policy, batch, encoded=h)
 
@@ -166,9 +157,8 @@ def ppo_losses(
     if check_canary:
         stats.ratio_p99 = check_ratio_canary(ratio, cfg.ratio_canary_tol)
 
-    adv = normalize_advantages(advantage)
-    unclipped = ratio * adv
-    clipped = ratio.clamp(1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv
+    unclipped = ratio * advantage
+    clipped = ratio.clamp(1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * advantage
     policy_loss = -torch.min(unclipped, clipped).mean()
 
     # --- Value loss, clipped to ±value_clip around V_old (§9.2) ---
@@ -180,26 +170,22 @@ def ppo_losses(
     ).mean()
 
     entropy_mean = entropy.mean()
-
+    
+    # 🌟 修正 2：這是最終的 loss！不會再往裡面加未 clip 的 KL Penalty 了
     total = policy_loss + cfg.c_value * value_loss - cfg.c_entropy * entropy_mean
 
-    # --- KL anchor to the frozen IL policy ---
+    # --- KL metrics (只做統計，不參與梯度計算) ---
     kl = torch.zeros((), device=logp.device)
-    if reference_policy is not None:
-        with torch.no_grad():
-            logp_ref, _ = recompute_logp(reference_policy, batch)
-        # Sample estimate of the mode-seeking KL(π_θ ‖ π_IL) on the actions
-        # taken.  Same mask, same precision path, same decision points — §9.3
-        # says assert that rather than assume it.
+    if logp_ref is not None:
         if logp_ref.shape != logp.shape:
             raise ValueError(
                 f"reference policy produced {tuple(logp_ref.shape)} log-probs for "
                 f"{tuple(logp.shape)} decision points"
             )
-        d = logp - logp_ref
-        kl = d.mean()
-        total = total + beta * kl
+        # 🌟 修正 3：全部包在 no_grad 裡面，單純計算 KL 數據，不加進 total
         with torch.no_grad():
+            d = logp - logp_ref
+            kl = d.mean()
             stats.kl_to_il_k3 = float(((-d).exp() - 1.0 + d).mean())
 
     with torch.no_grad():
@@ -211,8 +197,6 @@ def ppo_losses(
         stats.clip_fraction = float(
             ((ratio - 1.0).abs() > cfg.clip_eps).float().mean()
         )
-        # Schulman's low-variance estimator for KL(θ_old ‖ θ); always ≥ 0,
-        # unlike the naive -mean(logp - logp_old).
         log_ratio = logp - logp_old
         stats.approx_kl_step = float((log_ratio.exp() - 1.0 - log_ratio).mean())
         stats.explained_variance = explained_variance(value, value_target)

@@ -323,6 +323,7 @@ ln -sfn "$LOG_DIR" "$PY_DIR/logs/latest"
 # 回传指令本身的 exit code（pipefail 之下 tee 管线也一样）。
 run_stage() {
     local log="$1" cmd="$2" live="${3:-false}"
+    echo command "$cmd"\n
     if stage_is_live "$live"; then
         eval "$cmd" 2>&1 | tee "$log"
     else

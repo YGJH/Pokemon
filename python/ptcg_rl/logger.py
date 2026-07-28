@@ -15,10 +15,11 @@ step, which just counts ``log`` calls, never becomes the x axis of either.
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 from typing import Any
 
 from ptcg_il.train.logger import WandbLogger
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 DEFAULTS: dict[str, Any] = {

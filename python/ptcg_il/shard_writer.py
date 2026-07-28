@@ -11,6 +11,7 @@ TRANSFORMER_IL_SPEC.md Appendix C.1 for the shard format contract.
 import hashlib
 import json
 import logging
+from rich.logging import RichHandler
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
@@ -36,7 +37,7 @@ from ptcg_mine.episode import (
     validate_episode,
 )
 from ptcg_mine.stats import select_experts, team_leaderboard
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
 SAMPLES_PER_SHARD = 50000

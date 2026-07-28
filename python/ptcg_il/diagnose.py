@@ -41,6 +41,7 @@ import argparse
 import hashlib
 import json
 import logging
+from rich.logging import RichHandler
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -48,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
 # Feature groups for the ablation sweep.  Grouped by what they *mean*, not by

@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 import math
 import multiprocessing
 import os
@@ -29,7 +30,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
 # ============================================================

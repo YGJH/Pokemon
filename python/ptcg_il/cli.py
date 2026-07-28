@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from rich.logging import RichHandler
 import os
 import sys
 from pathlib import Path
@@ -30,7 +31,7 @@ from typing import Any
 # belief_labels is deliberately torch-free, so importing the weight defaults
 # here does not drag torch into `--help`.
 from ptcg_il.belief_labels import BELIEF_WEIGHTS
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
 

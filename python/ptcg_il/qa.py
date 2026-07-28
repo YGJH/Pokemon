@@ -18,13 +18,14 @@ Usage::
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
 # Deck legality: CardType enum values (verified against engine `all_card_data()`)

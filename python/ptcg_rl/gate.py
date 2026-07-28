@@ -26,11 +26,12 @@ the artifact that ships, and its cost does not depend on any search budget.
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 

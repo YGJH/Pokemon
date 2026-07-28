@@ -221,6 +221,46 @@ class TestPPOLosses:
             f"non-negative by construction, so this is a formula error"
         )
 
+    def test_kl_anchor_term_is_a_penalty_not_a_bonus(self):
+        """The KL contribution to the total loss must be non-negative.
+
+        Using the raw sample estimate ``E[log π_θ − log π_IL]`` in the loss lets
+        a finite minibatch come out negative: the anchor then *reduces* the loss
+        and gradient descent pushes θ away from π_IL.  That is the instability
+        seen in R2 when ``kl`` is negative, ``k3`` explodes, and ``ev`` collapses.
+        """
+        import copy
+
+        policy = _tiny_policy()
+        reference = copy.deepcopy(policy).eval()
+        # Perturb θ so the two policies differ; this is where raw noise can flip
+        # the sign of the sample estimate.
+        with torch.no_grad():
+            for p in policy.parameters():
+                p.add_(torch.randn_like(p) * 0.05)
+
+        x = _batch(B=32, seed=21)
+        from ptcg_rl.actor import recompute_logp
+
+        with torch.no_grad():
+            logp_old, _ = recompute_logp(policy, x)
+
+        inputs = self._inputs(32)
+        loss_with, _ = ppo_losses(
+            policy, reference, x, logp_old=logp_old, beta=1.0,
+            cfg=RLConfig(minibatch=32, rollout_buffer=32), **inputs,
+        )
+        loss_without, _ = ppo_losses(
+            policy, None, x, logp_old=logp_old, beta=1.0,
+            cfg=RLConfig(minibatch=32, rollout_buffer=32), **inputs,
+        )
+        # The only difference between the two calls is the KL term; if it is
+        # negative, loss_with < loss_without and the anchor is a bonus.
+        assert loss_with >= loss_without, (
+            f"KL anchor reduced the total loss by {float(loss_without - loss_with):.4f}; "
+            "it is acting as a bonus, not a penalty"
+        )
+
     def test_mismatched_reference_shape_raises(self):
         """Two policies must be scored on the same decision points (§9.3)."""
         policy = _tiny_policy()

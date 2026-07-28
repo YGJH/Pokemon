@@ -49,8 +49,8 @@ class RLConfig:
     """Low, because the KL anchor is already regularising."""
     minibatch: int = 1_024
     lr: float = 1e-5
-    clip_eps: float = 0.2
-    value_clip: float = 0.2
+    clip_eps: float = 0.01
+    value_clip: float = 0.01
     c_value: float = 0.5
     c_entropy: float = 0.003
     """Masked AR entropy sums over steps, so it exceeds single-token entropy.

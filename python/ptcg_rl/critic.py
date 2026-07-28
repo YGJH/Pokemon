@@ -30,13 +30,14 @@ rising monotonically in turn number.
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 

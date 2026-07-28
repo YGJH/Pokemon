@@ -28,12 +28,13 @@ pattern ``ptcg_mine/download.py`` uses for the Kaggle API.
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 import multiprocessing as mp
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
 import numpy as np
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 # Worker → parent

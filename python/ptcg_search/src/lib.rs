@@ -8,6 +8,7 @@ mod engine;
 mod ffi;
 mod guessing;
 mod mcts;
+mod puct;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};

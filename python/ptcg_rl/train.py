@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from rich.logging import RichHandler
+
 import sys
 import time
 from pathlib import Path
@@ -24,6 +26,7 @@ from typing import Any
 
 from ptcg_rl.logger import DEFAULTS as LOG_DEFAULTS
 from ptcg_rl.logger import NullRLLogger, build_logger
+logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[RichHandler(show_time=False)])
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +433,42 @@ def run_r2(args, cfg, policy, reference, device, *, wb=None) -> dict[str, Any]:
                 if not trajectories:
                     raise RuntimeError("rollout produced no completed games")
                 batch = build_batch(trajectories, gamma=cfg.gamma, lam=cfg.gae_lambda)
+
+                # 2. 🌟 效能修復：在送進 _ppo_epochs 之前，先全域算好 Reference logp
+                if reference is not None:
+                    from ptcg_rl.rollout import _collate
+                    from ptcg_rl.ppo import recompute_logp
+                    import torch
+                    
+                    reference.eval()
+                    n_decisions = len(batch.action_idx)
+                    logp_ref_list = []
+                    
+                    with torch.no_grad():
+                        # 使用 cfg.forward_batch (或 cfg.minibatch) 來切塊，避免 OOM
+                        chunk_size = getattr(cfg, "forward_batch", 256) 
+                        
+                        for start in range(0, n_decisions, chunk_size):
+                            end = min(start + chunk_size, n_decisions)
+                            
+                            # 把這小塊的資料轉成 Tensor (與 _ppo_epochs 內的做法相同)
+                            mb_ref = _collate([batch.features[i] for i in range(start, end)], device)
+                            mb_ref["action_idx"] = torch.as_tensor(batch.action_idx[start:end]).to(device)
+                            mb_ref["action_len"] = torch.as_tensor(batch.action_len[start:end]).to(device)
+                            
+                            # 進行推論
+                            h_ref, _ = reference._encode(mb_ref)
+                            lp_ref, _ = recompute_logp(reference, mb_ref, encoded=h_ref)
+                            
+                            # 算完先放回 CPU 或留在 GPU 皆可，這裡統一把 Tensor 收集起來
+                            logp_ref_list.append(lp_ref)
+                            
+                    # 將所有切塊拼湊回一個完整的一維 Tensor，供 _ppo_epochs 切分使用
+                    logp_ref = torch.cat(logp_ref_list)
+                else:
+                    logp_ref = None
+
+
             rollout = {
                 "games": len(trajectories),
                 "decisions": len(batch),
@@ -440,7 +479,8 @@ def run_r2(args, cfg, policy, reference, device, *, wb=None) -> dict[str, Any]:
 
             policy.train()
             with Timer("update") as t_upd:
-                stats = _ppo_epochs(policy, reference, batch, optimizer, beta, cfg, device)
+                stats = _ppo_epochs(policy, batch, logp_ref, optimizer, beta, cfg, device)
+                # stats = _ppo_epochs(policy, reference, batch, optimizer, beta, cfg, device)
             rollout["update_sec"] = t_upd.elapsed
             rollout["iter_sec"] = t_roll.elapsed + t_upd.elapsed
             t_rollout_total += t_roll.elapsed
@@ -490,7 +530,8 @@ def run_r2(args, cfg, policy, reference, device, *, wb=None) -> dict[str, Any]:
     return {"phase": "R2", "steps": step, "beta": beta, "history": history, **timing}
 
 
-def _ppo_epochs(policy, reference, batch, optimizer, beta, cfg, device) -> dict[str, Any]:
+# def _ppo_epochs(policy, reference, batch, optimizer, beta, cfg, device) -> dict[str, Any]:
+def _ppo_epochs(policy, batch, logp_ref_full, optimizer, beta, cfg, device) -> dict[str, Any]:
     """Run ``cfg.ppo_epochs`` over one rollout buffer.
 
     ``logp_old`` is recomputed over the **whole buffer up front** in this
@@ -526,11 +567,12 @@ def _ppo_epochs(policy, reference, batch, optimizer, beta, cfg, device) -> dict[
             logp_old = torch.as_tensor(batch.logp_old[idx]).to(device).float()
 
             loss, stats = ppo_losses(
-                policy, reference, mb,
+                policy, mb,
                 advantage=torch.as_tensor(batch.advantage[idx]).to(device).float(),
                 value_target=torch.as_tensor(batch.value_target[idx]).to(device).float(),
                 value_old=torch.as_tensor(batch.value_old[idx]).to(device).float(),
                 logp_old=logp_old,
+                logp_ref=logp_ref_full[idx] if logp_ref_full is not None else None,
                 beta=beta, cfg=cfg,
                 # Only the very first minibatch: after one optimizer step θ has
                 # genuinely moved, so a ratio of 1 is no longer expected and
@@ -609,8 +651,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+        format="%(message)s",
+        handlers=[RichHandler(show_time=False, force_terminal=True)],
+        force=True,
     )
 
     import torch

@@ -20,6 +20,7 @@ that PPO works here at all.
 from __future__ import annotations
 
 import logging
+from rich.logging import RichHandler
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -29,7 +30,7 @@ import torch
 from ptcg_il.featurizer import featurize
 from ptcg_rl.actor import sample_action
 from ptcg_rl.vec_env import Trajectory
-
+logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
 
@@ -118,7 +119,10 @@ def build_batch(
             advs.append(adv[i])
             vtargs.append(vtarget[i])
             turns.append(d.turn)
-
+    
+    #  在這裡將收集到的「全量 Rollout Advantage」轉成 numpy 後做標準化
+    advs_np = np.asarray(advs, dtype=np.float32)
+    advs_np = (advs_np - advs_np.mean()) / (advs_np.std() + 1e-8)
     if not feats:
         raise ValueError("no decision points in the collected trajectories")
 
@@ -128,7 +132,7 @@ def build_batch(
         action_len=np.asarray(a_len, dtype=np.int64),
         logp_old=np.asarray(lp, dtype=np.float32),
         value_old=np.asarray(vals, dtype=np.float32),
-        advantage=np.asarray(advs, dtype=np.float32),
+        advantage=advs_np,
         value_target=np.asarray(vtargs, dtype=np.float32),
         turn=np.asarray(turns, dtype=np.int64),
     )
