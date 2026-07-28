@@ -178,6 +178,56 @@ impl Drop for Engine {
     }
 }
 
+// ── EnginePool: per-thread Engine access for rayon ──────────────────────
+
+/// A pool of `Engine` instances, one per rayon worker thread.
+///
+/// RL_SPEC §2.1 established that concurrent battles in one process are
+/// independent (the C API takes the pointer explicitly).  We document that
+/// evidence here and mark `Engine` as `Send` so rayon can use it.
+///
+/// # Safety
+///
+/// `Engine` holds a raw `*mut c_void agent_ptr`.  Each `Engine` instance
+/// has its own distinct agent (created by `AgentStart`), and the C API
+/// functions take the agent pointer explicitly, so concurrent calls on
+/// different `Engine` values do not share mutable state.  This is the
+/// §2.1 measurement: 8 threads × 3 games, 0 foreign card ids, 0 errors.
+unsafe impl Send for Engine {}
+
+pub struct EnginePool {
+    engines: Vec<Engine>,
+}
+
+impl EnginePool {
+    /// Create a pool by loading `n` independent `Engine` instances.
+    ///
+    /// Each engine gets its own `AgentStart` call.  `init_game` is only
+    /// `true` for the first one (GameInitialize once per process).
+    pub fn new(
+        lib_path: &str,
+        n: usize,
+        init_game: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut engines = Vec::with_capacity(n);
+        for i in 0..n {
+            let engine = unsafe { Engine::load(lib_path, init_game && i == 0)? };
+            engines.push(engine);
+        }
+        Ok(EnginePool { engines })
+    }
+
+    /// Number of engines in the pool.
+    pub fn len(&self) -> usize {
+        self.engines.len()
+    }
+
+    /// Get a reference to one engine by index (for single-threaded use).
+    pub fn get(&self, idx: usize) -> &Engine {
+        &self.engines[idx]
+    }
+}
+
 // ── Helper types (match api.py dataclasses) ────────────────────────────────
 
 use serde::{Deserialize, Serialize};

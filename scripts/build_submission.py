@@ -52,6 +52,13 @@ MODEL_FILES: list[str] = [
     "policy.py",
 ]
 
+# Additional Python files to bundle (from ptcg_il/ or ptcg_rl/)
+EXTRA_FILES: list[tuple[str, str]] = [
+    # (source_rel, dest_name_in_model)
+    ("ptcg_il/search_infer.py", "search_infer.py"),
+    ("ptcg_rl/belief.py", "belief_posterior.py"),
+]
+
 # __init__.py for the submission model package.
 # IMPORTANT: MLP must be defined *before* the submodule imports because
 # cards.py, embed.py, and pointer.py all do ``from model import MLP`` at
@@ -84,12 +91,16 @@ from model.cards import CardEncoder, AttackEncoder  # noqa: E402
 from model.policy import Policy, select_multi  # noqa: E402
 '''
 
-MAIN_PY_TEMPLATE = '''"""Pokémon TCG AI Agent — Kaggle submission entry point.
+MAIN_PY_TEMPLATE = r'''"""Pokémon TCG AI Agent — Kaggle submission entry point.
 
-Model loads at import time.  Any failure (missing files, weight mismatch,
-CUDA error) raises immediately — no silent fallbacks.
+Uses belief model to predict opponent's deck, then PUCT MCTS (via bundled
+libptcg_search.so) to search for the best action.  Falls back to greedy
+policy if MCTS is unavailable.
+
+Model loads at import time.  Any failure raises immediately.
 """
 
+import json
 import os
 import numpy as np
 import torch
@@ -97,22 +108,31 @@ import torch
 try:
     from cg.api import to_observation_class
 except ImportError:
-    # Local testing fallback when cg is not available
     def to_observation_class(obs_dict: dict):
-        """Minimal Observation stub for local testing."""
         select = obs_dict.get("select")
         return type("Observation", (), {
             "select": None if select is None else type("SelectData", (), select)(),
         })()
+
 from model import Policy, select_multi
 from model.featurizer import featurize
+from model.search_infer import (
+    mcts_search,
+    predict_opponent_deck,
+    extract_opp_visible_cards,
+)
 
 DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ── MCTS config (inference-time) ─────────────────────────────────────────
+
+_MCTS_ITERATIONS = int(os.environ.get("MCTS_ITERATIONS", "64"))
+_MCTS_C_PUCT = float(os.environ.get("MCTS_C_PUCT", "2.0"))
+_MCTS_SEED = int(os.environ.get("MCTS_SEED", "0"))
+
 
 def _load_json(path: str) -> dict:
-    import json
     with open(path) as f:
         return json.load(f)
 
@@ -125,54 +145,18 @@ def _read_deck_csv() -> list[int]:
         return [int(line.strip()) for line in f if line.strip()]
 
 
-def _sample_to_batch(sample: dict, device: torch.device) -> dict:
-    """Convert a single numpy sample to a batch-1 torch dict.
+# ── Import-time model loading ─────────────────────────────────────────────
 
-    ``featurize()`` emits some fields as 0-d numpy *scalars* rather than arrays
-    -- notably ``minCount`` / ``maxCount`` (``np.int64(...)``).  Only copying
-    ``np.ndarray`` silently drops those, and ``select_multi`` then dies with
-    ``KeyError: 'minCount'`` on every multi-select decision (~9% of decisions,
-    i.e. a forfeited game).  Training never hits this because the shards store
-    them as arrays and ``collate_fn`` batches them.
-    """
-    batch = {}
-    for k, v in sample.items():
-        # Add the batch dim explicitly rather than via unsqueeze: for a 0-d
-        # input np.ascontiguousarray already promotes to shape (1,), so an
-        # unsqueeze on top would yield (1, 1) and _select_multi_raw would fail
-        # with "too many indices for tensor of dimension 1".
-        if isinstance(v, np.ndarray):
-            arr = np.ascontiguousarray(v)[None, ...]
-        elif isinstance(v, (np.generic, int, float, bool)):
-            arr = np.asarray(v).reshape(1)
-        else:
-            continue
-        t = torch.from_numpy(np.ascontiguousarray(arr))
-        if arr.dtype == np.bool_:
-            t = t.bool()
-        elif np.issubdtype(arr.dtype, np.integer):
-            t = t.long()
-        else:
-            t = t.float()
-        batch[k] = t.to(device)
-    return batch
-
-
-# ---- Import-time model loading ----
-
-_vocab = _load_json(os.path.join(DATA_DIR, "vocab.json"))
-_vocab_full = {
-    "id_to_index": {int(k): int(v) for k, v in _vocab.get("id_to_index", {}).items()},
-    "attack_id_to_index": {int(k): int(v) for k, v in _vocab.get("attack_id_to_index", {}).items()},
+_vocab_raw = _load_json(os.path.join(DATA_DIR, "vocab.json"))
+_vocab = {
+    "id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("id_to_index", {}).items()},
+    "attack_id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("attack_id_to_index", {}).items()},
 }
 
 _card_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "card_static.npy")))
 _attack_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "attack_static.npy")))
 
 _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
-# n_opp_arch sizes the belief arch head.  Omitting it built the head at [1, D]
-# against a [n_opp_arch, D] checkpoint, and a *shape* mismatch is fatal even
-# under strict=False — so the agent raised at import and forfeited every game.
 _model = Policy(
     V=_ckpt["V"], A=_ckpt["A"],
     D=_ckpt.get("D", 256), heads=_ckpt.get("heads", 8),
@@ -181,49 +165,83 @@ _model = Policy(
     card_static_table=_card_static, attack_static_table=_attack_static,
 )
 _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
-# Loud about what strict=False swallowed: silently dropped tensors mean an
-# agent that plays with partly random weights and simply loses.  Two classes of
-# "missing" are expected and filtered out, or the warning cries wolf every run:
-#   * tied aliases — pointer.card *is* embed.card, so the shadow/checkpoint
-#     stores the shared tensor once and the alias resolves to the same object;
-#   * `.static` buffers — supplied from card_static.npy / attack_static.npy.
-# data_ptr(), not id(): state_dict() detaches, so tied parameters come back as
-# distinct Python objects sharing one storage.
 _sd = _model.state_dict()
 _loaded_ptrs = {_sd[k].data_ptr() for k in _ckpt["model_state_dict"] if k in _sd}
 _real_missing = [k for k in _missing
                  if not k.endswith(".static") and _sd[k].data_ptr() not in _loaded_ptrs]
 if _real_missing:
-    print(f"[agent] WARNING: {len(_real_missing)} weights absent from the "
-          f"checkpoint and left at init: {_real_missing[:6]}")
+    print(f"[agent] WARNING: {len(_real_missing)} weights absent from checkpoint: {_real_missing[:6]}")
 _model.to(_device)
 _model.eval()
 
 _fixed_deck = _read_deck_csv()
 
-# ---- Agent function ----
+# Load archetypes for belief posterior
+_archetypes = _load_json(os.path.join(DATA_DIR, "archetypes.json"))
+
+# Track visible opponent cards across the game (for belief posterior)
+_opp_visible_cards: list[int] = []
+
+# ── Agent function ───────────────────────────────────────────────────────
+
 
 def agent(obs_dict: dict) -> list[int]:
+    global _opp_visible_cards
+
     obs = to_observation_class(obs_dict)
 
     # Deck selection step
     if obs.select is None:
+        _opp_visible_cards = []  # reset for new game
         return list(_fixed_deck)
 
-    # Featurize observation → tensor dict
-    sample = featurize(obs_dict, _vocab_full, value_target=0.0, sample_weight=1.0)
-    batch = _sample_to_batch(sample, _device)
-    max_count = int(sample["maxCount"])
+    # Update visible opponent cards
+    try:
+        _opp_visible_cards = extract_opp_visible_cards(obs_dict)
+    except Exception:
+        pass
 
-    with torch.no_grad():
-        if max_count == 1:
-            logits, _value, _hist = _model(batch)
-            logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-            return [int(logits.argmax(dim=-1)[0].item())]
-        else:
-            chosen = select_multi(_model, batch)
-            picks = [int(p) for p in chosen[0].tolist() if p >= 0]
-            return picks[:max_count]
+    # Predict opponent deck using belief model
+    opp_deck = predict_opponent_deck(
+        obs_dict, _model, _vocab, _archetypes, _device,
+        observed_card_ids=_opp_visible_cards,
+    )
+
+    # Run MCTS via bundled libptcg_search.so
+    result = mcts_search(
+        obs_dict,
+        fixed_deck=_fixed_deck,
+        opp_deck=opp_deck,
+        policy=_model,
+        vocab=_vocab,
+        device=_device,
+        libcg_path=_find_libcg(),
+        iterations=_MCTS_ITERATIONS,
+        c_puct=_MCTS_C_PUCT,
+        seed=_MCTS_SEED,
+    )
+
+    return result.get("indices", [])
+
+
+def _find_libcg() -> str:
+    """Locate libcg.so in the Kaggle environment."""
+    candidates = [
+        "/kaggle_simulations/agent/libcg.so",
+        "libcg.so",
+        os.path.join(os.path.dirname(__file__), "libcg.so"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # Fallback: try cg package
+    try:
+        from cg.sim import _lib_path
+        if _lib_path and os.path.exists(_lib_path):
+            return _lib_path
+    except Exception:
+        pass
+    return "libcg.so"
 '''
 
 
@@ -242,6 +260,9 @@ def write_init(dst_dir: Path) -> None:
 
 def build_model_package(src_dir: Path, dst_dir: Path) -> None:
     """Copy model files from ptcg_il/model/ to submission/model/, rewriting imports.
+
+    Also bundles ``search_infer.py``, ``belief_posterior.py``, and
+    ``libptcg_search.so`` for MCTS inference.
 
     Parameters
     ----------
@@ -264,6 +285,22 @@ def build_model_package(src_dir: Path, dst_dir: Path) -> None:
         text = rewrite_imports(text)
         (model_dst / fname).write_text(text)
         print(f"  Copied + rewrote {fname}")
+
+    # Extra files: search_infer.py, belief_posterior.py
+    python_src = src_dir / "python"
+    for rel_path, dest_name in EXTRA_FILES:
+        src = python_src / rel_path
+        if not src.exists():
+            print(f"WARNING: {src} not found — skipping")
+            continue
+        text = src.read_text()
+        # Rewrite belief_posterior imports (from ptcg_rl -> relative)
+        if "ptcg_il" in text or "ptcg_rl" in text:
+            text = text.replace("from ptcg_il.featurizer import", "from model.featurizer import")
+            text = text.replace("from ptcg_il.model.policy import", "from model.policy import")
+            text = text.replace("from ptcg_rl.belief import", "from model.belief_posterior import")
+        (model_dst / dest_name).write_text(text)
+        print(f"  Copied + rewrote {dest_name}")
 
     # ref_map.py — self-contained, no ptcg_il imports, copy verbatim
     ref_src = src_dir / "python" / "ptcg_il" / "ref_map.py"
@@ -456,8 +493,9 @@ def read_ckpt_deck(ckpt_path: Path) -> tuple[list[int] | None, dict | None]:
     return [int(c) for c in record["deck"]], record
 
 
-def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = None) -> None:
-    """Copy vocab, static tables, and FIXED_DECK into submission/data/.
+def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = None,
+                     src_dir: Path | None = None) -> None:
+    """Copy vocab, static tables, archetypes, deck, and Rust .so into submission/data/.
 
     Parameters
     ----------
@@ -466,6 +504,8 @@ def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = Non
         ``attack_static_table.npy``, and ``archetypes.json``.
     dst_dir : Path
         Output directory for the submission data files.
+    src_dir : Path or None
+        Project root (for finding libptcg_search.so).  Defaults to cwd.
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -478,6 +518,30 @@ def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = Non
     print(f"  Copied card_static.npy")
     shutil.copy(data_dir / "attack_static_table.npy", dst_dir / "attack_static.npy")
     print(f"  Copied attack_static.npy")
+
+    # Archetypes — needed by belief posterior for opponent deck prediction
+    arch_path = data_dir / "archetypes.json"
+    if arch_path.exists():
+        shutil.copy(arch_path, dst_dir / "archetypes.json")
+        print(f"  Copied archetypes.json")
+
+    # Rust MCTS library
+    if src_dir is None:
+        src_dir = Path.cwd()
+    so_candidates = [
+        src_dir / "python" / "ptcg_search" / "target" / "release" / "libptcg_search.so",
+        src_dir / "ptcg_search" / "target" / "release" / "libptcg_search.so",
+    ]
+    bundled = False
+    for so_path in so_candidates:
+        if so_path.exists():
+            shutil.copy(so_path, dst_dir / "libptcg_search.so")
+            size_kb = so_path.stat().st_size / 1024
+            print(f"  Copied libptcg_search.so ({size_kb:.0f} KB)")
+            bundled = True
+            break
+    if not bundled:
+        print(f"  WARNING: libptcg_search.so not found — MCTS will fall back to greedy policy")
 
     # deck.csv (one card ID per line) — MUST be the deck this checkpoint was
     # trained on, not archetypes.json's `fixed_deck`.
@@ -623,7 +687,7 @@ def main():
     check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force)
 
     print("Building data files...")
-    build_data_files(Path(args.data_dir), data_dir, deck=deck)
+    build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd())
     build_model_weights(Path(args.ckpt), data_dir, deck_record=deck_record)
     print("  OK")
 

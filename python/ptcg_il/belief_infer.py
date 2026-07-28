@@ -159,6 +159,7 @@ class OpponentDeckOracle:
         # opp_ids order *is* the head's class order -- shard_writer assigned
         # bel_arch by position in this list, so any reordering here would
         # silently pair each class with the wrong decklist.
+        self._archetypes_raw = archetypes  # saved for ArchetypePosterior
         by_id = {int(a["id"]): a for a in archetypes.get("archetypes", [])}
         self.representatives: list[list[int]] = []
         for gid in archetypes.get("opp_ids", []):
@@ -192,13 +193,33 @@ class OpponentDeckOracle:
         return {k: v[0].float().cpu().numpy() for k, v in out.items()}
 
     def predict(
-        self, obs_dict: dict, rng: np.random.Generator | None = None
+        self,
+        obs_dict: dict,
+        rng: np.random.Generator | None = None,
+        observed_card_ids: list[int] | None = None,
     ) -> list[int]:
         """A 60-card opponent decklist in engine card ids (empty on failure).
 
-        An empty list is a valid answer and means "no opinion" -- the Rust
-        determinizer then falls back to the mirror heuristic, which is exactly
-        the behaviour we want when the belief heads have nothing to say.
+        Fallback chain (RL_SPEC §8.1, Phase 3c):
+        1. Learned ``arch`` head — when confident (≥ arch_confidence)
+        2. Bayesian ``ArchetypePosterior`` — when it has collapsed (elimination)
+        3. Learned ``deck`` distribution — bag of cards
+        4. Empty list — Rust falls back to mirror heuristic
+
+        An empty list means "no opinion" — the Rust determinizer falls back
+        to the mirror heuristic, which is exactly the behaviour we want when
+        the belief heads have nothing to say.
+
+        Parameters
+        ----------
+        obs_dict : dict
+            The observation dict.
+        rng : np.random.Generator or None
+            For multinomial sampling in deck_from_distribution.
+        observed_card_ids : list[int] or None
+            Engine card ids of opponent cards seen so far (active, bench,
+            discard, face-up prizes).  Feeds the ArchetypePosterior for
+            elimination-based inference.
         """
         try:
             logits = self.belief(obs_dict)
@@ -206,6 +227,7 @@ class OpponentDeckOracle:
             logger.debug("Belief forward failed: %s", exc)
             return []
 
+        # ── Tier 1: Learned arch head ──────────────────────────────────
         arch = logits.get("arch")
         if arch is not None and arch.size > 1 and self.representatives:
             p = _softmax(arch[: len(self.representatives)])
@@ -214,6 +236,22 @@ class OpponentDeckOracle:
             if p[best] >= self.arch_confidence and len(rep) == DECK_SIZE:
                 return list(rep)
 
+        # ── Tier 2: Bayesian ArchetypePosterior (Phase 3c) ─────────────
+        if observed_card_ids and self.representatives:
+            try:
+                from ptcg_rl.belief import ArchetypePosterior
+
+                posterior = ArchetypePosterior(self._archetypes_raw)
+                probs = posterior.posterior(observed_card_ids)
+                best = int(np.argmax(probs))
+                if probs[best] >= 0.80 and best < len(self.representatives):  # CONFIDENT
+                    rep = self.representatives[best]
+                    if len(rep) == DECK_SIZE:
+                        return list(rep)
+            except Exception as exc:
+                logger.debug("ArchetypePosterior failed: %s", exc)
+
+        # ── Tier 3: Learned deck distribution ──────────────────────────
         return deck_from_distribution(
             _softmax(logits["deck"]), self.index_to_id, rng=rng
         )

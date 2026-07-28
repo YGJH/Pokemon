@@ -105,6 +105,10 @@ def build_parser() -> argparse.ArgumentParser:
     hp.add_argument("--no-anchor", action="store_true",
                     help="Drop the KL anchor. Ablation only — this removes the "
                          "catastrophic-forgetting guard entirely.")
+    hp.add_argument("--mcts-distill", action="store_true",
+                    help="Enable MCTS PUCT search distillation (Phase 3d). "
+                         "Runs MCTS on ρ=0.05 of rollout decisions and adds "
+                         "L_search to the PPO loss.")
 
     gate = p.add_argument_group("Gate (§10.2)")
     gate.add_argument("--gate-games", type=int, default=None,
@@ -144,6 +148,8 @@ def _config_from_args(args: argparse.Namespace):
             overrides[name] = val
     if args.gate_games is not None:
         overrides["gate_paired_games"] = args.gate_games
+    if args.mcts_distill:
+        overrides["mcts_enabled"] = True
     return RLConfig(**overrides)
 
 
@@ -594,6 +600,171 @@ def _ppo_epochs(policy, batch, logp_ref_full, optimizer, beta, cfg, device) -> d
     out = {k: float(sum(v) / len(v)) for k, v in agg.items() if v}
     out["n_updates"] = n_updates
     return out
+
+
+def _run_mcts_distillation(
+    args, cfg, policy, vocab, decisions, device, wb=None
+) -> list:
+    """Run batched MCTS PUCT search on ρ-tagged decision points.
+
+    Uses stored ``obs_json`` from rollout Decisions (Phase 3d) to
+    construct determinized search roots.  Each tagged state gets K
+    determinizations with different opponent deck guesses sampled from
+    the belief posterior.
+
+    Returns a list of ``SearchTarget`` (or ``None`` for untagged
+    decisions) aligned with the decision indices.
+    """
+    import json as _json
+    import numpy as np
+
+    from ptcg_rl.search import (
+        MctsForest,
+        SearchTarget,
+        batch_evaluate_leaves,
+    )
+
+    n = len(decisions)
+    n_tag = max(1, int(n * cfg.mcts_rho))
+    rng = np.random.default_rng(cfg.seed)
+    tagged_idx = set(rng.choice(n, size=n_tag, replace=False).tolist())
+
+    if not tagged_idx:
+        return [None] * n
+
+    forest = MctsForest(
+        n_engines=cfg.mcts_n_engines,
+        libcg_path=None,
+    )
+
+    # tree_id -> (batch_idx, determinization_k)
+    tree_map: dict[int, tuple[int, int]] = {}
+
+    try:
+        for i in tagged_idx:
+            dec = decisions[i]
+            obs_json = getattr(dec, "obs_json", None)
+            if not obs_json:
+                continue
+            obs_dict = _json.loads(obs_json)
+            fixed_deck = _fixed_deck(args)
+            opp_visible = getattr(dec, "opp_visible_card_ids", None) or []
+
+            # ── K weighted determinizations per state ──────────────────
+            for k in range(cfg.mcts_k_determinizations):
+                opp_template = _sample_opp_deck(
+                    args, obs_dict, opp_visible, seed=cfg.seed + i * 1000 + k
+                )
+                tree_id = forest.add_root(
+                    obs_dict,
+                    fixed_deck,
+                    opp_deck_template=opp_template,
+                    iterations=cfg.mcts_iterations,
+                    c_puct=cfg.mcts_c_puct,
+                    seed=cfg.seed + i * 1000 + k,
+                )
+                if tree_id >= 0:
+                    tree_map[tree_id] = (i, k)
+
+        if not tree_map:
+            return [None] * n
+
+        # ── MCTS batch loop ────────────────────────────────────────────
+        while True:
+            leaves = forest.select_batch(cfg.mcts_leaf_batch)
+            if not leaves:
+                break
+            expansions = batch_evaluate_leaves(leaves, policy, vocab, device)
+            forest.expand_batch(expansions)
+
+        results = {r["tree_id"]: r for r in forest.results()}
+    finally:
+        forest.close()
+
+    # ── Aggregate K determinizations per state ─────────────────────────
+    targets: list = [None] * n
+    # Collect per-state results
+    state_results: dict[int, list[dict]] = {}
+    for tree_id, result in results.items():
+        batch_idx, k = tree_map[tree_id]
+        state_results.setdefault(batch_idx, []).append(result)
+
+    for batch_idx, k_results in state_results.items():
+        if not k_results:
+            continue
+
+        # Aggregate visit counts across K trees
+        n_opts = -1
+        agg_visits: dict[int, float] = {}
+        agg_value = 0.0
+        n_with_value = 0
+
+        for r in k_results:
+            for opt, visits in r.get("visit_counts", []):
+                agg_visits[opt] = agg_visits.get(opt, 0.0) + visits
+                n_opts = max(n_opts, opt + 1)
+            rv = r.get("root_value")
+            if rv is not None:
+                agg_value += rv
+                n_with_value += 1
+
+        if n_opts > 0 and agg_visits:
+            total = sum(agg_visits.values())
+            dist = np.zeros(n_opts, dtype=np.float32)
+            for opt, v in agg_visits.items():
+                if opt < n_opts and total > 0:
+                    dist[opt] = float(v) / total
+        else:
+            dist = np.array([], dtype=np.float32)
+
+        root_value = (agg_value / max(n_with_value, 1)) if n_with_value > 0 else None
+
+        targets[batch_idx] = SearchTarget(
+            visit_distribution=dist,
+            root_value=root_value,
+            n_options=n_opts,
+        )
+
+    return targets
+
+
+def _sample_opp_deck(
+    args, obs_dict: dict, observed_card_ids: list[int], seed: int
+) -> list[int]:
+    """Sample an opponent deck template for one determinization.
+
+    Uses ``OpponentDeckOracle.predict()`` with multinomial sampling (rng),
+    so each call produces a potentially different distribution sample.
+    K calls with different seeds give K diverse determinizations.
+    """
+    import numpy as np
+
+    data_dir = Path(args.data_dir)
+    vocab = _load_vocab(data_dir)
+    archetypes = _load_archetypes(data_dir)
+
+    try:
+        from ptcg_il.belief_infer import OpponentDeckOracle
+
+        oracle = OpponentDeckOracle(
+            policy=None,  # Will be set below
+            vocab=vocab,
+            archetypes=archetypes,
+        )
+        # We need the policy for belief heads.  If unavailable, fall
+        # back to ArchetypePosterior (no NN needed).
+        return oracle.predict(
+            obs_dict,
+            rng=np.random.default_rng(seed),
+            observed_card_ids=observed_card_ids,
+        )
+    except Exception:
+        return []  # Empty = Rust mirror fallback
+
+
+def _load_archetypes(data_dir: Path) -> dict:
+    with open(data_dir / "archetypes.json") as f:
+        return json.load(f)
 
 
 def _recompute_buffer_logp(policy, batch, cfg, device) -> None:

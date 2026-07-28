@@ -11,6 +11,9 @@
 # 要打包哪一副牌用第一個參數指定，預設 a0（資料量最大的那副）:
 #   ./scripts/build_submit.sh          # checkpoints_a0
 #   ./scripts/build_submit.sh a1       # checkpoints_a1
+#
+# 會自動編譯 Rust MCTS library (libptcg_search.so) 並打包進 submission。
+# 如果 cargo 找不到，會跳過並在 submission 中使用 greedy fallback。
 
 set -euo pipefail
 
@@ -23,6 +26,16 @@ if [[ ! -f "$CKPT" ]]; then
     ls -d python/checkpoints* 2>/dev/null | sed 's/^/  /' >&2
     exit 1
 fi
+
+# ── Build Rust MCTS library ─────────────────────────────────────────────
+RUST_DIR="python/ptcg_search"
+if command -v cargo &>/dev/null && [[ -f "$RUST_DIR/Cargo.toml" ]]; then
+    echo "Building libptcg_search.so..."
+    (cd "$RUST_DIR" && cargo build --release 2>&1) || echo "WARNING: cargo build failed — submission will use greedy fallback"
+else
+    echo "WARNING: cargo not found — skipping Rust build, MCTS will fall back to greedy policy"
+fi
+# ─────────────────────────────────────────────────────────────────────────
 
 uv run python scripts/build_submission.py \
     --data-dir python/data \

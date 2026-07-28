@@ -27,6 +27,7 @@ pattern ``ptcg_mine/download.py`` uses for the Kaggle API.
 
 from __future__ import annotations
 
+import json
 import logging
 from rich.logging import RichHandler
 import multiprocessing as mp
@@ -70,6 +71,67 @@ class Decision:
     turn: int
     """Decision index within the game.  R1 checks that value accuracy rises with
     it; a critic that is no better late than early has learned nothing."""
+    opp_visible_card_ids: list[int] | None = None
+    """Engine card ids of opponent cards visible at this decision point
+    (active, bench, discard, face-up prizes).  Feeds the Bayesian
+    ArchetypePosterior for MCTS determinization (Phase 3c)."""
+    obs_json: str | None = None
+    """Raw observation JSON from the engine at this decision point.
+    Preserved for MCTS distillation (Phase 3d): the determinizer needs
+    ``search_begin_input``, ``current``, and ``select`` fields to
+    construct search roots."""
+
+
+def _extract_opp_visible_card_ids(obs: dict) -> list[int]:
+    """Return engine card ids of visible opponent cards from an observation.
+
+    Covers active, bench, discard, and face-up prize cards.  Face-down
+    prizes and deck cards are excluded (they are hidden).
+    """
+    current = obs.get("current", {})
+    your_idx = current.get("yourIndex", 0)
+    opp_idx = 1 - your_idx
+    players = current.get("players", [])
+    if opp_idx >= len(players):
+        return []
+    opp = players[opp_idx]
+
+    ids: list[int] = []
+
+    # Active Pokémon
+    for poke in (opp.get("active") or []):
+        if isinstance(poke, dict) and "id" in poke:
+            ids.append(poke["id"])
+            # Pre-evolutions
+            for pre in (poke.get("preEvolution") or []):
+                if isinstance(pre, dict) and "id" in pre:
+                    ids.append(pre["id"])
+
+    # Bench Pokémon
+    for poke in (opp.get("bench") or []):
+        if isinstance(poke, dict) and "id" in poke:
+            ids.append(poke["id"])
+            for pre in (poke.get("preEvolution") or []):
+                if isinstance(pre, dict) and "id" in pre:
+                    ids.append(pre["id"])
+
+    # Discard pile
+    for card in (opp.get("discard") or []):
+        if isinstance(card, dict) and "id" in card:
+            ids.append(card["id"])
+
+    # Face-up prize cards (only non-null entries)
+    for card in (opp.get("prize") or []):
+        if isinstance(card, dict) and "id" in card:
+            ids.append(card["id"])
+
+    # Stadium (if any)
+    stadium = current.get("stadium") or []
+    for card in stadium:
+        if isinstance(card, dict) and "id" in card:
+            ids.append(card["id"])
+
+    return ids
 
 
 @dataclass
@@ -341,6 +403,10 @@ class RolloutPool:
                             logp=float(rep["logp"]),
                             value=float(rep["value"]),
                             turn=len(self._open[w].decisions),
+                            opp_visible_card_ids=_extract_opp_visible_card_ids(
+                                req["obs"]
+                            ) if req.get("obs") else None,
+                            obs_json=json.dumps(req["obs"]) if req.get("obs") else None,
                         )
                     )
 

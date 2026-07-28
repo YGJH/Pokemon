@@ -202,3 +202,93 @@ def ppo_losses(
         stats.explained_variance = explained_variance(value, value_target)
 
     return total, stats
+
+
+# ── Search distillation loss (RL_SPEC §8.3, Phase 3d) ──────────────────────
+
+def search_distillation_loss(
+    policy,
+    batch: dict[str, torch.Tensor],
+    search_targets: list,
+    cfg,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute ``L_search`` for states that have MCTS distillation targets.
+
+    Only the states whose index is in ``search_targets`` contribute to the
+    loss; all other states carry zero contribution.
+
+    Parameters
+    ----------
+    policy : Policy
+    batch : dict
+        Batched featurized tensors (the full rollout buffer).
+    search_targets : list of SearchTarget or None
+        One ``SearchTarget`` per tagged decision point.  Any entry that is
+        ``None`` or missing is skipped.
+
+    Returns
+    -------
+    loss : Tensor
+        Scalar loss, differentiable w.r.t. policy parameters.
+    info : dict
+        ``{"search/pi_ce": ..., "search/v_mse": ...}`` for logging.
+    """
+    if not search_targets or all(t is None for t in search_targets):
+        return torch.zeros((), device=next(policy.parameters()).device), {}
+
+    import torch.nn.functional as F
+    import numpy as np
+
+    device = next(policy.parameters()).device
+    h, _history_h = policy._encode(batch)
+    logits, _ = policy.pointer(h, batch["tok_mask"],
+                                policy.embed.card, batch)
+    value = policy.value(h[:, 0])  # [B, 1]
+
+    total_pi = torch.zeros((), device=device)
+    total_v = torch.zeros((), device=device)
+    n_pi = 0
+    n_v = 0
+
+    for i, target in enumerate(search_targets):
+        if target is None:
+            continue
+
+        # -- Policy distillation: CE to visit distribution π̃ ────────
+        if target.visit_distribution is not None and len(target.visit_distribution) > 0:
+            pi_tilde = torch.as_tensor(
+                np.asarray(target.visit_distribution, dtype=np.float32)
+            ).to(device)
+
+            # Mask and softmax the model's logits
+            mask = batch["opt_mask"][i].bool()
+            masked_logits = logits[i].float().masked_fill(~mask, float("-inf"))
+            logp = F.log_softmax(masked_logits, dim=-1)
+
+            # CE over only the legal options populated by π̃
+            n_legal = min(len(pi_tilde), int(mask.sum()))
+            if n_legal > 0:
+                ce = -(pi_tilde[:n_legal] * logp[:n_legal]).sum()
+                total_pi = total_pi + ce
+                n_pi += 1
+
+        # -- Value distillation: MSE to root value Ṽ ──────────────────
+        if target.root_value is not None:
+            v_tilde = torch.tensor(target.root_value, device=device)
+            mse = F.mse_loss(value[i, 0], v_tilde)
+            total_v = total_v + mse
+            n_v += 1
+
+    loss_pi = total_pi / max(n_pi, 1) if n_pi > 0 else torch.zeros((), device=device)
+    loss_v = total_v / max(n_v, 1) if n_v > 0 else torch.zeros((), device=device)
+
+    loss = cfg.mcts_c_pi * loss_pi + cfg.mcts_c_v * loss_v
+
+    info = {}
+    if n_pi > 0:
+        info["search/pi_ce"] = float(loss_pi.detach())
+    if n_v > 0:
+        info["search/v_mse"] = float(loss_v.detach())
+    info["search/n_tagged"] = len([t for t in search_targets if t is not None])
+
+    return loss, info

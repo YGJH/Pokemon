@@ -84,6 +84,29 @@ class RLConfig:
     gate_kl_multiple: float = 4.0
     """KL at evaluation temperature may not exceed ``kappa × this``."""
 
+    # ── MCTS search distillation (R3, §8.3, Phase 3d) ──────────────────────
+    mcts_enabled: bool = False
+    """Enable MCTS distillation pass after each PPO update."""
+    mcts_iterations: int = 128
+    """PUCT iterations per tree."""
+    mcts_c_puct: float = 2.0
+    """PUCT exploration constant (AlphaZero uses 2.0)."""
+    mcts_k_determinizations: int = 8
+    """K determinized worlds per root state."""
+    mcts_leaf_batch: int = 512
+    """Max leaves collected per MCTS batch step (GPU forward batch)."""
+    mcts_rho: float = 0.05
+    """Fraction of rollout decision points tagged for MCTS distillation."""
+    mcts_c_pi: float = 0.3
+    """Weight of the policy distillation term in L_search (§8.3)."""
+    mcts_c_v: float = 0.3
+    """Weight of the value distillation term in L_search (§8.3)."""
+    mcts_n_engines: int = 4
+    """Number of libcg Engine instances (one per rayon worker in Rust).
+    Each engine drives one libcg agent_ptr independently (§2.1: concurrent
+    battles are safe).  4 instances let MCTS realise 4 × 8 = 32 children
+    concurrently across determinizations."""
+
     # ── Critic repair (R1, §3) ──────────────────────────────────────────────
     critic_steps: int = 5_000
     critic_lr: float = 3e-4
