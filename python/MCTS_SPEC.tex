@@ -1,0 +1,520 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+
+\geometry{margin=2.5cm}
+\hypersetup{colorlinks=true,linkcolor=blue!60!black,urlcolor=blue!60!black}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  framesep=4pt,
+  backgroundcolor=\color{gray!8},
+  columns=fullflexible,
+}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\file}[1]{\texttt{\small #1}}
+
+\title{\textbf{MCTS Training and Inference Specification}\\[0.3em]
+\large Pok\'emon TCG AI --- as implemented, 2026-07-31}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document describes the MCTS system \emph{as it currently exists in the
+code}, not as designed. It covers the observation encoding, the action space,
+the PUCT search, the self-play training loop, and the inference path used by
+the Kaggle submission. Section~\ref{sec:problem} states the measured problem:
+with a repaired critic and a corrected value backup, PUCT still loses
+$40$ percentage points against its own greedy policy prior. Every number here
+was measured on this repository; every file:line reference was read, not
+recalled.
+\end{abstract}
+
+\tableofcontents
+
+% ======================================================================
+\section{System overview}
+
+Three components cooperate at inference time:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Policy network} (\file{ptcg\_il/model/policy.py}) --- a
+    transformer over $46$ state tokens producing per-option logits (the
+    \emph{pointer head}), a scalar value, and four \emph{belief} heads over
+    opponent cards.
+  \item \textbf{Belief $\to$ deck oracle}
+    (\file{ptcg\_il/search\_infer.py:90}) --- converts the belief heads into a
+    concrete $60$-card opponent decklist.
+  \item \textbf{PUCT tree} (\file{ptcg\_search/src/puct.rs}, Rust, driven over
+    a C-ABI) --- searches with the policy as prior and the value head as leaf
+    evaluation, determinized against the predicted opponent deck.
+\end{enumerate}
+
+\noindent
+The division of labour matters and is a common source of confusion:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Head} & \textbf{Predicts} & \textbf{Consumed by} \\
+\midrule
+Pointer & distribution over \emph{legal options} & PUCT priors; greedy action \\
+Value   & game outcome $\in(-1,1)$              & PUCT leaf backup \\
+Belief (\code{arch}, \code{deck}, & distributions over \emph{opponent cards} & determinization \\
+\quad \code{hidden}, \code{hand}) & & (never over actions) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{The belief heads never score a move.} They exist solely to supply a
+concrete opponent deck so that a hidden-information game can be rolled out.
+
+% ======================================================================
+\section{Observation encoding}
+\label{sec:obs}
+
+Produced by \code{featurize()} in \file{ptcg\_il/featurizer.py}. Pure NumPy,
+one call per decision point.
+
+\subsection{State token sequence}
+
+A fixed sequence of $L_{\text{STATE}} = 46$ tokens:
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Rows} & \textbf{Count} & \textbf{Token} & \textbf{Layout} \\
+\midrule
+$0$        & $1$  & CLS      & global features \\
+$1$--$12$  & $12$ & POK\'EMON & $0$=my active, $1$--$5$ my bench, $6$=opp active, $7$--$11$ opp bench \\
+$13$--$42$ & $30$ & HAND     & my hand, packed to front \\
+$43$--$44$ & $2$  & SUMMARY  & row $0$ = me, row $1$ = opponent \\
+$45$       & $1$  & STADIUM  & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Tensor dictionary}
+
+\code{featurize()} returns $37$ keys. The card-bearing ones:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Key} & \textbf{Shape} & \textbf{Notes} \\
+\midrule
+\code{poke\_card\_feat}    & $[12, 94]$        & static card features \\
+\code{hand\_card\_feat}    & $[30, 94]$        & \\
+\code{stadium\_card\_feat} & $[1, 94]$         & \\
+\code{context\_card\_feat} & $[1, 94]$         & added to CLS \\
+\code{effect\_card\_feat}  & $[1, 94]$         & added to CLS \\
+\code{discard\_card\_feat} & $[2, 60, 94]$     & sum-pooled into SUMMARY \\
+\code{prize\_card\_feat}   & $[2, 6, 94]$      & revealed prizes only \\
+\code{opt\_card\_feat}     & $[64, 94]$        & per-option card identity \\
+\code{opt\_attack\_feat}   & $[64, 14]$        & per-option attack identity \\
+\code{log\_card\_feat}     & $[32, 94]$        & belief GRU input \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Dense per-token features: \code{poke\_feat} $[12,26]$, \code{hand\_feat}
+$[30,2]$, \code{sum\_feat} $[2,11]$, \code{cls\_feat} $[93]$,
+\code{opt\_scalar} $[64,6]$. Masks: \code{tok\_mask} $[46]$,
+\code{opt\_mask} $[64]$, \code{discard\_mask} $[2,60]$.
+
+\subsection{Card features: $94$ dimensions}
+
+\begin{equation*}
+\underbrace{\text{base}[52]}_{\substack{\text{hp}/400,\ \text{retreat}/4,\ \text{cardType}(7),\ \text{stage}(3),\\ \text{energyType}(12),\ \text{weakness}(12),\ \text{resistance}(12),\\ [\text{ex},\text{megaEx},\text{tera},\text{aceSpec}](4)}}
+\;\Vert\;
+\underbrace{3 \times \text{attack}[14]}_{\substack{\text{damage}/350,\ \text{energy-cost histogram}(12),\\ |\text{energies}|/5}}
+\end{equation*}
+
+\noindent
+Built by \code{card\_static\_row()} in \file{ptcg\_mine/cards.py}. Because
+\code{card.attacks} holds attack \emph{ids}, the builder requires an
+\code{attacks\_by\_id} lookup; without it the $52$--$94$ half is silently zero.
+Measured on this corpus: $1055$ of $1267$ engine cards have a non-empty attack
+half.
+
+\subsection{Card identity uses raw engine ids}
+
+Features are looked up by \textbf{engine card id}, never by vocab index:
+
+\begin{lstlisting}
+_cfeat = lambda ids: _ids_to_feat(ids, engine_card_features, F_CARD, None)
+\end{lstlisting}
+
+\noindent
+This matters for generalization. \code{engine\_card\_features.npy} covers all
+$1267$ engine cards; the mined vocab holds $294$. Routing through the vocab
+mapped the other $973$ to \code{UNKNOWN\_CARD}, which dereferences to the
+string \code{"UNKNOWN"} and therefore to an \emph{all-zero row} ---
+indistinguishable from an empty slot. That never fires on the training corpus
+(the vocab is built \code{all\_corpus}) and only appears in live play.
+The same applied to attacks: $1341$ of $1556$ were outside the attack vocab.
+\code{PAD} remains $0$ and no engine id is $0$, so mask logic is unaffected.
+
+% ======================================================================
+\section{Action space}
+\label{sec:action}
+
+\subsection{Options}
+
+Each decision offers up to $O_{\text{MAX}} = 64$ options. An action is a list
+of \emph{distinct option indices} $k$ with
+$\text{minCount} \le k \le \text{maxCount}$.
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Single-select} ($\text{maxCount} = 1$): one index.
+  \item \textbf{Multi-select} ($\text{maxCount} > 1$): handled
+    autoregressively, pick-without-replacement, with an appended \textbf{STOP}
+    column (\code{opt\_type} $= 17$) at index \code{stop\_column}. STOP is
+    masked until $t \ge \text{minCount}$.
+\end{itemize}
+
+\subsection{Pointer head}
+
+\code{PointerHead.forward(h, tok\_mask, card\_enc, x)} returns
+\code{(logits, o)}. Each option token is built from its type embedding, the
+gathered encoder states at \code{opt\_src\_idx} / \code{opt\_tgt\_idx}, its
+card and attack features, and \code{opt\_scalar}; it then cross-attends over
+the $46$ state tokens. Padding is masked to $-10^9$.
+
+% ======================================================================
+\section{PUCT search}
+\label{sec:search}
+
+Implemented in Rust (\file{ptcg\_search/src/puct.rs}), driven from Python over
+a C-ABI (\file{ptcg\_il/search\_infer.py}).
+
+\subsection{Protocol}
+
+\begin{lstlisting}
+handle = puct_init(obs_json, libcg_path, fixed_deck, opp_deck,
+                   iterations, c_puct, seed, host_initialized=1)
+loop:
+    leaf = puct_select(handle)      # -> leaf_obs_json, player_role,
+                                    #    n_options, is_terminal, tree_done
+    if leaf.error or leaf.tree_done: break
+    priors, value = _policy_evaluate_leaf(leaf.leaf_obs_json, ...)
+    puct_expand(handle, priors, value)
+result = puct_result(handle)        # -> visit_counts, root_value
+puct_free(handle)
+\end{lstlisting}
+
+\subsection{Selection}
+
+For a child $c$ of a node with visit count $N$ and prior $P$:
+\begin{equation*}
+Q(c) = \frac{\text{total\_value}(c)}{N(c)}, \qquad
+U(c) = c_{\text{puct}} \cdot P(c) \cdot \frac{\sqrt{N}}{1 + N(c)}
+\end{equation*}
+\begin{equation*}
+\text{score}(c) =
+\begin{cases}
+Q(c) + U(c) & \text{\code{player\_role}} = 0 \quad (\text{our turn, max}) \\
+Q(c) - U(c) & \text{\code{player\_role}} = 1 \quad (\text{opponent, min})
+\end{cases}
+\end{equation*}
+
+\subsection{Value sign convention --- critical}
+\label{sec:sign}
+
+\code{puct.rs:53} states that \code{total\_value} is a
+\emph{``Sum of backpropagated values (from our perspective, in $[-1,1]$)''},
+and \code{backpropagate} adds the value \textbf{unchanged} along the selection
+path. The min/max distinction is expressed only through the sign of $U$ above.
+
+The network does \emph{not} share this convention. In
+\file{ptcg\_il/shard\_writer.py:454}:
+\begin{lstlisting}
+value_target = 1.0 if r == 1 else -1.0   # r = reward of the player
+                                         #     whose observation this is
+\end{lstlisting}
+so the value head predicts from the \textbf{acting player's} perspective.
+Therefore at an opponent leaf the prediction must be negated:
+\begin{equation*}
+v_{\text{backup}} =
+\begin{cases}
++v_\theta(s_{\text{leaf}}) & \text{\code{player\_role}} = 0 \\
+-v_\theta(s_{\text{leaf}}) & \text{\code{player\_role}} = 1
+\end{cases}
+\end{equation*}
+Priors need no such flip: they score the options belonging to whoever moves at
+that leaf, which is exactly that node's action set.
+
+\subsection{Determinization}
+
+MCTS cannot roll out hidden information, so \code{puct\_init} is given a
+concrete \code{opp\_deck}. It comes from \code{predict\_opponent\_deck()}
+(\file{search\_infer.py:90}), a four-tier fallback:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Learned \code{arch} head} --- if $\max_i \text{softmax}(\text{arch})_i \ge 0.5$
+    and that archetype has a $60$-card representative, use it.
+  \item \textbf{\code{ArchetypePosterior}} --- Bayesian elimination over
+    archetypes using opponent cards actually observed so far.
+  \item \textbf{Card distribution head} --- bag-of-cards sampling from the
+    \code{deck} logits.
+  \item \textbf{Empty list} --- Rust falls back to mirroring our own deck.
+\end{enumerate}
+
+\noindent
+This is a \textbf{point estimate}: one deck per decision, and all
+$K$ determinizations and all iterations assume it.
+
+% ======================================================================
+\section{Self-play training}
+\label{sec:training}
+
+\file{ptcg\_rl/mcts\_train.py}. One iteration:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Self-play} --- \code{games\_per\_iter} games, our fixed deck
+    versus an opponent archetype sampled from $\mathcal{D}_{\text{opp}}$
+    (or all $179$ with \code{--all-archetypes}). Opponents are sampled with
+    adaptive weights: low win rate $\to$ high weight.
+  \item \textbf{MCTS tagging} --- a fraction $\rho$ of decisions
+    (\code{--rho}) get PUCT targets computed with the \emph{known} opponent
+    deck, aggregated over $K$ determinizations:
+    \begin{equation*}
+      \tilde{\pi}(a) = \frac{\sum_{k=1}^{K} N_k(a)}{\sum_{a'}\sum_{k=1}^{K} N_k(a')},
+      \qquad
+      \tilde{V} = \frac{1}{K}\sum_{k=1}^{K} V_k^{\text{root}}
+    \end{equation*}
+  \item \textbf{Replay buffer} --- stores \code{features}, \code{action\_idx},
+    \code{action\_len}, \code{mcts\_pi}, \code{mcts\_value},
+    \code{game\_outcome}, \code{opp\_archetype}. Capacity
+    \code{--buffer-capacity}; training starts at \code{--min-buffer}.
+  \item \textbf{Optimisation} --- \code{train\_steps\_per\_iter} steps.
+  \item \textbf{League evaluation} --- every \code{--eval-every-games}.
+\end{enumerate}
+
+\subsection{Loss}
+
+Per \code{train\_step()} (\file{mcts\_train.py:889}):
+\begin{equation*}
+\mathcal{L} = c_\pi \mathcal{L}_\pi + c_V \mathcal{L}_V + \beta\, \mathcal{L}_{\text{KL}}
+\end{equation*}
+with, for each sample,
+\begin{equation*}
+\mathcal{L}_\pi =
+\begin{cases}
+-\sum_{a} \tilde{\pi}(a) \log p_\theta(a \mid s) & \text{if MCTS-tagged (distillation)} \\[0.4em]
+-\log p_\theta(\mathbf{a}^{\text{expert}} \mid s) & \text{otherwise (behaviour cloning,} \\[-0.2em]
+ & \text{\quad joint AR log-prob incl.\ STOP)}
+\end{cases}
+\end{equation*}
+\begin{equation*}
+\mathcal{L}_V = \big(v_\theta(s) - z\big)^2, \quad z \in \{-1,+1\} \text{ the game outcome}
+\end{equation*}
+and $\mathcal{L}_{\text{KL}}$ an anchor to the frozen $\pi_{\text{IL}}$.
+
+\subsection{League gate}
+
+A candidate is saved \textbf{only} if its Elo reaches the $70$th percentile of
+the pool (\code{elo.top\_pct(0.70)}, logged as \code{top30\%}); at most
+\code{--max-champions} champions are retained. Past champions and all
+discovered IL checkpoints are registered as opponents, with \code{ckpt-best}
+fixed at Elo $1500$ as the anchor.
+
+% ======================================================================
+\section{Inference procedure}
+\label{sec:inference}
+
+\code{agent(obs\_dict)} in the generated \file{main.py}:
+
+\begin{enumerate}[leftmargin=*]
+  \item \code{obs.select is None} $\Rightarrow$ return the fixed $60$-card deck
+    (deck-selection step) and reset the observed-card tracker.
+  \item \code{extract\_opp\_visible\_cards()} --- accumulate opponent cards
+    seen so far, for the Bayesian tier of the deck oracle.
+  \item \code{predict\_opponent\_deck()} --- belief heads $\to$ $60$-card list.
+  \item \code{mcts\_search()} $\to$ \code{result["indices"]}.
+\end{enumerate}
+
+\subsection{Action extraction}
+
+\code{puct\_result} returns \code{visit\_counts} as
+$[(\text{option\_index}, \text{visits}), \dots]$ and has \textbf{no}
+\code{indices} key. The move is the most-visited root child:
+\begin{equation*}
+a^\star = \arg\max_{a} N(a)
+\end{equation*}
+
+\subsection{Multi-select is not searched}
+
+The tree applies \emph{one} option index per node
+(\code{search\_step(id, \&[action])}), so root visit counts rank the
+\emph{first} pick only. That is a complete action for single-select but not a
+$k$-subset for multi-select. Decisions with $\text{maxCount} > 1$ therefore
+bypass the tree entirely and use the policy's autoregressive
+\code{select\_multi}. Taking the tree's top-$k$ would report a choice the
+search never evaluated, and might not even be a legal co-selection.
+
+\subsection{Graceful degradation}
+
+Any failure inside \code{mcts\_search} falls back to \code{\_greedy\_action}
+(a single forward pass). This fallback is now \textbf{logged once per distinct
+reason}. Previously it was a bare \code{except Exception: pass}, under which a
+run with no search at all was indistinguishable from a working one --- the
+agent still returned legal moves, just from the policy prior.
+
+% ======================================================================
+\section{Current problem}
+\label{sec:problem}
+
+\subsection{Measured results}
+
+Head-to-head against \file{700.py}, archetype-0 mirror match, identical
+weights (\file{checkpoints\_a0\_r1/ckpt-rl-last.pt}), search toggled:
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{Games} & \textbf{Win rate} & \textbf{95\% CI} & \textbf{s/game} \\
+\midrule
+Greedy (no search)                & $60$ & $\mathbf{76.7\%}$ & $[64.6, 85.6]$ & $0.3$ \\
+PUCT, broken critic, sign bug     & $60$ & $41.7\%$ & --- & $4.0$ \\
+PUCT, repaired critic, sign bug   & $60$ & $25.0\%$ & --- & $3.7$ \\
+PUCT, repaired critic, sign fixed & $60$ & $36.7\%$ & $[25.6, 49.3]$ & $4.9$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Greedy versus corrected PUCT: $\Delta = -40.0$ points, $z = 4.42$,
+non-overlapping confidence intervals. Search costs $16\times$ the wall clock
+to lose $40$ points.
+
+\subsection{Critic status}
+
+R1 critic repair (\file{ptcg\_rl/critic.py}, Phase A: trunk frozen, $4$
+value-head tensors) passed its gate:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Metric} & \textbf{Before} & \textbf{After R1} & \textbf{Gate} \\
+\midrule
+\code{corr}            & weak     & $0.4837$ & $\ge 0.35$ \checkmark \\
+\code{pred\_std}       & $0.068$  & $0.4246$ & $\ge 0.30$ \checkmark \\
+\code{sign\_agreement} & $0.6476$ & $0.6910$ & --- \\
+per-turn accuracy      & ---      & $0.61 \to 0.70 \to 0.75 \to 0.74$ & rises \checkmark \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Phase B (joint fine-tune) was never needed, so $h_{\text{CLS}}$ did carry
+outcome signal that IL's auxiliary MSE had simply not taught the head to read.
+
+\subsection{Interpretation}
+
+The critic passing its gate did \emph{not} make search competitive, so
+``undertrained critic'' is not a sufficient explanation. But the critic is
+still weak in absolute terms: \code{sign\_agreement} $0.69$ means roughly one
+backup in three has the wrong sign, and early-game per-turn accuracy $0.61$ is
+barely above chance. PUCT backs up $64$ such evaluations per decision.
+
+\noindent
+The two available search measurements differ in \emph{two} variables at once
+(critic quality and the sign bug), so neither isolates the critic's
+contribution.
+
+\subsection{Open hypotheses}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Critic still too weak.} Discriminator: rerun with
+    $v \equiv 0$ (priors and visit counts only). Recovery toward $41\%$
+    implicates the critic; staying near $37\%$ exonerates it.
+  \item \textbf{Determinization quality.} The opponent deck is a point
+    estimate from an \code{arch} head that only commits at $p \ge 0.5$. If it
+    is wrong, all $64$ iterations plan against a fiction. Discriminator:
+    measure predicted-vs-true archetype agreement in self-play, where the true
+    deck is known.
+  \item \textbf{Iteration budget.} $64$ iterations over a branching factor of
+    $2$--$10$. Ranked last: more iterations of a mis-specified search only
+    compound the error.
+\end{enumerate}
+
+\subsection{Scope caveat}
+
+All numbers above are a single-deck (archetype $0$) mirror match against one
+opponent. Per the project's own record, offline and live rankings have
+diverged before ($78\%$ vs $48\%$), so these should not be generalized to the
+competition ladder without a wider test.
+
+% ======================================================================
+\section{Defect history in this path}
+
+Six defects sat between \code{mcts\_search} and a working tree. All were
+masked by the blanket \code{except Exception: pass}, which is why the loud
+fallback warning had to be added \emph{first} --- each fix merely revealed the
+next.
+
+\begin{center}
+\begin{longtable}{@{}rp{6.6cm}p{5.4cm}@{}}
+\toprule
+\textbf{\#} & \textbf{Defect} & \textbf{Effect} \\
+\midrule
+\endhead
+$1$ & \code{\_find\_libcg()} returned a bare \code{"libcg.so"}; its
+      \code{from cg.sim import \_lib\_path} fallback used a name that does not
+      exist (\code{sim.py} has a \emph{local} \code{lib\_path})
+    & \code{puct\_init} $\to$ NULL; every decision greedy \\
+\addlinespace
+$2$ & Read \code{leaf["obs\_json"]}; Rust emits \code{leaf\_obs\_json}
+    & \code{KeyError} on iteration $1$ \\
+\addlinespace
+$3$ & \code{policy.\_encode()} returns \code{(h, history\_h)};
+      \code{policy.pointer(h, opt\_mask)} predates the signature
+      \code{(h, tok\_mask, card\_enc, x)}; \code{value[0,0]} on a $[B]$ tensor
+    & \code{TypeError} on every leaf \\
+\addlinespace
+$4$ & \code{puct\_result} returns \code{visit\_counts}, no \code{indices} key,
+      but \code{main.py} did \code{result.get("indices", [])}
+    & successful search returned an \emph{empty} action; engine
+      \code{IndexError} \\
+\addlinespace
+$5$ & \code{player\_role} ignored; value not negated at opponent nodes
+      (\S\ref{sec:sign})
+    & inverted backup on half the leaves; harmless while the critic was
+      near-constant, harmful once R1 gave it discriminative power \\
+\addlinespace
+$6$ & \code{\_dict\_to\_batch} filtered on \code{isinstance(v, np.ndarray)},
+      but the featurizer emits scalars as \code{np.int64} (an
+      \code{np.generic})
+    & $9$ keys silently dropped, incl.\ \code{minCount};
+      \code{KeyError: 'minCount'} on multi-select only \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\noindent
+Defect $6$ has a subtlety worth recording: the naive repair
+(\code{np.ascontiguousarray}) promotes a $0$-d scalar to $1$-d, yielding shape
+$[1,1]$ instead of the documented $[B]$. That broadcasts wrongly inside
+\code{\_select\_multi\_raw} \emph{without raising}, so the \code{KeyError}
+would have disappeared while STOP masking quietly misbehaved.
+
+\end{document}

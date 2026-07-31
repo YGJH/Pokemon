@@ -44,7 +44,7 @@ def test_write_vocab_json_roundtrip(tmp_path):
     assert data["caps"]["o_max"] == config.o_max
     assert data["caps"]["d_max"] == config.d_max
 
-    assert data["F_CARD"] == 52
+    assert data["F_CARD"] == 94  # 52 base + 3 attacks × 14
     assert data["F_ATK"] == 14
     assert data["F_POKE"] == 26
     assert data["F_HAND"] == 2

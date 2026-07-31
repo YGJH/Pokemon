@@ -145,6 +145,8 @@ class Trajectory:
     """Budget exceeded.  Recorded as a **loss**, never discarded — dropping these
     games would silently select for slow policies (§4.2)."""
     error: str | None = None
+    battle_idx: int = -1
+    """Rust battle index — used to match drain results to pending trajectories."""
 
     def __len__(self) -> int:
         return len(self.decisions)
@@ -370,11 +372,18 @@ class RolloutPool:
         if not self._procs:
             raise RuntimeError("pool not started; use `with RolloutPool(...) as pool`")
 
+        import time as _perf_time
         done: list[Trajectory] = []
         collected = 0
 
+        self._perf_t_sweep = 0.0
+        self._perf_t_act = 0.0
+        self._perf_n_act = 0
+
         while collected < n_decisions:
+            _ts = _perf_time.perf_counter()
             pending_idx, requests, finished = self._sweep()
+            self._perf_t_sweep += _perf_time.perf_counter() - _ts
             for traj in finished:
                 done.append(traj)
                 collected += len(traj)
@@ -384,7 +393,10 @@ class RolloutPool:
                     break
                 continue
 
+            _ta = _perf_time.perf_counter()
             replies = act_fn(requests)
+            self._perf_t_act += _perf_time.perf_counter() - _ta
+            self._perf_n_act += 1
             if len(replies) != len(requests):
                 raise RuntimeError(
                     f"act_fn returned {len(replies)} replies for {len(requests)} "

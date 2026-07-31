@@ -342,7 +342,12 @@ PRIZE_N=6, BENCH_N=8, ATKCOST_N=5, DMGCTR_N=20`. Every raw magnitude below is th
 | `[48:52]` | 4 | `[ex, megaEx, tera, aceSpec]` |
 
 `attack_static(attackId) -> float32[F_ATK_STATIC=14]`:
-`[damage/ATKDMG_N] (1) ⊕ energy-cost histogram over N_ENERGY (12) ⊕ [len(energies)/ATKCOST_N] (1)`.
+`[damage/ATKDMG_N] (1) ⊕ energy-cost histogram over N_ENERGY (12), each `count/ATKCOST_N` ⊕ [len(energies)/ATKCOST_N] (1)`.
+
+> The histogram is normalized, matching `poke_feat[3:15]`. It was originally specified as raw counts
+> while `poke_feat` divided by `ENERGY_N`, which put values up to 5.0 in 36 of the 94 card-feature
+> dims next to everything else in [0, 1]. `ATKCOST_N` (not `ENERGY_N`) so the histogram and the
+> `len(energies)` term that summarises it share one scale.
 
 > ⚠️ **Verify the 12-wide energy space covers every cost symbol, including *colorless*.** The
 > `energy-cost histogram` here and the attached-energy histogram in `poke_feat[3:15]` both assume
@@ -592,10 +597,15 @@ class Encoder(nn.Module):
     def __init__(self, D=256, heads=8, layers=4, ff=1024):
         layer = nn.TransformerEncoderLayer(D, heads, ff, dropout=0.0,
                     activation="gelu", batch_first=True, norm_first=True)
-        self.enc = nn.TransformerEncoder(layer, layers)
+        self.enc = nn.TransformerEncoder(layer, layers, norm=nn.LayerNorm(D))
     def forward(self, rows, tok_mask):              # rows[B,L,D], tok_mask bool[B,L]
         return self.enc(rows, src_key_padding_mask=~tok_mask)   # h[B,L,D]
 ```
+The trailing `norm` is required: `norm_first=True` normalizes *into* each sublayer but never on the
+way out, so without it the residual stream leaves the stack un-normalized and its scale grows with
+depth. Measured per-element RMS across the four layers was 0.13 → 0.43 → 0.77 → 1.22 → 1.49. That is
+mild at `layers=4` — `PointerHead` is the consumer that cares, since it cross-attends into these rows
+as unnormalized keys/values — but it compounds if `layers` is raised.
 (Token count is ~46 → packing unnecessary; the `entity-transformer` packing trick is optional and
 only helps if `L` grows.)
 

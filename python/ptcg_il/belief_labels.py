@@ -17,17 +17,13 @@ agent* cannot see, which is exactly what makes it a usable training target:
   next decision and carry it back — see :func:`opp_hand_at_next_decision` for
   why that offset is acceptable.
 
-Representation choice: counts are stored as a **distribution over the vocab**
-(count / total) rather than per-card integer buckets.  Card multiplicity is not
-bounded by the usual 4-copy rule — basic Energy is exempt, and real decks in
-this corpus go up to 22 copies of one card — so a fixed set of count buckets
-either truncates Energy or wastes most of its classes.  A single softmax over V
-sidesteps that, and it composes directly with how the planner consumes the
-output: draw 60 cards from the distribution and you have a decklist.
+Representation choice: counts are indexed by **engine card ID** directly rather
+than vocab index.  The pure-feature model has no vocab, so labels map directly
+to engine card IDs in [0, n_all_cards).
 
 Storage is sparse (index/count pairs, :data:`BELIEF_K` slots).  A 60-card deck
-holds at most 26 distinct cards in this corpus, so dense ``float32[V]`` arrays
-would be ~97% zeros and would dominate the shard size.
+holds at most 26 distinct cards in this corpus, so dense ``float32[n_all_cards]``
+arrays would be ~97% zeros and would dominate the shard size.
 """
 
 from __future__ import annotations
@@ -36,7 +32,7 @@ import bisect
 
 import numpy as np
 
-from ptcg_il.featurizer import PAD_CARD, UNKNOWN_CARD
+from ptcg_il.featurizer import PAD_CARD
 
 # Sparse-slot budget for one decklist.  Corpus max is 26 distinct cards in a
 # 60-card deck; 32 leaves headroom without a second pass over the data.
@@ -64,26 +60,23 @@ def _accumulate(counts: dict[int, int], index: int, n: int = 1) -> None:
 
 
 def deck_counts_dense(
-    deck_ids: list[int], id_to_index: dict, vocab_size: int
+    deck_ids: list[int], n_all_cards: int
 ) -> np.ndarray:
-    """int32[vocab_size] copy-count of every card in *deck_ids*.
+    """int32[n_all_cards] copy-count of every card in *deck_ids*.
 
-    Out-of-vocab ids all collapse onto :data:`UNKNOWN_CARD`, matching how the
-    featurizer maps them, so the model's target lives in the same index space
-    as its inputs.
+    Cards are indexed by their engine card ID directly — no vocab remapping.
     """
-    out = np.zeros(vocab_size, dtype=np.int32)
+    out = np.zeros(n_all_cards, dtype=np.int32)
     for cid in deck_ids:
-        idx = int(id_to_index.get(cid, UNKNOWN_CARD))
-        if 0 <= idx < vocab_size:
-            out[idx] += 1
+        if 0 <= cid < n_all_cards:
+            out[int(cid)] += 1
     return out
 
 
 def opp_visible_counts(
-    state: dict, your_index: int, id_to_index: dict, vocab_size: int
+    state: dict, your_index: int, n_all_cards: int
 ) -> np.ndarray:
-    """int32[vocab_size] counts of opponent cards we can currently *see*.
+    """int32[n_all_cards] counts of opponent cards we can currently *see*.
 
     Covers every area the observation reveals: their active and bench Pokémon
     (including the pre-evolution stack underneath, attached Energy and Tools),
@@ -116,7 +109,7 @@ def opp_visible_counts(
     players = state.get("players") or []
     opp_index = 1 - your_index
     if opp_index >= len(players) or players[opp_index] is None:
-        return np.zeros(vocab_size, dtype=np.int32)
+        return np.zeros(n_all_cards, dtype=np.int32)
     opp = players[opp_index]
 
     counts: dict[int, int] = {}
@@ -124,15 +117,13 @@ def opp_visible_counts(
     def add_card(card, owner_must_be: int | None = opp_index) -> None:
         if not isinstance(card, dict):
             return
-        # Attached cards name their owner; only count the opponent's own cards.
         if owner_must_be is not None:
             owner = card.get("playerIndex")
             if owner is not None and int(owner) != owner_must_be:
                 return
         cid = card.get("id")
-        if cid is None:
-            return
-        _accumulate(counts, int(id_to_index.get(cid, UNKNOWN_CARD)))
+        if cid is not None and 0 <= int(cid) < n_all_cards:
+            _accumulate(counts, int(cid))
 
     def add_pokemon(poke) -> None:
         if not isinstance(poke, dict):
@@ -148,19 +139,17 @@ def opp_visible_counts(
         add_pokemon(poke)
     for card in opp.get("discard") or []:
         add_card(card)
-    # Face-down prizes serialize as null; only flipped ones have an id.
     for card in opp.get("prize") or []:
         add_card(card)
-    # Stadium lives on the state, not on a player; playerIndex says whose it is.
     stadium = state.get("stadium")
     if isinstance(stadium, dict):
         stadium = [stadium]
     for card in stadium or []:
         add_card(card)
 
-    out = np.zeros(vocab_size, dtype=np.int32)
+    out = np.zeros(n_all_cards, dtype=np.int32)
     for idx, n in counts.items():
-        if 0 <= idx < vocab_size:
+        if 0 <= idx < n_all_cards:
             out[idx] = n
     return out
 
@@ -261,7 +250,7 @@ def _to_sparse(dense: np.ndarray, k: int = BELIEF_K) -> tuple[np.ndarray, np.nda
 
 
 def densify(
-    idx: np.ndarray, cnt: np.ndarray, vocab_size: int, normalize: bool = True
+    idx: np.ndarray, cnt: np.ndarray, n_all_cards: int, normalize: bool = True
 ) -> np.ndarray:
     """Inverse of :func:`_to_sparse`, batched over any leading dimensions.
 
@@ -276,17 +265,15 @@ def densify(
     lead = idx.shape[:-1]
     flat_idx = idx.reshape(-1, idx.shape[-1])
     flat_cnt = cnt.reshape(-1, cnt.shape[-1])
-    out = np.zeros((flat_idx.shape[0], vocab_size), dtype=np.float32)
+    out = np.zeros((flat_idx.shape[0], n_all_cards), dtype=np.float32)
     rows = np.repeat(np.arange(flat_idx.shape[0]), flat_idx.shape[1])
-    np.add.at(out, (rows, flat_idx.reshape(-1).clip(0, vocab_size - 1)),
+    np.add.at(out, (rows, flat_idx.reshape(-1).clip(0, n_all_cards - 1)),
               flat_cnt.reshape(-1))
-    # Slot padding writes into column PAD_CARD; its contribution is 0 anyway
-    # because padded counts are 0, but clear it so PAD never carries mass.
     out[:, PAD_CARD] = 0.0
     if normalize:
         total = out.sum(axis=1, keepdims=True)
         np.divide(out, total, out=out, where=total > 0)
-    return out.reshape(*lead, vocab_size)
+    return out.reshape(*lead, n_all_cards)
 
 
 def empty_belief_labels() -> dict[str, np.ndarray]:
@@ -316,8 +303,7 @@ def build_belief_labels(
     state: dict,
     your_index: int,
     opp_deck: list[int],
-    id_to_index: dict,
-    vocab_size: int,
+    n_all_cards: int,
     opp_arch_index: int,
     opp_hand_ids: list[int] | None,
 ) -> dict[str, np.ndarray]:
@@ -343,12 +329,8 @@ def build_belief_labels(
         True for every row this function produces.  Rows filled in by
         :func:`empty_belief_labels` carry False.
     """
-    deck_dense = deck_counts_dense(opp_deck, id_to_index, vocab_size)
-    visible = opp_visible_counts(state, your_index, id_to_index, vocab_size)
-    # A card we have seen cannot still be hidden.  clip() rather than plain
-    # subtraction because our own cards can end up in their discard (Boss's
-    # Orders on an attached Tool, and similar), which would otherwise drive a
-    # count negative and silently corrupt the distribution.
+    deck_dense = deck_counts_dense(opp_deck, n_all_cards)
+    visible = opp_visible_counts(state, your_index, n_all_cards)
     hidden_dense = np.clip(deck_dense - visible, 0, None)
 
     deck_idx, deck_cnt = _to_sparse(deck_dense)
@@ -359,10 +341,8 @@ def build_belief_labels(
         hand_cnt = np.zeros(BELIEF_K, dtype=np.int16)
         hand_valid = np.zeros((), dtype=np.bool_)
     else:
-        hand_dense = deck_counts_dense(opp_hand_ids, id_to_index, vocab_size)
+        hand_dense = deck_counts_dense(opp_hand_ids, n_all_cards)
         hand_idx, hand_cnt = _to_sparse(hand_dense)
-        # An empty hand is a legitimate observation but carries no signal for a
-        # distribution target, so treat it as invalid rather than as uniform.
         hand_valid = np.array(hand_dense.sum() > 0, dtype=np.bool_)
 
     return {

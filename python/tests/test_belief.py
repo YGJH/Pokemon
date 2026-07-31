@@ -26,11 +26,20 @@ from ptcg_il.belief_labels import (
     opp_hand_timeline,
     opp_visible_counts,
 )
-from ptcg_il.model.belief import BeliefHeads, belief_loss, soft_cross_entropy
+from ptcg_il.model.belief import (
+    LOG_FEAT_DIM,
+    L_LOG_MAX,
+    MAX_AREA,
+    N_AREA_EMB,
+    BeliefHeads,
+    BeliefModule,
+    belief_loss,
+    soft_cross_entropy,
+)
+from ptcg_il.model.cards import CardFeaturizer
 
-V = 20
-PAD, UNKNOWN = 0, 1
-ID_TO_INDEX = {100 + i: i + 2 for i in range(V - 2)}
+# n_all_cards = max engine card ID + 1 (simulate ~200 cards)
+N_ALL = 200
 
 
 def _card(card_id: int, player: int = 1) -> dict:
@@ -45,16 +54,15 @@ def _card(card_id: int, player: int = 1) -> dict:
 class TestDeckCounts:
     def test_counts_sum_to_deck_size(self):
         deck = [100] * 4 + [101] * 20 + [102] * 36
-        dense = deck_counts_dense(deck, ID_TO_INDEX, V)
+        dense = deck_counts_dense(deck, N_ALL)
         assert dense.sum() == DECK_SIZE
-        assert dense[ID_TO_INDEX[101]] == 20
+        assert dense[101] == 20
 
-    def test_oov_collapses_to_unknown(self):
-        """Unknown ids must land on UNKNOWN, matching what the featurizer does
-        with the same card — otherwise label and input disagree."""
-        dense = deck_counts_dense([9999, 9998, 100], ID_TO_INDEX, V)
-        assert dense[UNKNOWN] == 2
-        assert dense[ID_TO_INDEX[100]] == 1
+    def test_oov_ids_ignored(self):
+        """Card ids beyond n_all_cards are silently dropped."""
+        dense = deck_counts_dense([9999, 9998, 100], N_ALL)
+        assert dense[100] == 1
+        assert dense.sum() == 1  # only card 100 was in range
 
 
 class TestVisibleCounts:
@@ -65,10 +73,9 @@ class TestVisibleCounts:
                 {"active": [], "bench": [], "discard": [_card(101, player=1)]},
             ],
         }
-        dense = opp_visible_counts(state, your_index=0, id_to_index=ID_TO_INDEX,
-                                   vocab_size=V)
-        assert dense[ID_TO_INDEX[101]] == 1
-        assert dense[ID_TO_INDEX[100]] == 0
+        dense = opp_visible_counts(state, your_index=0, n_all_cards=N_ALL)
+        assert dense[101] == 1
+        assert dense[100] == 0
 
     def test_energy_we_attached_is_not_credited_to_them(self):
         """Our Energy sitting on their Pokemon is ours, not part of their deck.
@@ -83,9 +90,9 @@ class TestVisibleCounts:
                 },
             ],
         }
-        dense = opp_visible_counts(state, 0, ID_TO_INDEX, V)
-        assert dense[ID_TO_INDEX[101]] == 1
-        assert dense[ID_TO_INDEX[100]] == 0
+        dense = opp_visible_counts(state, 0, N_ALL)
+        assert dense[101] == 1
+        assert dense[100] == 0
 
     def test_stadium_is_counted(self):
         """The Stadium hangs off the state, not off a player.  Missing it made
@@ -94,8 +101,8 @@ class TestVisibleCounts:
             "players": [{"active": [], "bench": [], "discard": []}] * 2,
             "stadium": _card(102, player=1),
         }
-        dense = opp_visible_counts(state, 0, ID_TO_INDEX, V)
-        assert dense[ID_TO_INDEX[102]] == 1
+        dense = opp_visible_counts(state, 0, N_ALL)
+        assert dense[102] == 1
 
 
 class TestHandTimeline:
@@ -138,14 +145,14 @@ class TestSparseRoundTrip:
         deck = [100] * 30 + [101] * 30
         labels = build_belief_labels(
             state={"players": [{"active": [], "bench": [], "discard": []}] * 2},
-            your_index=0, opp_deck=deck, id_to_index=ID_TO_INDEX, vocab_size=V,
+            your_index=0, opp_deck=deck, n_all_cards=N_ALL,
             opp_arch_index=2, opp_hand_ids=[100],
         )
         dense = densify(labels["bel_deck_idx"][None, :],
-                        labels["bel_deck_cnt"][None, :], V)[0]
+                        labels["bel_deck_cnt"][None, :], N_ALL)[0]
         assert dense.sum() == pytest.approx(1.0)
-        assert dense[ID_TO_INDEX[100]] == pytest.approx(0.5)
-        assert dense[PAD] == 0.0
+        assert dense[100] == pytest.approx(0.5)
+        assert dense[0] == 0.0  # PAD
 
     def test_hidden_is_the_deck_minus_what_is_visible(self):
         deck = [100] * 30 + [101] * 30
@@ -156,8 +163,8 @@ class TestSparseRoundTrip:
             ],
         }
         labels = build_belief_labels(
-            state=state, your_index=0, opp_deck=deck, id_to_index=ID_TO_INDEX,
-            vocab_size=V, opp_arch_index=0, opp_hand_ids=None,
+            state=state, your_index=0, opp_deck=deck, n_all_cards=N_ALL,
+            opp_arch_index=0, opp_hand_ids=None,
         )
         assert labels["bel_hidden_total"] == DECK_SIZE - 4
         assert not bool(labels["bel_hand_valid"])
@@ -169,8 +176,8 @@ class TestSparseRoundTrip:
         shard silently loses its labels."""
         real = build_belief_labels(
             state={"players": [{"active": [], "bench": [], "discard": []}] * 2},
-            your_index=0, opp_deck=[100] * 60, id_to_index=ID_TO_INDEX,
-            vocab_size=V, opp_arch_index=1, opp_hand_ids=[100],
+            your_index=0, opp_deck=[100] * 60, n_all_cards=N_ALL,
+            opp_arch_index=1, opp_hand_ids=[100],
         )
         empty = empty_belief_labels()
         assert set(real) == set(empty)
@@ -183,7 +190,7 @@ class TestSparseRoundTrip:
         deck = (deck * 10)[:DECK_SIZE]
         labels = build_belief_labels(
             state={"players": [{"active": [], "bench": [], "discard": []}] * 2},
-            your_index=0, opp_deck=deck, id_to_index=ID_TO_INDEX, vocab_size=V,
+            your_index=0, opp_deck=deck, n_all_cards=N_ALL,
             opp_arch_index=0, opp_hand_ids=None,
         )
         assert int(labels["bel_deck_cnt"].sum()) == DECK_SIZE
@@ -195,8 +202,76 @@ class TestSparseRoundTrip:
 
 
 def _heads(n_arch: int = 4, D: int = 8) -> BeliefHeads:
-    heads = BeliefHeads(V, D, n_arch, card_emb=torch.nn.Embedding(V, D))
+    cf = CardFeaturizer(D)
+    heads = BeliefHeads(D, n_arch, N_ALL, card_emb=cf)
+    # Minimal all_card_feat for the card matrix
+    heads.set_all_card_feat(torch.randn(N_ALL, 94))
     return heads
+
+
+class TestBeliefAreaEncoding:
+    """The log-area embedding must separate every AreaType the engine emits.
+
+    It was `nn.Embedding(7, 4)` behind a `clamp(-1, 5)`, which folded BENCH(5)
+    through LOOKING(12) onto one vector -- the GRU could not tell "drawn to
+    hand" from "moved to prize".  Real shard logs contain areas up to 12.
+    """
+
+    def _log(self, area_from: int, area_to: int) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = torch.zeros(1, L_LOG_MAX, LOG_FEAT_DIM)
+        feat[0, 0, 3] = float(area_from)
+        feat[0, 0, 4] = float(area_to)
+        mask = torch.zeros(1, L_LOG_MAX, dtype=torch.bool)
+        mask[0, 0] = True
+        return feat, mask
+
+    def test_embedding_covers_every_area_type(self):
+        from ptcg_mine.cards import load_engine
+
+        load_engine()  # puts the bundled `cg` package on sys.path
+        from cg.api import AreaType
+
+        engine_max = max(int(a) for a in AreaType)
+        assert MAX_AREA == engine_max, (
+            f"cg.api.AreaType now reaches {engine_max}; MAX_AREA is {MAX_AREA}"
+        )
+        # area+1 for area in -1..MAX_AREA must all be valid embedding rows.
+        assert BeliefModule(8).area_emb.num_embeddings == engine_max + 2
+
+    def test_every_area_gets_a_distinct_embedding(self):
+        emb = BeliefModule(8).area_emb
+        rows = emb(torch.arange(N_AREA_EMB))
+        pairs = [
+            (i, j)
+            for i in range(N_AREA_EMB)
+            for j in range(i + 1, N_AREA_EMB)
+            if torch.equal(rows[i], rows[j])
+        ]
+        assert not pairs, f"area embedding rows collide: {pairs}"
+
+    @pytest.mark.parametrize("area", [5, 6, 7, 8, 9, 10, 11, 12])
+    def test_high_areas_are_not_folded_onto_bench(self, area):
+        """Each area above BENCH(5) produces a belief distinct from BENCH's."""
+        mod = BeliefModule(8)
+        mod.eval()
+        with torch.no_grad():
+            bench = mod(*self._log(5, -1))
+            other = mod(*self._log(area, -1))
+        if area == 5:
+            assert torch.allclose(bench, other)
+        else:
+            assert not torch.allclose(bench, other, atol=1e-6), (
+                f"area {area} is indistinguishable from BENCH(5)"
+            )
+
+    def test_out_of_range_area_is_clamped_not_crashed(self):
+        """An area beyond the enum must clamp, not index out of bounds."""
+        mod = BeliefModule(8)
+        mod.eval()
+        with torch.no_grad():
+            out = mod(*self._log(99, -7))
+        assert out.shape == (1, 8)
+        assert torch.isfinite(out).all()
 
 
 class TestBeliefHeads:
@@ -204,24 +279,24 @@ class TestBeliefHeads:
         out = _heads()(torch.randn(3, 8))
         assert out["arch"].shape == (3, 4)
         for k in ("deck", "hidden", "hand"):
-            assert out[k].shape == (3, V)
+            assert out[k].shape == (3, N_ALL)
 
     def test_pad_gets_zero_probability(self):
         out = _heads()(torch.randn(3, 8))
         for k in ("deck", "hidden", "hand"):
             p = torch.softmax(out[k], dim=-1)
-            assert torch.all(p[:, PAD] == 0.0)
+            assert torch.all(p[:, 0] == 0.0)  # PAD=0
 
-    def test_missing_card_encoder_fails_loudly(self):
-        """A silent zero matrix here would train to a uniform belief and look
-        merely 'weak' rather than broken."""
-        with pytest.raises(RuntimeError, match="card_emb"):
-            BeliefHeads(V, 8, 4)(torch.randn(2, 8))
+    def test_missing_all_card_feat_fails_loudly(self):
+        """Without set_all_card_feat the belief heads cannot produce output."""
+        heads = BeliefHeads(8, 4, N_ALL, card_emb=CardFeaturizer(8))
+        with pytest.raises(RuntimeError, match="all_card_feat"):
+            heads(torch.randn(2, 8))
 
 
 def _labels(B: int = 4, valid: bool = True, hand_valid: bool = True,
             arch: int = 1, n_arch: int = 4) -> dict[str, torch.Tensor]:
-    dist = torch.zeros(B, V)
+    dist = torch.zeros(B, N_ALL)
     dist[:, 2] = 0.5
     dist[:, 3] = 0.5
     return {
@@ -241,7 +316,7 @@ class TestBeliefLoss:
         loss, parts = belief_loss(preds, _labels(), w_deck=1.0, w_hidden=0.0,
                                   w_hand=0.0, w_arch=0.0)
         # V-1 candidates because PAD is masked out.
-        assert parts["belief/deck_ce"] == pytest.approx(np.log(V - 1), abs=0.5)
+        assert parts["belief/deck_ce"] == pytest.approx(np.log(N_ALL - 1), abs=0.5)
         assert torch.isfinite(loss)
 
     def test_all_invalid_gives_exactly_zero(self):
@@ -267,12 +342,12 @@ class TestBeliefLoss:
         assert "belief/arch_ce" not in parts
 
     def test_soft_cross_entropy_is_minimised_by_the_target(self):
-        target = torch.zeros(1, V)
+        target = torch.zeros(1, N_ALL)
         target[0, 5] = 1.0
-        confident = torch.full((1, V), -10.0)
+        confident = torch.full((1, N_ALL), -10.0)
         confident[0, 5] = 10.0
         assert float(soft_cross_entropy(confident, target)) < float(
-            soft_cross_entropy(torch.zeros(1, V), target)
+            soft_cross_entropy(torch.zeros(1, N_ALL), target)
         )
 
     def test_gradients_reach_every_head(self):
@@ -292,39 +367,39 @@ class TestBeliefLoss:
 
 class TestDeckFromDistribution:
     def test_returns_exactly_sixty_cards(self):
-        probs = np.full(V, 1.0 / V)
-        index_to_id = [0, 1] + [100 + i for i in range(V - 2)]
+        probs = np.full(N_ALL, 1.0 / N_ALL)
+        index_to_id = list(range(N_ALL))
         assert len(deck_from_distribution(probs, index_to_id)) == DECK_SIZE
 
     def test_never_emits_pad_or_unknown(self):
         """PAD and UNKNOWN name no card the engine can deal; leaking either
         into the template makes the determinizer's deck illegal."""
-        probs = np.zeros(V)
-        probs[PAD] = probs[UNKNOWN] = 0.4
+        probs = np.zeros(N_ALL)
+        probs[0] = probs[1] = 0.4
         probs[5] = 0.2
-        index_to_id = [0, 1] + [100 + i for i in range(V - 2)]
+        index_to_id = list(range(N_ALL))
         deck = deck_from_distribution(probs, index_to_id)
-        assert set(deck) == {index_to_id[5]}
+        assert set(deck) == {5}
         assert len(deck) == DECK_SIZE
 
     def test_dominant_card_gets_most_slots(self):
-        probs = np.zeros(V)
+        probs = np.zeros(N_ALL)
         probs[5] = 0.9
         probs[6] = 0.1
-        index_to_id = [0, 1] + [100 + i for i in range(V - 2)]
+        index_to_id = list(range(N_ALL))
         deck = deck_from_distribution(probs, index_to_id)
-        assert deck.count(index_to_id[5]) == 54
+        assert deck.count(5) == 54
 
     def test_sampled_mode_is_still_sixty_cards(self):
-        probs = np.full(V, 1.0 / V)
-        index_to_id = [0, 1] + [100 + i for i in range(V - 2)]
+        probs = np.full(N_ALL, 1.0 / N_ALL)
+        index_to_id = list(range(N_ALL))
         rng = np.random.default_rng(0)
         assert len(deck_from_distribution(probs, index_to_id, rng=rng)) == DECK_SIZE
 
     def test_all_zero_distribution_yields_no_opinion(self):
         """An empty list is the signal that leaves the Rust determinizer on its
         own fallback, which beats handing it a deck of PAD."""
-        assert deck_from_distribution(np.zeros(V), [0, 1]) == []
+        assert deck_from_distribution(np.zeros(N_ALL), [0, 1]) == []
 
 
 @pytest.fixture
@@ -332,17 +407,18 @@ def oracle(tmp_path):
     from ptcg_il.featurizer import normalize_vocab
     from ptcg_il.model.policy import Policy
 
-    ids = [100 + i for i in range(V - 2)]
+    ids = [100 + i for i in range(N_ALL - 2)]
     vocab = normalize_vocab({
         "id_to_index": {str(c): i + 2 for i, c in enumerate(ids)},
-        "size": V,
+        "size": N_ALL,
+        "index_to_id": {i + 2: c for i, c in enumerate(ids)},
     })
     reps = [[ids[i % len(ids)]] * DECK_SIZE for i in range(3)]
     archetypes = {
         "opp_ids": [0, 1, 2],
         "archetypes": [{"id": i, "representative": reps[i]} for i in range(3)],
     }
-    policy = Policy(V=V, A=2, D=16, layers=1, heads=2, ff=32, n_opp_arch=3).eval()
+    policy = Policy(D=16, layers=1, heads=2, ff=32, n_opp_arch=3, n_all_cards=N_ALL).eval()
     return OpponentDeckOracle(policy, vocab, archetypes, device="cpu"), reps
 
 
@@ -357,13 +433,13 @@ class TestOpponentDeckOracle:
         orc, reps = oracle
         monkeypatch.setattr(orc, "belief", lambda obs: {
             "arch": np.array([10.0, 0.0, 0.0]),
-            "deck": np.zeros(V),
+            "deck": np.zeros(N_ALL),
         })
         assert orc.predict({}) == reps[0]
 
     def test_unsure_archetype_falls_back_to_the_distribution(self, oracle, monkeypatch):
         orc, reps = oracle
-        deck_logits = np.zeros(V)
+        deck_logits = np.zeros(N_ALL)
         deck_logits[5] = 20.0
         monkeypatch.setattr(orc, "belief", lambda obs: {
             "arch": np.zeros(3),  # uniform → below the confidence floor
@@ -385,7 +461,7 @@ class TestOpponentDeckOracle:
         assert rebuilt.index_to_id[:2] == [-1, -1]
         assert rebuilt.index_to_id[2:] == orc.index_to_id[2:]
 
-        deck_logits = np.zeros(V)
+        deck_logits = np.zeros(N_ALL)
         deck_logits[5] = 20.0
         monkeypatch.setattr(rebuilt, "belief", lambda obs: {
             "arch": np.zeros(3), "deck": deck_logits,
@@ -412,33 +488,33 @@ class TestOpponentDeckOracle:
 
 
 class TestDatasetDensification:
-    def _dataset(self, tmp_path, vocab_size):
+    def _dataset(self, tmp_path, n_all_cards):
         from ptcg_il.train.dataset import ShardDataset
 
         ds = ShardDataset.__new__(ShardDataset)
-        ds.vocab_size = vocab_size
+        ds.n_all_cards = n_all_cards
         return ds
 
     def _sparse_sample(self):
         labels = build_belief_labels(
             state={"players": [{"active": [], "bench": [], "discard": []}] * 2},
             your_index=0, opp_deck=[100] * 30 + [101] * 30,
-            id_to_index=ID_TO_INDEX, vocab_size=V, opp_arch_index=1,
+            n_all_cards=N_ALL, opp_arch_index=1,
             opp_hand_ids=[100],
         )
         return {k: torch.as_tensor(v) for k, v in labels.items()}
 
     def test_rows_become_normalized_distributions(self, tmp_path):
-        ds = self._dataset(tmp_path, V)
+        ds = self._dataset(tmp_path, N_ALL)
         sample = self._sparse_sample()
         ds._densify_belief(sample)
         for key in ("bel_deck", "bel_hidden", "bel_hand"):
-            assert sample[key].shape == (V,)
+            assert sample[key].shape == (N_ALL,)
             assert float(sample[key].sum()) == pytest.approx(1.0)
-            assert float(sample[key][PAD]) == 0.0
+            assert float(sample[key][0]) == 0.0  # PAD=0
 
     def test_sparse_keys_do_not_leak_into_the_batch(self, tmp_path):
-        ds = self._dataset(tmp_path, V)
+        ds = self._dataset(tmp_path, N_ALL)
         sample = self._sparse_sample()
         ds._densify_belief(sample)
         assert not [k for k in sample if k.startswith("bel_") and
@@ -448,7 +524,7 @@ class TestDatasetDensification:
         """An older corpus has no bel_* keys at all; the dataset must invent
         masked-out ones rather than raise, or the belief flag would fork the
         whole training path."""
-        ds = self._dataset(tmp_path, V)
+        ds = self._dataset(tmp_path, N_ALL)
         sample: dict[str, torch.Tensor] = {}
         ds._densify_belief(sample)
         assert not bool(sample["bel_valid"])
@@ -472,7 +548,7 @@ def test_forward_with_belief_shares_one_encode_pass():
     from ptcg_il.model.policy import Policy
 
     torch.manual_seed(0)
-    policy = Policy(V=V, A=2, D=16, layers=1, heads=2, ff=32, n_opp_arch=3).eval()
+    policy = Policy(D=16, layers=1, heads=2, ff=32, n_opp_arch=3, n_all_cards=N_ALL).eval()
     assert hasattr(policy, "belief_heads")
     assert policy.belief_heads.card_emb is policy.embed.card
 
@@ -481,6 +557,6 @@ def test_belief_heads_are_absent_from_the_plain_forward_graph():
     """The auxiliary heads must cost nothing when the belief loss is off."""
     from ptcg_il.model.policy import Policy
 
-    policy = Policy(V=V, A=2, D=16, layers=1, heads=2, ff=32, n_opp_arch=3)
+    policy = Policy(D=16, layers=1, heads=2, ff=32, n_opp_arch=3, n_all_cards=N_ALL)
     names = {n for n, _ in policy.named_parameters() if n.startswith("belief_heads.")}
     assert names, "belief heads should still be registered parameters"

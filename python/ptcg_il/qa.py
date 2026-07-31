@@ -240,8 +240,20 @@ def check_reference_roundtrip(
             data = np.load(sf, mmap_mode="r", allow_pickle=False)
         except OSError:
             continue
-        if "opt_src_idx" not in data or "opt_card_id" not in data or "opt_mask" not in data:
+        if "opt_src_idx" not in data or "opt_mask" not in data:
             continue
+        if "opt_card_id" not in data:
+            # Shards written after the card-feature refactor carry
+            # `opt_card_feat` rows, not vocab ids.  Skipping silently here
+            # would report a pass over zero samples, so say so instead: this
+            # check still needs migrating to compare feature rows.
+            return False, {
+                "skipped": "shards carry opt_card_feat, not opt_card_id; "
+                           "check_reference_roundtrip needs migrating to "
+                           "compare card features",
+                "samples_checked": 0,
+                "shard": sf.name,
+            }
 
         opt_src = data["opt_src_idx"]     # [S, O_MAX]
         opt_card = data["opt_card_id"]     # [S, O_MAX]
@@ -498,13 +510,18 @@ def check_attachment_collision(
     max_samples: int | None = None,
 ) -> dict[str, Any]:
     """Among ``ENERGY/TOOL_CARD/CARD`` selects, count options that share both
-    ``opt_src_idx`` AND ``opt_card_id`` (truly indistinguishable to the pointer).
+    ``opt_src_idx`` AND their card's static features (truly indistinguishable to
+    the pointer).
+
+    The card half of the comparison is the ``opt_card_feat`` row, not a vocab id:
+    the pointer head consumes the feature vector, so two options whose features
+    match *are* the same input to it even when the underlying card ids differ.
 
     Returns ``n_collision_options``, ``collision_share``, ``n_options_total``.
     """
     shard_dir = Path(shard_dir)
     # We only need to check attachment-type options.
-    # Walk shard files, reading opt_type, opt_src_idx, opt_card_id.
+    # Walk shard files, reading opt_type, opt_src_idx, opt_card_feat.
     n_collision = 0
     n_total_attachment_options = 0
     samples_checked = 0
@@ -515,11 +532,11 @@ def check_attachment_collision(
             data = np.load(sf, mmap_mode="r", allow_pickle=False)
         except OSError:
             continue
-        if "opt_type" not in data:
+        if "opt_type" not in data or "opt_card_feat" not in data:
             continue
         opt_type = data["opt_type"]       # [S, O_MAX]
         opt_src = data["opt_src_idx"]     # [S, O_MAX]
-        opt_card = data["opt_card_id"]    # [S, O_MAX]
+        opt_card = data["opt_card_feat"]  # [S, O_MAX, F_CARD]
         opt_mask = data["opt_mask"]       # [S, O_MAX]
 
         # Attachment OptionTypes: CARD(3), TOOL_CARD(4), ENERGY_CARD(5), ENERGY(6)
@@ -529,10 +546,12 @@ def check_attachment_collision(
             row_mask = att_mask[s]
             if not row_mask.any():
                 continue
-            # Build (src_idx, card_id) pairs for this sample's attachment options
+            # Build (src_idx, card-features) pairs for this sample's attachment
+            # options.  Feature rows are float arrays, so key them by bytes.
             pairs = list(zip(
                 opt_src[s][row_mask].tolist(),
-                opt_card[s][row_mask].tolist(),
+                [np.ascontiguousarray(row).tobytes()
+                 for row in opt_card[s][row_mask]],
             ))
             # Count how many unique pairs vs total
             n_total_attachment_options += len(pairs)
@@ -551,7 +570,7 @@ def check_attachment_collision(
     if share > 0.0:
         logger.warning(
             "ATTACHMENT COLLISION: %d/%d attachment options (%.2f%%) "
-            "share both opt_src_idx AND opt_card_id — truly indistinguishable "
+            "share both opt_src_idx AND their card features — truly indistinguishable "
             "to the pointer head. Consider promoting attachments to tokens (A.7).",
             n_collision,
             n_total_attachment_options,

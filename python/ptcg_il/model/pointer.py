@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ptcg_il.model import MLP
-from ptcg_il.model.cards import AttackEncoder, CardEncoder
+from ptcg_il.model.cards import AttackFeaturizer, CardFeaturizer
 
 L_STATE = 46
 O_MAX = 64
@@ -35,17 +35,11 @@ class PointerHead(nn.Module):
         Prebuilt table for AttackEncoder.
     """
 
-    def __init__(
-        self,
-        A: int,
-        D: int = 256,
-        heads: int = 8,
-        attack_static_table: torch.Tensor | None = None,
-    ):
+    def __init__(self, D: int = 256, heads: int = 8):
         super().__init__()
         self.opt_type_emb = nn.Embedding(18, D)  # OptionType 0..16 + STOP=17
-        self.card: CardEncoder | None = None      # bound externally by Policy
-        self.attack = AttackEncoder(A, D, attack_static_table)
+        self.card: CardFeaturizer | None = None   # bound externally by Policy
+        self.attack = AttackFeaturizer(D)
         self.null_token = nn.Parameter(torch.zeros(D))
         self.msgru = nn.GRUCell(D, D)             # multi-select memory
         self.opt_in = nn.Linear(D + F_OPT, D)
@@ -79,7 +73,7 @@ class PointerHead(nn.Module):
         self,
         h: torch.Tensor,
         tok_mask: torch.Tensor,
-        card_enc: CardEncoder,
+        card_enc: CardFeaturizer,
         x: dict[str, torch.Tensor],
         msgru_h: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,12 +85,12 @@ class PointerHead(nn.Module):
             Encoded state tokens from Encoder.
         tok_mask : bool Tensor[B, L]
             True = real state token.
-        card_enc : CardEncoder
-            Shared card encoder (for opt_card_id embedding).
+        card_enc : CardFeaturizer
+            Shared card featurizer (for opt_card_feat embedding).
         x : dict
             Option tensors: opt_type [B,O], opt_src_idx [B,O], opt_tgt_idx [B,O],
-            opt_card_id [B,O], opt_attack_idx [B,O], opt_scalar [B,O,F_OPT],
-            opt_mask bool [B,O].
+            opt_card_feat [B,O,F_CARD], opt_attack_feat [B,O,F_ATK],
+            opt_scalar [B,O,F_OPT], opt_mask bool [B,O].
         msgru_h : Tensor[B, D] or None
             Multi-select GRU hidden state.  When None (single-select),
             no extra context is added.
@@ -121,8 +115,8 @@ class PointerHead(nn.Module):
             self.opt_type_emb(x["opt_type"])
             + src
             + tgt
-            + card_enc(x["opt_card_id"])
-            + self.attack(x["opt_attack_idx"])
+            + card_enc(x["opt_card_feat"])
+            + self.attack(x["opt_attack_feat"])
         )  # [B, O, D]
 
         if msgru_h is not None:

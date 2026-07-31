@@ -740,7 +740,8 @@ class TestBuildShards:
             data = np.load(shard_file)
             # Check essential keys are present
             essential_keys = {
-                "poke_card_id", "hand_card_id", "cls_feat", "opt_type",
+                "poke_card_feat", "hand_card_feat", "opt_card_feat",
+                "log_card_feat", "cls_feat", "opt_type",
                 "opt_src_idx", "action_idx", "action_len", "sel_type", "sel_ctx",
                 "value_target", "tok_mask", "opt_mask",
             }

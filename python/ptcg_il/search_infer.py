@@ -13,6 +13,11 @@ from typing import Any
 
 import numpy as np
 
+# Set by the agent at import time to provide engine card/attack features
+# for the pure-feature featurizer.
+_engine_card_features: dict | None = None
+_engine_attack_features: dict | None = None
+
 # ── Rust library loading ──────────────────────────────────────────────────
 
 
@@ -197,6 +202,23 @@ def extract_opp_visible_cards(obs_dict: dict) -> list[int]:
 # ── MCTS inference ────────────────────────────────────────────────────────
 
 
+_FALLBACK_WARNED: set[str] = set()
+
+
+def _warn_fallback(reason: str) -> None:
+    """Report a degradation to greedy — once per distinct reason.
+
+    ``mcts_search`` used to swallow every failure, so a run with no search at
+    all was indistinguishable from a working one: the agent still returned
+    legal moves, just from a single forward pass.  Printing once per reason
+    keeps that visible without one line per decision.
+    """
+    if reason in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(reason)
+    print(f"[agent] WARNING: MCTS unavailable, falling back to greedy ({reason})")
+
+
 def mcts_search(
     obs_dict: dict,
     fixed_deck: list[int],
@@ -214,6 +236,21 @@ def mcts_search(
     Returns ``{"indices": [...], "visit_counts": ..., "root_value": ...}``.
     Falls back to greedy policy if the Rust library is unavailable.
     """
+    # The Rust tree applies one option index per node (`search_step(id, &[a])`),
+    # so root visit counts rank the *first* pick only.  That is a complete
+    # action for single-select, but a multi-select decision needs k indices in
+    # one reply and the tree cannot express that subset — taking its top-k
+    # would report a choice the search never actually evaluated (and may not
+    # even be a legal co-selection).  Those go to the policy's autoregressive
+    # `select_multi`, which is built for it.
+    _sel = obs_dict.get("select") or {}
+    try:
+        _max_count = int(_sel.get("maxCount", 1) or 1)
+    except (TypeError, ValueError):
+        _max_count = 1
+    if _max_count > 1:
+        return _greedy_action(obs_dict, policy, vocab, device)
+
     try:
         lib = _load_search_lib()
 
@@ -245,10 +282,14 @@ def mcts_search(
             if leaf.get("error") or leaf.get("tree_done"):
                 break
 
-            # Evaluate leaf with policy network
+            # Evaluate leaf with policy network.  The Rust side names this
+            # field `leaf_obs_json` (see ptcg_search/src/lib.rs puct_select);
+            # reading `obs_json` raised KeyError on the very first iteration,
+            # which the old blanket except turned into a silent greedy move.
             priors, value = _policy_evaluate_leaf(
-                leaf["obs_json"], leaf["n_options"],
+                leaf["leaf_obs_json"], leaf["n_options"],
                 leaf["is_terminal"], policy, vocab, device,
+                player_role=int(leaf.get("player_role", 0)),
             )
 
             lib.puct_expand(
@@ -261,9 +302,22 @@ def mcts_search(
         lib.puct_free(handle)
 
         if raw:
-            return json.loads(raw)
-    except Exception:
-        pass
+            res = json.loads(raw)
+            # puct_result reports {"visit_counts": [[option_index, visits], ...]}
+            # — it has no "indices" key, so returning it verbatim gave the agent
+            # an empty action and the engine rejected it with IndexError.  The
+            # move is the most-visited root child, which is what PUCT's visit
+            # distribution is for.
+            counts = res.get("visit_counts") or []
+            if counts:
+                best = max(counts, key=lambda pair: (pair[1], -pair[0]))[0]
+                res["indices"] = [int(best)]
+                return res
+            _warn_fallback("puct_result returned no visit counts")
+        else:
+            _warn_fallback("puct_result returned no data")
+    except Exception as exc:
+        _warn_fallback(f"{type(exc).__name__}: {exc}")
 
     # Fallback: greedy policy
     return _greedy_action(obs_dict, policy, vocab, device)
@@ -276,10 +330,21 @@ def _policy_evaluate_leaf(
     policy: Any,
     vocab: dict,
     device: Any,
+    player_role: int = 0,
 ) -> tuple[list[float], float]:
     """Featurize a leaf observation and run one policy forward pass.
 
-    Returns (priors, value).
+    Returns ``(priors, value)`` with **value in the perspective of the player to
+    move at this leaf** — i.e. exactly what the network natively predicts
+    (``value_target = +1`` when the player whose observation this is won, see
+    ``shard_writer``).
+
+    The tree re-orients it: ``expand_leaf`` negates when ``player_role == 1``.
+    That is the only place it can correctly happen — the network's input is
+    egocentric, so "this is an opponent node" is not expressible to it.
+
+    Priors need no re-orientation: they score the options belonging to whoever
+    moves at that leaf, which is exactly the node's action set.
     """
     from model.featurizer import featurize
 
@@ -287,25 +352,35 @@ def _policy_evaluate_leaf(
         return ([], 0.0)
 
     obs_dict = json.loads(obs_json)
-    feats = featurize(obs_dict, vocab)
+    feats = featurize(obs_dict, vocab,
+                      engine_card_features=_engine_card_features,
+                      engine_attack_features=_engine_attack_features)
     batch = _dict_to_batch(feats, device)
 
+    # Mirror Policy.forward: _encode returns (h, history_h), and PointerHead
+    # needs (h, tok_mask, card_enc, x) and returns (logits, o).  The old call
+    # `policy.pointer(h, batch["opt_mask"])` predated the pure-feature pointer
+    # and raised TypeError on every leaf.
     with _no_grad():
-        h = policy._encode(batch)
-        logits = policy.pointer(h, batch["opt_mask"])
-        value = policy.value(h[:, 0, :])
+        h, _history = policy._encode(batch)
+        logits, _o = policy.pointer(h, batch["tok_mask"], policy.embed.card, batch)
+        value = policy.value(h[:, 0])          # [B]
 
     mask = batch["opt_mask"][0].cpu().numpy()
     l = logits[0].float().cpu().numpy()
     l = np.where(mask, l, -np.inf)
     l = l - l.max()
     probs = np.exp(l)
-    probs = probs / probs.sum()
+    total = probs.sum()
+    probs = probs / total if total > 0 else np.full_like(probs, 1.0 / max(len(probs), 1))
 
-    n_legal = int(mask.sum())
-    priors = probs[:n_legal].tolist() if n_legal > 0 else []
-    val = float(value[0, 0].cpu().numpy())
-
+    # puct_expand expects exactly n_options priors — the mask can additionally
+    # cover a STOP column on multi-select, which the tree knows nothing about.
+    priors = probs[:n_options].tolist() if n_options > 0 else []
+    val = float(value.reshape(-1)[0].cpu().numpy())
+    # No flip here: `expand_leaf` in ptcg_search re-orients the value using the
+    # node's player_role.  Negating here as well would double-negate and
+    # restore the original inverted backup.
     return priors, val
 
 
@@ -316,7 +391,9 @@ def _greedy_action(
     from model.featurizer import featurize
     from model.policy import select_multi
 
-    feats = featurize(obs_dict, vocab)
+    feats = featurize(obs_dict, vocab,
+                      engine_card_features=_engine_card_features,
+                      engine_attack_features=_engine_attack_features)
     batch = _dict_to_batch(feats, device)
     max_count = int(feats.get("maxCount", 1))
 
@@ -354,9 +431,22 @@ def _dict_to_batch(feats: dict, device: Any) -> dict:
 
     batch = {}
     for k, v in feats.items():
-        if not isinstance(v, np.ndarray):
+        # np.int64(3) is an np.generic *scalar*, not an ndarray, so an
+        # isinstance(v, np.ndarray) filter silently drops every 0-d key the
+        # featurizer emits: minCount, maxCount, stop_column, sel_type, sel_ctx,
+        # action_len, log_len, value_target, sample_weight.  `select_multi`
+        # reads minCount/maxCount, so multi-select decisions died with
+        # KeyError: 'minCount' while single-select ones — which never touch
+        # those keys — went through fine.
+        if not isinstance(v, (np.ndarray, np.generic)):
             continue
-        t = torch.from_numpy(np.ascontiguousarray(v)).unsqueeze(0)
+        # np.asarray keeps a scalar 0-d so unsqueeze(0) yields [B]; going via
+        # ascontiguousarray would promote it to 1-d and give [B, 1], which
+        # broadcasts wrongly inside _select_multi_raw instead of failing.
+        arr = np.asarray(v)
+        if arr.ndim:
+            arr = np.ascontiguousarray(arr)
+        t = torch.from_numpy(arr).unsqueeze(0)
         if v.dtype == np.bool_:
             t = t.bool()
         elif np.issubdtype(v.dtype, np.integer):

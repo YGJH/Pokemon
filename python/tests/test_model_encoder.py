@@ -103,6 +103,29 @@ class TestEncoder:
         layer = enc.enc.layers[0]
         assert layer.self_attn.batch_first, "Encoder must use batch_first=True"
 
+    def test_final_layernorm_present(self):
+        """A pre-norm stack needs a trailing norm, or its output is un-normalized."""
+        enc = Encoder()
+        assert isinstance(enc.enc.norm, torch.nn.LayerNorm)
+        assert enc.enc.norm.normalized_shape == (D,)
+
+    def test_output_is_normalized(self):
+        """Encoder output has ~unit per-element RMS regardless of input scale.
+
+        Without the final norm the residual stream leaves the stack at whatever
+        scale four layers happened to accumulate (measured RMS 1.49 on the
+        trained checkpoint, and growing with `layers`).
+        """
+        enc = Encoder()
+        enc.eval()
+        tok_mask = torch.ones(8, L, dtype=torch.bool)
+        for scale in (0.1, 1.0, 10.0):
+            rows = torch.randn(8, L, D) * scale
+            with torch.no_grad():
+                h = enc(rows, tok_mask)
+            rms = float(h.pow(2).mean().sqrt())
+            assert 0.8 < rms < 1.25, f"input scale {scale} → output RMS {rms}"
+
     def test_default_sizes(self):
         """Default D=256, heads=8, layers=4, ff=1024."""
         enc = Encoder()

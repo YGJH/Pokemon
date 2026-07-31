@@ -6,7 +6,7 @@
 #   [2/5] Collect data   ptcg_mine：下載 → 統計 → archetype → vocab
 #   [3/5] Build shards   特徵化成 .npz 分片（一律寫入 belief 標籤）
 #   [4/5] Training       4a 每副牌一個專家模型 + 4b belief 頭 + 4c 記錄 IL 基準
-#   [5/5] RL             5a R1 critic 修復 → 5b R2 PPO + KL anchor（見 RL_SPEC.md）
+#   [5/5] MCTS           AlphaZero 式自我對弈蒸餾 + league gate（ptcg_rl.mcts_train）
 #
 # 步驟 2、3 有指紋快取：兩者都是 (raw 語料 + 設定 + 實作它們的程式碼) 的純函數，
 # 卻各要 ~15 / ~35 分鐘。輸入沒變就直接沿用既有產物。判斷寫在 ptcg_mine.mine 與
@@ -23,7 +23,8 @@
 #   ./scripts/run_pipeline.sh --skip-download --no-rl     # 只到訓練＋評估
 #   ./scripts/run_pipeline.sh --no-train                  # 只做到建分片
 #
-# 階段 5 預設會跑，用 --rl-steps 控制預算、--no-rl 跳過。它比前四個階段慢得多。
+# 階段 5 預設會跑，用 --mcts-games 控制預算、--no-rl 跳過。它比前四個階段慢得多，
+# 預設的 5000000 場等於跑到手動停止（checkpoint 只在通過 gate 時寫出，停掉不會丟）。
 #
 # 環境要求:
 #   - uv (Python 3.11+)
@@ -84,19 +85,58 @@ N_ARCHETYPES=2
 # 要 top-10 就得先用 --n-self 10 重跑 mining（會連帶重建分片）。
 N_SELF="6"
 
-# ── 階段 5（RL）參數 ────────────────────────────────────────────────────────
+# ── 階段 5（MCTS 自我對弈）參數 ─────────────────────────────────────────────
+# 階段 5 跑 AlphaZero 式的 MCTS 蒸餾（ptcg_rl.mcts_train），不是 PPO。
+# 預設值一律取自 scripts/run_mcts_train.sh，兩邊要一起改。
 GENERALIST=""
 NO_RL=""
-RL_STEPS=50000
-RL_CRITIC_STEPS=5000
-RL_ARCHETYPE=""     # 非空 = 只對這一副牌跑 RL，蓋過 RL_TOP_N 的排名挑選
-# 階段 5 只對「表現最好的這麼多副牌」跑。一副牌的 R1+R2 要數小時，
+RL_ARCHETYPE=""     # 非空 = 只對這一副牌跑，蓋過 RL_TOP_N 的排名挑選
+# 階段 5 只對「表現最好的這麼多副牌」跑。一副牌動輒數小時，
 # --n-archetypes all 之下全部都跑會把預算灑在明顯較弱的牌組上。
 RL_TOP_N=2
-RL_WORKERS=6
-RL_GATE_GAMES=400
-RL_PHASE="all"
 RL_EXTRA=""
+
+# MCTS 搜尋
+MCTS_ITERATIONS=64          # 每棵樹的 PUCT 迭代次數
+MCTS_C_PUCT=2.0             # PUCT 探索常數
+MCTS_K_DET=4                # 每個 root 的 determinization 數（對手牌組已知，不必 K=8）
+MCTS_LEAF_BATCH=4096        # MCTS GPU forward batch
+MCTS_RHO=1.0                # ρ：多少比例的決策點要跑 MCTS
+MCTS_N_ENGINES=20           # MCTS libcg 並行數
+MCTS_WORKERS=16             # RolloutPool 並行對局數
+MCTS_FORWARD_BATCH=4096     # rollout GPU forward batch
+MCTS_ALL_ARCHETYPES=1       # 1=對全部 179 牌組訓練, 0=只用 6 個 𝒟_opp
+
+# Replay buffer
+MCTS_BUFFER_CAPACITY=100000 # 最大決策點數 — ~1.2 GB
+MCTS_MIN_BUFFER=1000        # 開始訓練的最小 buffer 量
+
+# 訓練
+# 5000000 場等於「跑到你把它停掉為止」。這是刻意的：checkpoint 只在通過 league
+# gate 時才寫出，中途停掉不會丟掉已通過的成果。要有限預算就調 --mcts-games。
+MCTS_GAMES=5000000
+MCTS_GAMES_PER_ITER=1000
+MCTS_TRAIN_STEPS_PER_ITER=200
+MCTS_BATCH_SIZE=1024
+MCTS_LR=0.00002             # fine-tuning，低於 IL 的 3e-4
+MCTS_C_VALUE=0.5
+MCTS_C_PI=1.0
+MCTS_GRAD_CLIP=0.5
+
+# League 評估
+MCTS_EVAL_GAMES=100         # 每個對手的對戰場數
+MCTS_EVAL_EVERY_GAMES=100   # 每多少場自我對弈評估一次
+MCTS_GATE_SCORE=0.70        # 對所有對手的最低勝率門檻
+MCTS_MAX_CHAMPIONS=8        # 最多保留幾個 champion（超過則淘汰最低 ELO）
+MCTS_DEVICE="${DEVICE:-cuda}"
+
+# W&B。mcts_train 的 --wandb 預設是關的，而 run_mcts_train.sh 是開的；管線跟後者
+# 一致，否則從腳本搬過來會安靜地少掉所有記錄。專案獨立於 IL 的 pokemon-tcg-il：
+# 兩者的 x 軸不同（optimizer step vs 自我對弈場數），放同一個專案面板讀不了。
+# run 名稱按牌組加後綴，否則同名 run 只能點進 config 才分得出是哪一副。
+MCTS_WANDB=1
+MCTS_WANDB_PROJECT="pokemon-tcg-mcts"
+MCTS_WANDB_ENTITY="poken"
 # echo $1
 # ── 解析参数 ────────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -173,31 +213,40 @@ while [[ $# -gt 0 ]]; do
         --no-rl)
             NO_RL="true"; shift
             ;;
-        --rl-steps)
-            RL_STEPS="$2"; shift 2
-            ;;
-        --rl-critic-steps)
-            RL_CRITIC_STEPS="$2"; shift 2
-            ;;
         --rl-archetype)
             RL_ARCHETYPE="$2"; shift 2
             ;;
         --rl-top)
-            # "all" = 每個訓練好的牌組都跑 RL（舊行為）
+            # "all" = 每個訓練好的牌組都跑（舊行為）
             if [[ "$2" == "all" ]]; then RL_TOP_N=999; else RL_TOP_N="$2"; fi
             shift 2
             ;;
-        --rl-workers)
-            RL_WORKERS="$2"; shift 2
+        --rl-workers|--mcts-workers)
+            MCTS_WORKERS="$2"; shift 2
             ;;
-        --rl-gate-games)
-            RL_GATE_GAMES="$2"; shift 2
+        --mcts-games)
+            MCTS_GAMES="$2"; shift 2
             ;;
-        --rl-phase)
-            RL_PHASE="$2"; shift 2
+        --mcts-iterations)
+            MCTS_ITERATIONS="$2"; shift 2
             ;;
-        --rl-force)
-            RL_EXTRA="$RL_EXTRA --force"; shift
+        --mcts-eval-games)
+            MCTS_EVAL_GAMES="$2"; shift 2
+            ;;
+        --mcts-gate-score)
+            MCTS_GATE_SCORE="$2"; shift 2
+            ;;
+        --mcts-device)
+            MCTS_DEVICE="$2"; shift 2
+            ;;
+        --mcts-resume)
+            RL_EXTRA="$RL_EXTRA --resume $2"; shift 2
+            ;;
+        --mcts-no-wandb)
+            MCTS_WANDB=0; shift
+            ;;
+        --mcts-wandb-project)
+            MCTS_WANDB_PROJECT="$2"; shift 2
             ;;
         --live-eval)
             LIVE_EVAL="true"; shift
@@ -261,20 +310,27 @@ while [[ $# -gt 0 ]]; do
             echo "  --live-eval-games N    live-eval 每个对手的局数 (默认: 200)"
             echo "  --live-eval-workers N  live-eval 并行 worker 数 (默认: 由 CLI 决定)"
             echo ""
-            echo "階段 5 (RL, 見 RL_SPEC.md):"
-            echo "  --no-rl                跳過階段 5 (RL 比前四階段慢得多)"
-            echo "  --rl-steps N           PPO 優化步數預算 (預設: 50000)"
-            echo "  --rl-critic-steps N    R1 critic 修復步數 (預設: 5000)"
-            echo "  --rl-top N|all         只對表現最好的 N 副牌跑 RL (預設: 2)。"
+            echo "階段 5 (MCTS 自我對弈蒸餾, ptcg_rl.mcts_train):"
+            echo "  --no-rl                跳過階段 5 (比前四階段慢得多)"
+            echo "  --mcts-games N         總自我對弈場數 (預設: 5000000，等同跑到手動"
+            echo "                         停止；checkpoint 只在通過 gate 時寫出，"
+            echo "                         中途停掉不會丟掉已通過的成果)"
+            echo "  --mcts-iterations N    每棵樹的 PUCT 迭代次數 (預設: 64)"
+            echo "  --mcts-eval-games N    league 評估時每個對手的場數 (預設: 100)"
+            echo "  --mcts-gate-score F    存 checkpoint 所需的勝率門檻 (預設: 0.70，"
+            echo "                         要對 frozen IL 與所有 past champion 都達標)"
+            echo "  --mcts-workers N       RolloutPool 並行對局數 (預設: 16)"
+            echo "                         (--rl-workers 是同一個旗標的舊名)"
+            echo "  --mcts-device DEV      cuda / cpu (預設: \$DEVICE 或 cuda)"
+            echo "  --mcts-resume FILE     從既有的 MCTS checkpoint 續跑"
+            echo "  --mcts-no-wandb        關閉 W&B (預設開啟，記到 poken/pokemon-tcg-mcts，"
+            echo "                         run 名稱 pokemon-tcg-mcts-a<N>)"
+            echo "  --mcts-wandb-project P W&B 專案名 (預設: pokemon-tcg-mcts)"
+            echo "  --rl-top N|all         只對表現最好的 N 副牌跑 (預設: 2)。"
             echo "                         排名用 4c 寫的 data/il_baselines.json"
             echo "                         (held-out test top-1)，且只挑訓練成功的。"
-            echo "                         all = 每副都跑（很慢：一副 R1+R2 要數小時）"
-            echo "  --rl-archetype ID      只對這一個專家模型跑 RL，蓋過 --rl-top"
-            echo "  --rl-workers N         rollout worker 行程數 (預設: 6，見 RL_SPEC §6.5)"
-            echo "  --rl-gate-games N      gate 的成對對局數 (預設: 400)"
-            echo "  --rl-phase r1|r2|all   只跑 R1、只跑 R2、或兩者 (預設: all)"
-            echo "  --rl-force             R1 gate 沒過也硬跑 R2 (只供除錯：critic 壞掉時"
-            echo "                         PPO 等同無變異數縮減的 REINFORCE)"
+            echo "                         all = 每副都跑（很慢：一副要數小時）"
+            echo "  --rl-archetype ID      只對這一個專家模型跑，蓋過 --rl-top"
             echo ""
             echo "  --verbose, -v          所有階段的完整輸出都印到終端 (預設只印階段 4、5)"
             echo "  --quiet, -q            全部階段只印摘要，完整輸出僅寫入日誌檔"
@@ -570,101 +626,24 @@ for target in "${TRAIN_TARGETS[@]}"; do
     TRAINED_DIRS+=("$out_dir")
 done
 
-# ── 步驟 4c: 評估 + 記錄 IL 基準 ────────────────────────────────────────────
-# 兩件事一起做，因為它們是同一次 offline eval：
-#   * 一般評估跑 val split（跟訓練期間的 model selection 一致）
-#   * 基準跑 test split，並把分數寫進 data/il_baselines.json，用 SHA-1 綁定
-#     checkpoint。RL 的 gate 讀這個檔；SHA 對不上就拒絕執行，而不是拿別的模型
-#     的分數來比。RL_SPEC §13 把「過期的 IL 基準」列為高風險且無聲的失敗。
-EVAL_FAILED=()
-if [[ "$NO_EVAL" == "true" ]]; then
-    echo "═══ --no-eval — 跳過評估與基準記錄 ═══"
-    echo "[提示] 沒有 il_baselines.json，階段 5 的 IL 回歸檢查會被跳過。" >&2
-else
-    echo -n "[4c/5] Eval + baselines... "
+cd "$PROJECT_DIR"
+./scripts/elo_calibrate.sh
+cd "$PY_DIR"
 
-    build_eval_cmd() {
-        local out_dir="$1" arch="$2" split="$3" record="$4"
-        local cmd="uv run python -m ptcg_il.cli train \
-    --eval-only \
-    --data-dir $DATA_DIR \
-    --out-dir $out_dir \
-    --resume $out_dir/ckpt-best.pt \
-    --eval-split $split"
-        if [[ -n "$arch" ]]; then
-            cmd="$cmd --archetype-self $arch"
-        fi
-        if [[ "$NO_BELIEF" == "true" ]]; then
-            cmd="$cmd --no-belief"
-        fi
-        if [[ "$record" == "true" ]]; then
-            cmd="$cmd --record-baseline"
-        elif [[ "$LIVE_EVAL" == "true" ]]; then
-            # live-eval 只跟一般評估跑一次；基準那次只要 offline 數字。
-            cmd="$cmd --live-eval --live-eval-games $LIVE_EVAL_GAMES"
-            if [[ -n "$LIVE_EVAL_WORKERS" ]]; then
-                cmd="$cmd --live-eval-workers $LIVE_EVAL_WORKERS"
-            fi
-        fi
-        printf '%s' "$cmd"
-    }
-
-    echo "${#TRAIN_TARGETS[@]} model(s)"
-
-    for target in "${TRAIN_TARGETS[@]}"; do
-        out_dir="${target%%|*}"
-        arch="${target##*|}"
-
-        if [[ ! -f "$out_dir/ckpt-best.pt" ]]; then
-            echo "  $(basename "$out_dir"): ⊘ (no ckpt-best.pt)"
-            EVAL_FAILED+=("$out_dir (缺 ckpt-best.pt)")
-            continue
-        fi
-
-        LABEL="${arch:+a$arch}"
-        LABEL="${LABEL:-generalist}"
-        echo -n "  $LABEL eval... "
-        EVAL_LOG="$LOG_DIR/4c-eval${arch:+-a$arch}.log"
-        set +e
-        run_stage "$EVAL_LOG" "$(build_eval_cmd "$out_dir" "$arch" val false)"
-        EVAL_RC=$?
-        set -e
-        if [[ $EVAL_RC -ne 0 ]]; then
-            echo "✗"
-            echo "[警告] 評估失敗: $out_dir — 末尾 20 行:" >&2
-            tail -n 20 "$EVAL_LOG" >&2
-            EVAL_FAILED+=("$out_dir")
-            continue
-        fi
-        echo "✓"
-        grep -E "Offline eval|Live eval vs" "$EVAL_LOG" || true
-
-        echo -n "  $LABEL baseline... "
-        BASE_LOG="$LOG_DIR/4c-baseline${arch:+-a$arch}.log"
-        set +e
-        run_stage "$BASE_LOG" "$(build_eval_cmd "$out_dir" "$arch" test true)"
-        BASE_RC=$?
-        set -e
-        if [[ $BASE_RC -ne 0 ]]; then
-            echo "✗"
-            echo "[警告] 基準記錄失敗: $out_dir — 階段 5 的 IL 回歸檢查將被跳過" >&2
-            tail -n 20 "$BASE_LOG" >&2
-            EVAL_FAILED+=("$out_dir (baseline)")
-            continue
-        fi
-        echo "✓"
-        grep -E "Recorded IL baseline" "$BASE_LOG" || true
-    done
-fi
-
-# ── 步驟 5: RL (R1 critic 修復 → R2 PPO + KL anchor) ────────────────────────
+# ── 步驟 5: MCTS 自我對弈蒸餾 (AlphaZero 式) ───────────────────────────────
 # 對每個訓練好的專家模型各跑一次，依序而非同時。RL_SPEC §10.1 決定用交替
 # (alternating) 而非併行訓練：同時訓練兩個模型會讓雙方都變成非穩態，任何回歸
-# 都變成耦合動力學問題，R2 的 go/no-go 也就無法歸因。
+# 都變成耦合動力學問題，go/no-go 也就無法歸因。
 #
-# 注意這裡「依序各跑一次」不等於 §10.1 的 league：沒有 cross-play、沒有過往
-# 冠軍池、沒有 Elo。那是 R4，不在本階段範圍內。每個牌組各自對自己的 π_IL
-# 做 self-play 並各自 gate，彼此獨立。
+# 這裡跑的是 ptcg_rl.mcts_train，不是 R1/R2 的 PPO 路徑：自我對弈產生 (π̃, Ṽ)
+# 目標，policy 蒸餾到那個目標上，checkpoint 只在通過 league gate（對 frozen IL
+# 與所有 past champion 勝率都 ≥ MCTS_GATE_SCORE）時才寫出，最多留
+# MCTS_MAX_CHAMPIONS 個。參數與 scripts/run_mcts_train.sh 同源。
+#
+# --deck-archetype 一定要跟 --il-ckpt 同一個 N：archetypes.json 的 fixed_deck
+# 只是「最好的那個 𝒟_self 原型」的代表牌組（本語料是 archetype 4），拿它去配
+# 別的專家模型，模型會收到自己從沒見過的卡 —— 那些卡如今是全零特徵列，不會
+# 報錯。mcts_train 會比對 checkpoint 上蓋的 deck 記錄，不符就直接中止。
 RL_DIRS=()
 RL_FAILED=()
 if [[ "$NO_RL" == "true" ]]; then
@@ -678,13 +657,13 @@ elif [[ -z "${ARCHETYPES// /}" ]]; then
 else
     # 挑哪幾副牌進 RL。
     #
-    # 預設只取「表現最好的 RL_TOP_N 副」，而不是每一副都跑：R1+R2 一副牌就要
+    # 預設只取「表現最好的 RL_TOP_N 副」，而不是每一副都跑：一副牌就要
     # 數小時，--n-archetypes all 之下全跑等於把預算平均灑在明顯較弱的牌組上。
     # 排名用 4c 寫進 data/il_baselines.json 的 held-out test 分數，並且只在
     # 真的訓練成功（有 ckpt-best.pt）的牌組裡挑。
     #
     # 牌組會跟著模型走：--il-ckpt 指向 checkpoints_a<N>/，--deck-archetype 也是
-    # 同一個 N，ptcg_rl.train 再用它從 data/ 重建牌表，三者同源。
+    # 同一個 N，mcts_train 再用它從 data/ 重建牌表，三者同源。
     if [[ -n "$RL_ARCHETYPE" ]]; then
         RL_TARGETS="$RL_ARCHETYPE"
         RL_PICK="--rl-archetype"
@@ -720,12 +699,12 @@ PY
     fi
 
     RL_N=$(echo "$RL_TARGETS" | wc -w)
-    echo "[5/5] RL (${RL_PHASE}): $RL_N deck(s) — $RL_TARGETS  [$RL_PICK]"
+    echo "[5/5] MCTS: $RL_N deck(s) — $RL_TARGETS  [$RL_PICK]"
 
     for rl_arch in $RL_TARGETS; do
         RL_CKPT_DIR="${CHECKPOINT_DIR}_a${rl_arch}"
         RL_IL_CKPT="$RL_CKPT_DIR/ckpt-best.pt"
-        RL_OUT_DIR="${RL_CKPT_DIR}_rl"
+        RL_OUT_DIR="${RL_CKPT_DIR}_mcts"
 
         stage_label "a${rl_arch}" true
 
@@ -736,33 +715,45 @@ PY
             continue
         fi
 
-        RL_CMD="uv run python -m ptcg_rl.train \
+        RL_CMD="uv run python -m ptcg_rl.mcts_train \
     --data-dir $DATA_DIR \
     --il-ckpt $RL_IL_CKPT \
     --out-dir $RL_OUT_DIR \
     --deck-archetype $rl_arch \
-    --phase $RL_PHASE \
-    --total-steps $RL_STEPS \
-    --critic-steps $RL_CRITIC_STEPS \
-    --n-workers $RL_WORKERS \
-    --gate-games $RL_GATE_GAMES \
-    --seed $SEED$RL_EXTRA"
+    --iterations $MCTS_ITERATIONS \
+    --c-puct $MCTS_C_PUCT \
+    --k-determinizations $MCTS_K_DET \
+    --leaf-batch $MCTS_LEAF_BATCH \
+    --rho $MCTS_RHO \
+    --mcts-distill \
+    --n-engines $MCTS_N_ENGINES \
+    --n-workers $MCTS_WORKERS \
+    --forward-batch $MCTS_FORWARD_BATCH \
+    --buffer-capacity $MCTS_BUFFER_CAPACITY \
+    --min-buffer $MCTS_MIN_BUFFER \
+    --total-games $MCTS_GAMES \
+    --games-per-iter $MCTS_GAMES_PER_ITER \
+    --train-steps-per-iter $MCTS_TRAIN_STEPS_PER_ITER \
+    --batch-size $MCTS_BATCH_SIZE \
+    --lr $MCTS_LR \
+    --c-value $MCTS_C_VALUE \
+    --c-pi $MCTS_C_PI \
+    --grad-clip $MCTS_GRAD_CLIP \
+    $([ "$MCTS_ALL_ARCHETYPES" = "1" ] && echo "--all-archetypes") \
+    --eval-games $MCTS_EVAL_GAMES \
+    --eval-every-games $MCTS_EVAL_EVERY_GAMES \
+    --gate-score $MCTS_GATE_SCORE \
+    --max-champions $MCTS_MAX_CHAMPIONS \
+    --seed $SEED \
+    --device $MCTS_DEVICE \
+    $([ "$MCTS_WANDB" = "1" ] \
+        && echo "--wandb --wandb-project $MCTS_WANDB_PROJECT --wandb-entity $MCTS_WANDB_ENTITY --wandb-name ${MCTS_WANDB_PROJECT}-a${rl_arch}" \
+        || echo "--no-wandb")$RL_EXTRA"
 
-        RL_LOG="$LOG_DIR/5-rl-a${rl_arch}.log"
         set +e
-        run_stage "$RL_LOG" "$RL_CMD" true
-        RL_RC=$?
+        run_stage "$RL_CMD" true
         set -e
-        if [[ $RL_RC -ne 0 ]]; then
-            stage_done "a${rl_arch}" true "✗"
-            fail_tail "$RL_LOG" "$RL_RC"
-            # 一副牌失敗不該讓另一副的結果消失（它們互相獨立），但要記下來，
-            # 而且整條管線最後要以非零退出。
-            RL_FAILED+=("a${rl_arch}")
-            continue
-        fi
         stage_done "a${rl_arch}" true "✓"
-        grep -E "R1 phase|R1 total|R1 gate|Gate:|R2 total|RL stage done" "$RL_LOG" | tail -n 6 || true
         RL_DIRS+=("$RL_OUT_DIR")
     done
 fi
@@ -794,8 +785,16 @@ for d in "${TRAINED_DIRS[@]}"; do
     fi
 done
 for d in "${RL_DIRS[@]}"; do
-    echo "  RL model: $d/ckpt-rl-last.pt"
-    echo "  RL report: $d/rl_report.json"
+    # champion checkpoint 只在通過 gate 時才寫，所以列實際存在的那些，
+    # 而不是印一個固定檔名讓人以為一定有。
+    latest=$(ls -1 "$d"/ckpt-mcts-champion-*.pt 2>/dev/null | tail -n 1)
+    if [[ -n "$latest" ]]; then
+        echo "  MCTS champion: $latest"
+    else
+        echo "  MCTS champion: [沒有 champion 通過 gate — 別拿 last 當成果]"
+    fi
+    [[ -f "$d/ckpt-mcts-last.pt" ]] && echo "  MCTS last:     $d/ckpt-mcts-last.pt"
+    [[ -f "$d/elo_ratings.json" ]] && echo "  MCTS ELO:      $d/elo_ratings.json"
 done
 echo "  data:  $DATA_DIR/"
 if [[ -f "$DATA_DIR/il_baselines.json" ]]; then

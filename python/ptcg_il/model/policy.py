@@ -23,12 +23,12 @@ class Policy(nn.Module):
     CLS token.  Pass ``history_h`` to ``forward`` for sequential inference;
     omit it (or pass None) during independent-sample training.
 
+    Cards and attacks are represented purely by their static features (no
+    learned id embeddings), so the model generalises zero-shot to any card
+    the engine knows about.
+
     Parameters
     ----------
-    V : int
-        Card vocab size.
-    A : int
-        Attack vocab size.
     D : int
         Model dimension (256).
     heads : int
@@ -37,51 +37,44 @@ class Policy(nn.Module):
         Encoder layers (4).
     ff : int
         Feed-forward hidden dim (1024).
-    card_static_table : Tensor[V, 52] or None
-    attack_static_table : Tensor[A, 14] or None
+    n_opp_arch : int
+        Number of opponent archetypes for belief head.
+    n_all_cards : int
+        Total number of engine cards (for belief card matrix).
     """
 
     def __init__(
         self,
-        V: int,
-        A: int,
         D: int = 256,
         heads: int = 8,
         layers: int = 4,
         ff: int = 1024,
-        card_static_table: torch.Tensor | None = None,
-        attack_static_table: torch.Tensor | None = None,
         n_opp_arch: int = 0,
+        n_all_cards: int = 0,
+        all_card_feat: torch.Tensor | None = None,
     ):
         super().__init__()
-        self.embed = TokenEmbedder(V, D, card_static_table)
+        self.embed = TokenEmbedder(D)
         self.encoder = Encoder(D, heads, layers, ff)
-        self.pointer = PointerHead(A, D, heads, attack_static_table)
+        self.pointer = PointerHead(D, heads)
         self.pointer.card = self.embed.card
         self.value = ValueHead(D)
-        self.belief = BeliefModule(V, D)
-        self.belief.card_emb = self.embed.card  # share CardEncoder
-        # Supervised opponent-card predictions.  Kept optional so existing
-        # checkpoints (whose state_dict has no belief_heads.* keys) still load,
-        # and so a run that does not want the auxiliary loss pays nothing.
-        self.belief_heads = BeliefHeads(V, D, n_opp_arch, card_emb=self.embed.card)
+        self.belief = BeliefModule(D)
+        self.belief.card_emb = self.embed.card  # share CardFeaturizer
+        self.belief_heads = BeliefHeads(D, n_opp_arch, n_all_cards,
+                                         card_emb=self.embed.card)
+        if all_card_feat is not None:
+            self.belief_heads.set_all_card_feat(all_card_feat)
         self.n_opp_arch = n_opp_arch
         self.history_gru = nn.GRUCell(D, D)  # cross-turn memory on CLS token
         self.D = D
-        # Every argument needed to rebuild this module, recorded here rather
-        # than derived from state-dict shapes at load time.  Checkpoints written
-        # before this existed carry an empty ``config``, which is why loading one
-        # meant inferring V/A/D/heads/layers/ff from tensor shapes and why the
-        # packed ``main.py`` still needs ``strict=False``.  RL loads two policies
-        # (θ and the frozen π_IL) and cannot afford that guesswork.
         self.config: dict[str, int] = {
-            "V": V,
-            "A": A,
             "D": D,
             "heads": heads,
             "layers": layers,
             "ff": ff,
             "n_opp_arch": n_opp_arch,
+            "n_all_cards": n_all_cards,
         }
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
@@ -97,7 +90,10 @@ class Policy(nn.Module):
 
         # Belief module: encode logs into belief state
         if "log_feat" in x and x.get("log_mask") is not None:
-            belief = self.belief(x["log_feat"], x["log_mask"])  # [B, D]
+            belief = self.belief(
+                x["log_feat"], x["log_mask"],
+                log_card_feat=x.get("log_card_feat"),
+            )  # [B, D]
         else:
             belief = torch.zeros(B, self.D, device=device)
 
@@ -191,39 +187,29 @@ def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
     return belief_missing
 
 
-def policy_from_config(
-    config: dict,
-    card_static_table: torch.Tensor | None = None,
-    attack_static_table: torch.Tensor | None = None,
-) -> Policy:
+def policy_from_config(config: dict,
+                       all_card_feat: torch.Tensor | None = None) -> Policy:
     """Rebuild a :class:`Policy` from a checkpoint's ``config`` record.
 
-    Raises ``KeyError`` when the record is missing a required size rather than
-    falling back to a default.  A silently-wrong ``D`` or ``heads`` produces a
-    module whose ``load_state_dict`` fails loudly, but a wrong ``n_opp_arch``
-    does not — the belief head just changes width, and
-    :func:`load_policy_state` forgives missing belief keys.  Guessing here would
-    turn that into a plausible-looking model with randomly-initialised heads.
-
-    Checkpoints written before ``Policy.config`` existed have no such record;
-    callers must build the policy from artifact sizes instead.
+    Supports both old configs (with ``V``/``A`` from the id_emb era) and new
+    configs (pure-feature model).  ``V``/``A`` are ignored — the pure-feature
+    model does not need them.
     """
-    missing = [k for k in ("V", "A", "D", "heads", "layers", "ff") if k not in config]
+    required = ["D", "heads", "layers", "ff"]
+    missing = [k for k in required if k not in config]
     if missing:
         raise KeyError(
             f"checkpoint config is missing {missing}; it predates Policy.config "
-            "and the policy must be built from vocab.json/archetypes.json sizes"
+            "and the policy must be built from artifact sizes instead"
         )
     return Policy(
-        V=int(config["V"]),
-        A=int(config["A"]),
         D=int(config["D"]),
         heads=int(config["heads"]),
         layers=int(config["layers"]),
         ff=int(config["ff"]),
-        card_static_table=card_static_table,
-        attack_static_table=attack_static_table,
         n_opp_arch=int(config.get("n_opp_arch", 0)),
+        n_all_cards=int(config.get("n_all_cards", 0)),
+        all_card_feat=all_card_feat,
     )
 
 

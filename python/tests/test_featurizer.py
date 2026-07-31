@@ -17,6 +17,8 @@ from ptcg_il.featurizer import (
     DECK_N,
     DMGCTR_N,
     ENERGY_N,
+    F_ATK,
+    F_CARD,
     F_GLOBAL,
     F_HAND,
     F_OPT,
@@ -25,6 +27,8 @@ from ptcg_il.featurizer import (
     H_MAX,
     HAND_N,
     HP_N,
+    L_LOG_MAX,
+    LOG_FEAT_DIM,
     L_STATE,
     O_MAX,
     PAD_CARD,
@@ -84,6 +88,42 @@ def _build_test_vocab_with_attacks(ep: dict) -> dict:
     return vocab
 
 
+_ECF_CACHE: dict[int, np.ndarray] | None = None
+_EAF_CACHE: dict[int, np.ndarray] | None = None
+
+
+def _engine_card_features() -> dict[int, np.ndarray]:
+    """``{engine_card_id: float32[F_CARD]}`` for every engine card, built once.
+
+    The identity and information-leak tests below *must* pass this to
+    ``featurize``.  Without it every ``*_card_feat`` tensor is all zeros, and
+    an assertion that a hidden card's row is zero would hold vacuously.
+    """
+    global _ECF_CACHE
+    if _ECF_CACHE is None:
+        from ptcg_mine.cards import build_engine_card_features, load_engine
+
+        card_data, attack_data = load_engine()
+        _ECF_CACHE = build_engine_card_features(card_data, attack_data)
+    return _ECF_CACHE
+
+
+def _engine_attack_features() -> dict[int, np.ndarray]:
+    """``{engine_attack_id: float32[F_ATK]}`` for every engine attack."""
+    global _EAF_CACHE
+    if _EAF_CACHE is None:
+        from ptcg_mine.cards import build_engine_attack_features, load_engine
+
+        _, attack_data = load_engine()
+        _EAF_CACHE = build_engine_attack_features(attack_data)
+    return _EAF_CACHE
+
+
+def _feat_of(card_id: int) -> np.ndarray:
+    """Expected ``*_card_feat`` row for *card_id*."""
+    return np.asarray(_engine_card_features()[card_id], dtype=np.float32)
+
+
 def _get_active_step(
     ep: dict, step_idx: int, player: int
 ) -> tuple[dict, list[int]]:
@@ -102,14 +142,14 @@ class TestPokemonTokens:
     """Step 1: Verify pokemon token shapes, slot layout, and feature values."""
 
     def test_shapes(self):
-        """poke_card_id.shape == (12,), poke_feat.shape == (12, 26)."""
+        """poke_card_feat.shape == (12, F_CARD), poke_feat.shape == (12, 26)."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)  # MAIN select with visible mons
 
         result = featurize(obs, vocab, action)
-        assert result["poke_card_id"].shape == (P_MAX,)
-        assert result["poke_card_id"].dtype == np.int64
+        assert result["poke_card_feat"].shape == (P_MAX, F_CARD)
+        assert result["poke_card_feat"].dtype == np.float32
         assert result["poke_feat"].shape == (P_MAX, F_POKE)
         assert result["poke_feat"].dtype == np.float32
 
@@ -119,32 +159,30 @@ class TestPokemonTokens:
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_card_features=_engine_card_features())
 
-        # Step 8 Player 0: my active=721, opp active=722, no bench
-        # My active (slot 0) should have remapped 721, opp active (slot 6) should have 722
-        id_to_index = vocab["id_to_index"]
-        my_active_id = _remap(721, id_to_index)
-        opp_active_id = _remap(722, id_to_index)
-
-        assert result["poke_card_id"][0] == my_active_id, (
-            f"Expected my active card at slot 0, got {result['poke_card_id'][0]}"
+        # Step 8 Player 0: my active=721, opp active=722, no bench.  Card
+        # identity now reaches the model as static features, not as an id.
+        assert np.array_equal(result["poke_card_feat"][0], _feat_of(721)), (
+            "Expected my active card's features at slot 0"
         )
-        assert result["poke_card_id"][6] == opp_active_id, (
-            f"Expected opp active card at slot 6, got {result['poke_card_id'][6]}"
+        assert np.array_equal(result["poke_card_feat"][6], _feat_of(722)), (
+            "Expected opp active card's features at slot 6"
         )
 
     def test_empty_bench_slots_are_pad(self):
-        """Empty bench slots should be PAD_CARD."""
+        """Empty bench slots should be PAD (all-zero features)."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_card_features=_engine_card_features())
 
         # Bench slots 1..5 and 7..11 should be PAD
         for i in [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]:
-            assert result["poke_card_id"][i] == PAD_CARD, f"Slot {i} not PAD"
+            assert np.all(result["poke_card_feat"][i] == 0.0), f"Slot {i} not PAD"
             assert np.all(result["poke_feat"][i] == 0.0), f"Slot {i} features not zero"
 
     def test_hp_features(self):
@@ -239,15 +277,15 @@ class TestHandAndSummary:
     """Step 3: Verify hand and summary token shapes and feature values."""
 
     def test_hand_shapes_and_padding(self):
-        """hand_card_id.shape == (30,), hand_feat.shape == (30, 2)."""
+        """hand_card_feat.shape == (30, F_CARD), hand_feat.shape == (30, 2)."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
         result = featurize(obs, vocab, action)
 
-        assert result["hand_card_id"].shape == (H_MAX,)
-        assert result["hand_card_id"].dtype == np.int64
+        assert result["hand_card_feat"].shape == (H_MAX, F_CARD)
+        assert result["hand_card_feat"].dtype == np.float32
         assert result["hand_feat"].shape == (H_MAX, F_HAND)
         assert result["hand_feat"].dtype == np.float32
 
@@ -257,21 +295,26 @@ class TestHandAndSummary:
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_card_features=_engine_card_features())
 
         # Player 0 hand has 7 cards in this step
         hand = obs["current"]["players"][0]["hand"]
         n_hand = len(hand)
         assert n_hand == 7
 
-        # First 7 slots should be non-PAD
+        # First 7 slots carry the real card's features (no engine card has an
+        # all-zero row, so non-zero here is exactly "a card is present").
         for i in range(n_hand):
-            assert result["hand_card_id"][i] != PAD_CARD, (
+            assert np.array_equal(
+                result["hand_card_feat"][i], _feat_of(hand[i]["id"])
+            ), f"Hand slot {i} does not carry its card's features"
+            assert np.any(result["hand_card_feat"][i] != 0.0), (
                 f"Hand slot {i} should not be PAD"
             )
         # Remaining slots should be PAD
         for i in range(n_hand, H_MAX):
-            assert result["hand_card_id"][i] == PAD_CARD, (
+            assert np.all(result["hand_card_feat"][i] == 0.0), (
                 f"Hand slot {i} should be PAD"
             )
 
@@ -346,17 +389,19 @@ class TestHandAndSummary:
         assert result["sum_feat"][0, 2] == pytest.approx(7.0 / HAND_N)
 
     def test_discard_and_prize_tensors(self):
-        """discard_ids and prize_ids have correct shapes."""
+        """discard_card_feat and prize_card_feat have correct shapes."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
         result = featurize(obs, vocab, action)
 
-        assert result["discard_ids"].shape == (SUM, D_MAX)
+        assert result["discard_card_feat"].shape == (SUM, D_MAX, F_CARD)
+        assert result["discard_card_feat"].dtype == np.float32
         assert result["discard_mask"].shape == (SUM, D_MAX)
         assert result["discard_mask"].dtype == bool
-        assert result["prize_ids"].shape == (SUM, PZ_MAX)
+        assert result["prize_card_feat"].shape == (SUM, PZ_MAX, F_CARD)
+        assert result["prize_card_feat"].dtype == np.float32
 
     def test_opponent_hand_not_visible(self):
         """Opponent hand is None in observation → all PAD in hand tokens."""
@@ -372,14 +417,16 @@ class TestHandAndSummary:
         # No assertion needed on the hand tokens themselves since they're always my hand
 
     def test_stadium_absent(self):
-        """When no stadium, stadium_card_id = PAD, stadium_present = 0.0."""
+        """When no stadium, stadium_card_feat = zeros, stadium_present = 0.0."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_card_features=_engine_card_features())
 
-        assert result["stadium_card_id"][0] == PAD_CARD
+        assert result["stadium_card_feat"].shape == (1, F_CARD)
+        assert np.all(result["stadium_card_feat"][0] == 0.0)
         assert result["stadium_present"][0] == 0.0
 
 
@@ -497,17 +544,19 @@ class TestClsFeatures:
         assert result["cls_feat"][88] == 0.0, "effect absent → has_effect must be 0.0"
 
     def test_context_effect_card_ids(self):
-        """context_card_id and effect_card_id are present and padded."""
+        """context_card_feat and effect_card_feat are present and padded."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_card_features=_engine_card_features())
 
-        assert result["context_card_id"].shape == (1,)
-        assert result["effect_card_id"].shape == (1,)
-        assert result["context_card_id"][0] == PAD_CARD  # No context card in this step
-        assert result["effect_card_id"][0] == PAD_CARD
+        assert result["context_card_feat"].shape == (1, F_CARD)
+        assert result["effect_card_feat"].shape == (1, F_CARD)
+        # No context card and no effect in this step → both PAD (all zeros)
+        assert np.all(result["context_card_feat"][0] == 0.0)
+        assert np.all(result["effect_card_feat"][0] == 0.0)
 
     def test_reserved_zeros(self):
         """Reserved positions [89:93] should be zero."""
@@ -648,8 +697,10 @@ class TestOptionsSingleSelect:
         assert result["opt_type"].shape == (O_MAX,)
         assert result["opt_src_idx"].shape == (O_MAX,)
         assert result["opt_tgt_idx"].shape == (O_MAX,)
-        assert result["opt_card_id"].shape == (O_MAX,)
-        assert result["opt_attack_idx"].shape == (O_MAX,)
+        assert result["opt_card_feat"].shape == (O_MAX, F_CARD)
+        assert result["opt_card_feat"].dtype == np.float32
+        assert result["opt_attack_feat"].shape == (O_MAX, F_ATK)
+        assert result["opt_attack_feat"].dtype == np.float32
         assert result["opt_scalar"].shape == (O_MAX, F_OPT)
         assert result["opt_mask"].shape == (O_MAX,)
 
@@ -781,24 +832,35 @@ class TestMultiSelectAndRefs:
         )
 
     def test_attack_option_ref(self):
-        """ATTACK option: src = my active row 1, tgt = -1, attack_idx set."""
+        """ATTACK option: src = my active row 1, tgt = -1, attack features set."""
         ep = _load_episode()
         vocab = _build_test_vocab_with_attacks(ep)
         # Find a step with ATTACK options
         # Step 16 P1: options may have ATTACK
         obs, action = _get_active_step(ep, 16, 1)
 
-        result = featurize(obs, vocab, action)
+        result = featurize(obs, vocab, action,
+                           engine_attack_features=_engine_attack_features())
 
-        for j in range(O_MAX):
-            if result["opt_mask"][j] and result["opt_type"][j] == 13:
-                assert result["opt_src_idx"][j] == 1, (
-                    f"ATTACK opt[{j}] src should be my active row 1"
-                )
-                assert result["opt_tgt_idx"][j] == -1
-                assert result["opt_attack_idx"][j] > 0, (
-                    f"ATTACK opt[{j}] should have attack_idx > 0"
-                )
+        options = obs["select"]["option"]
+        assert len(options) <= O_MAX, "options were reordered; j is not the raw index"
+
+        n_attacks = 0
+        for j, opt in enumerate(options):
+            if not result["opt_mask"][j] or int(opt["type"]) != 13:
+                continue
+            assert result["opt_src_idx"][j] == 1, (
+                f"ATTACK opt[{j}] src should be my active row 1"
+            )
+            assert result["opt_tgt_idx"][j] == -1
+            # The attack reaches the model as static features, not an index.
+            assert np.array_equal(
+                result["opt_attack_feat"][j],
+                _engine_attack_features()[opt["attackId"]],
+            ), f"ATTACK opt[{j}] does not carry its attack's features"
+            n_attacks += 1
+
+        assert n_attacks > 0, "step 16 P1 offered no ATTACK option to check"
 
     def test_end_option(self):
         """END option: src=-1, tgt=-1, type=14."""
@@ -843,15 +905,15 @@ class TestEndToEnd:
     """Step 13: End-to-end test — iterate all ACTIVE decisions, verify all keys."""
 
     REQUIRED_KEYS = {
-        # State — card identity & structural
-        "poke_card_id",
-        "hand_card_id",
-        "stadium_card_id",
-        "context_card_id",
-        "effect_card_id",
-        "discard_ids",
+        # State — card identity, as static features (no learned id embeddings)
+        "poke_card_feat",
+        "hand_card_feat",
+        "stadium_card_feat",
+        "context_card_feat",
+        "effect_card_feat",
+        "discard_card_feat",
         "discard_mask",
-        "prize_ids",
+        "prize_card_feat",
         # State — dense features
         "poke_feat",
         "hand_feat",
@@ -867,8 +929,8 @@ class TestEndToEnd:
         "opt_type",
         "opt_src_idx",
         "opt_tgt_idx",
-        "opt_card_id",
-        "opt_attack_idx",
+        "opt_card_feat",
+        "opt_attack_feat",
         "opt_scalar",
         "opt_mask",
         # Labels & bookkeeping
@@ -881,10 +943,77 @@ class TestEndToEnd:
         "value_target",
         "sample_weight",
         "stop_column",
+        # Logs (belief module)
         "log_feat",
         "log_mask",
         "log_len",
+        "log_card_feat",
     }
+
+    def test_out_of_vocab_cards_still_carry_their_features(self):
+        """A card absent from the vocab must still arrive with real features.
+
+        Regression: identity used to be routed card_id → vocab index → engine
+        id.  An out-of-vocab card hit ``UNKNOWN_CARD`` (index 1), which
+        dereferences to the string ``"UNKNOWN"`` and has no engine features, so
+        it reached the model as an all-zero row — byte-identical to an empty
+        slot.  ``engine_card_features`` covers every engine card, so nothing
+        justified dropping it.  Invisible offline (the vocab is built from the
+        whole corpus) and only reachable in live play, which is exactly why it
+        needs a test.
+        """
+        ep = _load_episode()
+        ecf = _engine_card_features()
+
+        n_checked = 0
+        for obs, action in self._iter_active_decisions(ep):
+            hand = obs["current"]["players"][obs["current"]["yourIndex"]].get("hand")
+            if not hand:
+                continue
+            # Build a vocab that deliberately does *not* know the hand's cards.
+            vocab = _build_test_vocab_with_attacks(ep)
+            evicted = {int(c["id"]) for c in hand}
+            vocab["id_to_index"] = {
+                k: v for k, v in vocab["id_to_index"].items() if int(k) not in evicted
+            }
+
+            result = featurize(obs, vocab, action, engine_card_features=ecf)
+
+            for i, card in enumerate(hand[:H_MAX]):
+                cid = int(card["id"])
+                assert cid not in vocab["id_to_index"], "fixture did not evict the card"
+                assert np.array_equal(result["hand_card_feat"][i], _feat_of(cid)), (
+                    f"out-of-vocab card {cid} lost its features"
+                )
+                assert np.any(result["hand_card_feat"][i] != 0.0), (
+                    f"out-of-vocab card {cid} arrived as an all-zero row"
+                )
+                n_checked += 1
+            if n_checked:
+                break
+
+        assert n_checked > 0, "fixture offered no hand card to evict"
+
+    def test_log_card_feat_shape(self):
+        """log_card_feat is [L_LOG_MAX, F_CARD] — one card-feature row per log entry.
+
+        Regression: the card-id column was sliced with the *batched* form
+        ``log_feat[:, :, 2]`` (as ``model/belief.py`` does on ``[B, L, 6]``),
+        but ``featurize`` emits per-sample ``log_feat[L_LOG_MAX, LOG_FEAT_DIM]``,
+        so the slice raised IndexError for every decision point.
+        """
+        ep = _load_episode()
+        vocab = _build_test_vocab_with_attacks(ep)
+
+        count = 0
+        for obs, action in self._iter_active_decisions(ep):
+            result = featurize(obs, vocab, action)
+            assert result["log_feat"].shape == (L_LOG_MAX, LOG_FEAT_DIM)
+            assert result["log_card_feat"].shape == (L_LOG_MAX, F_CARD)
+            assert result["log_card_feat"].dtype == np.float32
+            count += 1
+
+        assert count > 0, "No ACTIVE decisions found in sample episode"
 
     def _iter_active_decisions(self, ep: dict):
         """Yield (obs, action) for all ACTIVE decisions in the episode."""
@@ -924,14 +1053,14 @@ class TestEndToEnd:
         vocab = _build_test_vocab_with_attacks(ep)
 
         expected_shapes = {
-            "poke_card_id": (P_MAX,),
-            "hand_card_id": (H_MAX,),
-            "stadium_card_id": (1,),
-            "context_card_id": (1,),
-            "effect_card_id": (1,),
-            "discard_ids": (SUM, D_MAX),
+            "poke_card_feat": (P_MAX, F_CARD),
+            "hand_card_feat": (H_MAX, F_CARD),
+            "stadium_card_feat": (1, F_CARD),
+            "context_card_feat": (1, F_CARD),
+            "effect_card_feat": (1, F_CARD),
+            "discard_card_feat": (SUM, D_MAX, F_CARD),
             "discard_mask": (SUM, D_MAX),
-            "prize_ids": (SUM, PZ_MAX),
+            "prize_card_feat": (SUM, PZ_MAX, F_CARD),
             "poke_feat": (P_MAX, F_POKE),
             "hand_feat": (H_MAX, F_HAND),
             "sum_feat": (SUM, F_SUM),
@@ -944,8 +1073,8 @@ class TestEndToEnd:
             "opt_type": (O_MAX,),
             "opt_src_idx": (O_MAX,),
             "opt_tgt_idx": (O_MAX,),
-            "opt_card_id": (O_MAX,),
-            "opt_attack_idx": (O_MAX,),
+            "opt_card_feat": (O_MAX, F_CARD),
+            "opt_attack_feat": (O_MAX, F_ATK),
             "opt_scalar": (O_MAX, F_OPT),
             "opt_mask": (O_MAX,),
             "action_idx": (O_MAX,),
@@ -956,6 +1085,9 @@ class TestEndToEnd:
             "sel_ctx": (),
             "value_target": (),
             "sample_weight": (),
+            "log_feat": (L_LOG_MAX, LOG_FEAT_DIM),
+            "log_mask": (L_LOG_MAX,),
+            "log_card_feat": (L_LOG_MAX, F_CARD),
         }
 
         for obs, action in self._iter_active_decisions(ep):
@@ -985,6 +1117,11 @@ class TestEndToEnd:
             for key in [
                 "poke_feat", "hand_feat", "sum_feat", "cls_feat",
                 "stadium_present", "opt_scalar", "value_target", "sample_weight",
+                "poke_card_feat", "hand_card_feat", "stadium_card_feat",
+                "context_card_feat", "effect_card_feat",
+                "discard_card_feat", "prize_card_feat",
+                "opt_card_feat", "opt_attack_feat",
+                "log_feat", "log_card_feat",
             ]:
                 assert result[key].dtype == np.float32, (
                     f"{key} dtype: expected float32, got {result[key].dtype}"
@@ -992,21 +1129,17 @@ class TestEndToEnd:
 
             # Int tensors
             for key in [
-                "poke_card_id", "hand_card_id", "stadium_card_id",
-                "context_card_id", "effect_card_id",
-                "discard_ids", "prize_ids",
                 "tok_type", "tok_owner", "tok_zone",
                 "opt_type", "opt_src_idx", "opt_tgt_idx",
-                "opt_card_id", "opt_attack_idx",
                 "action_idx", "action_len", "minCount", "maxCount",
-                "sel_type", "sel_ctx",
+                "sel_type", "sel_ctx", "log_len",
             ]:
                 assert result[key].dtype == np.int64, (
                     f"{key} dtype: expected int64, got {result[key].dtype}"
                 )
 
             # Bool tensors
-            for key in ["discard_mask", "tok_mask", "opt_mask"]:
+            for key in ["discard_mask", "tok_mask", "opt_mask", "log_mask"]:
                 assert result[key].dtype == bool, (
                     f"{key} dtype: expected bool, got {result[key].dtype}"
                 )
@@ -1236,10 +1369,30 @@ class TestCardIdAt:
 class TestOptCardId:
     """Test that options carry the identity of the card they reference.
 
-    Options almost never ship a `cardId` field, so `opt_card_id` is populated by
-    dereferencing `(area, playerIndex, index)` against the state.  Two things
+    Options almost never ship a `cardId` field, so `opt_card_feat` is populated
+    by dereferencing `(area, playerIndex, index)` against the state.  Two things
     must hold: visible references resolve, and hidden ones stay PAD.
+
+    Every test here passes ``engine_card_features``.  Without it every
+    ``opt_card_feat`` row is zeros and the leak assertions below would hold no
+    matter what the featurizer did.  ``test_pad_row_is_distinguishable`` pins
+    the invariant that makes an all-zero row mean "PAD".
     """
+
+    def test_pad_row_is_distinguishable(self):
+        """No real engine card has an all-zero feature row.
+
+        The leak tests read "all-zero row" as "no card here".  That is only
+        sound while no real card's features are all zero.
+        """
+        rows = np.stack([np.asarray(v, dtype=np.float32)
+                         for v in _engine_card_features().values()])
+        assert rows.shape[1] == F_CARD
+        n_zero = int((np.abs(rows).sum(axis=1) == 0).sum())
+        assert n_zero == 0, (
+            f"{n_zero} engine cards have an all-zero feature row, so a zero row "
+            f"no longer distinguishes PAD from a real card"
+        )
 
     def test_hand_referencing_options_populated(self):
         """PLAY options that point into the hand get a real card id.
@@ -1261,7 +1414,8 @@ class TestOptCardId:
                     continue
                 state = obs["current"]
                 me = state["yourIndex"]
-                out = featurize(obs, vocab)
+                out = featurize(obs, vocab,
+                                engine_card_features=_engine_card_features())
                 for j, opt in enumerate(obs["select"]["option"]):
                     if j >= O_MAX or not out["opt_mask"][j]:
                         continue
@@ -1273,8 +1427,8 @@ class TestOptCardId:
                     raw = card_id_at(state, 2, me, idx)
                     if raw is None:
                         continue
-                    assert out["opt_card_id"][j] == _remap(raw, vocab["id_to_index"])
-                    assert out["opt_card_id"][j] != PAD_CARD
+                    assert np.array_equal(out["opt_card_feat"][j], _feat_of(raw))
+                    assert np.any(out["opt_card_feat"][j] != 0.0)
                     n_checked += 1
 
         assert n_checked > 0, "fixture offered no hand-referencing PLAY option"
@@ -1298,7 +1452,8 @@ class TestOptCardId:
                 if obs is None or not (obs.get("select") or {}).get("option"):
                     continue
                 state = obs["current"]
-                out = featurize(obs, vocab)
+                out = featurize(obs, vocab,
+                                engine_card_features=_engine_card_features())
                 for j, opt in enumerate(obs["select"]["option"]):
                     if j >= O_MAX or not out["opt_mask"][j]:
                         continue
@@ -1308,7 +1463,7 @@ class TestOptCardId:
                     if area is None:
                         continue
                     if int(area) == 1:
-                        assert out["opt_card_id"][j] == PAD_CARD, (
+                        assert np.all(out["opt_card_feat"][j] == 0.0), (
                             f"deck ref leaked at step {step_i} option {j}")
                         n_hidden_seen += 1
                     elif int(area) == 6 and idx is not None:
@@ -1318,17 +1473,16 @@ class TestOptCardId:
                         except (KeyError, IndexError, TypeError, ValueError):
                             continue
                         if slot is None:
-                            assert out["opt_card_id"][j] == PAD_CARD, (
+                            assert np.all(out["opt_card_feat"][j] == 0.0), (
                                 f"face-down prize leaked at step {step_i} option {j}")
                             n_hidden_seen += 1
 
         assert n_hidden_seen > 0, "fixture contained no hidden-zone reference to check"
 
     def test_populated_ids_match_their_location(self):
-        """Every non-PAD opt_card_id equals the vocab index of the card there."""
+        """Every non-PAD opt_card_feat equals the features of the card there."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
-        id_to_index = vocab["id_to_index"]
 
         n_populated = 0
         for step_i in range(len(ep["steps"])):
@@ -1341,14 +1495,15 @@ class TestOptCardId:
                     continue
                 state = obs["current"]
                 me = state["yourIndex"]
-                out = featurize(obs, vocab)
+                out = featurize(obs, vocab,
+                                engine_card_features=_engine_card_features())
                 for j, opt in enumerate(obs["select"]["option"]):
                     if j >= O_MAX or not out["opt_mask"][j]:
                         continue
                     if not isinstance(opt, dict) or opt.get("cardId") is not None:
                         continue
-                    v = int(out["opt_card_id"][j])
-                    if v == PAD_CARD:
+                    row = out["opt_card_feat"][j]
+                    if not np.any(row != 0.0):  # PAD
                         continue
                     n_populated += 1
                     area, idx = opt.get("area"), opt.get("index")
@@ -1360,9 +1515,9 @@ class TestOptCardId:
                     else:
                         raw = None
                     if raw is not None:
-                        assert v == _remap(raw, id_to_index)
+                        assert np.array_equal(row, _feat_of(raw))
 
-        assert n_populated > 0, "fixture produced no populated opt_card_id at all"
+        assert n_populated > 0, "fixture produced no populated opt_card_feat at all"
 
 
 # ---------------------------------------------------------------------------

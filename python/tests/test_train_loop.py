@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from ptcg_il.model.cards import F_ATK, F_CARD
 from ptcg_il.model.policy import Policy
 from ptcg_il.train.checkpoint import (
     build_submission_bundle,
@@ -38,7 +39,7 @@ from ptcg_il.train.loop import (
 
 def _tiny_policy() -> Policy:
     """Create a tiny Policy (D=32, layers=1) for fast tests."""
-    return Policy(V=16, A=8, D=32, heads=4, layers=1, ff=64)
+    return Policy(D=32, heads=4, layers=1, ff=64)
 
 
 # ============================================================
@@ -52,16 +53,17 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
     P_MAX, H_MAX, SUM, D_MAX, PZ_MAX = 12, 30, 2, 60, 6
     L_STATE, O_MAX = 46, 64
     F_GLOBAL, F_POKE, F_HAND, F_SUM, F_OPT = 93, 26, 2, 11, 6
+    L_LOG_MAX, LOG_FEAT_DIM = 32, 6
 
     return {
-        # State — card ids
-        "poke_card_id": np.zeros(P_MAX, dtype=np.int64),
-        "hand_card_id": np.zeros(H_MAX, dtype=np.int64),
-        "stadium_card_id": np.zeros(1, dtype=np.int64),
-        "context_card_id": np.zeros(1, dtype=np.int64),
-        "effect_card_id": np.zeros(1, dtype=np.int64),
-        "discard_ids": np.zeros((SUM, D_MAX), dtype=np.int64),
-        "prize_ids": np.zeros((SUM, PZ_MAX), dtype=np.int64),
+        # State — card identity, as static features (no id embeddings)
+        "poke_card_feat": np.zeros((P_MAX, F_CARD), dtype=np.float32),
+        "hand_card_feat": np.zeros((H_MAX, F_CARD), dtype=np.float32),
+        "stadium_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
+        "context_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
+        "effect_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
+        "discard_card_feat": np.zeros((SUM, D_MAX, F_CARD), dtype=np.float32),
+        "prize_card_feat": np.zeros((SUM, PZ_MAX, F_CARD), dtype=np.float32),
         # State — dense features
         "cls_feat": np.random.randn(F_GLOBAL).astype(np.float32) * 0.1,
         "poke_feat": np.random.randn(P_MAX, F_POKE).astype(np.float32) * 0.1,
@@ -78,8 +80,8 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
         "opt_type": np.zeros(O_MAX, dtype=np.int64),
         "opt_src_idx": np.full(O_MAX, -1, dtype=np.int64),
         "opt_tgt_idx": np.full(O_MAX, -1, dtype=np.int64),
-        "opt_card_id": np.zeros(O_MAX, dtype=np.int64),
-        "opt_attack_idx": np.zeros(O_MAX, dtype=np.int64),
+        "opt_card_feat": np.zeros((O_MAX, F_CARD), dtype=np.float32),
+        "opt_attack_feat": np.zeros((O_MAX, F_ATK), dtype=np.float32),
         "opt_scalar": np.zeros((O_MAX, F_OPT), dtype=np.float32),
         "opt_mask": np.zeros(O_MAX, dtype=bool),
         # Labels
@@ -92,6 +94,11 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
         "value_target": np.array(1.0, dtype=np.float32),
         # Masks
         "discard_mask": np.zeros((SUM, D_MAX), dtype=bool),
+        # Logs (belief module)
+        "log_feat": np.zeros((L_LOG_MAX, LOG_FEAT_DIM), dtype=np.float32),
+        "log_mask": np.zeros(L_LOG_MAX, dtype=bool),
+        "log_len": np.array(0, dtype=np.int64),
+        "log_card_feat": np.zeros((L_LOG_MAX, F_CARD), dtype=np.float32),
     }
 
 
@@ -133,11 +140,10 @@ def _configure_sample(
     s["sel_type"] = np.array(min(sel_ctx, 10), dtype=np.int64)
     s["value_target"] = np.array(1.0 if won else -1.0, dtype=np.float32)
 
-    # Embeddings need real card ids for some tokens
-    for i in range(10):
-        s["poke_card_id"][i] = 2  # some real card
-    for i in range(5):
-        s["hand_card_id"][i] = 2
+    # The card MLP needs non-zero features for the tokens that are in play;
+    # an all-zero row is PAD and embeds to ~zero.
+    s["poke_card_feat"][:10] = np.random.randn(10, F_CARD).astype(np.float32) * 0.1
+    s["hand_card_feat"][:5] = np.random.randn(5, F_CARD).astype(np.float32) * 0.1
 
     return s
 
@@ -216,7 +222,7 @@ class TestNoDecay:
     def test_embedding_no_decay(self):
         """Embedding weights should not be decayed."""
         p = torch.nn.Parameter(torch.zeros(16, 32))
-        assert _no_decay("embed.card.id_emb.weight", p)
+        assert _no_decay("embed.type_emb.weight", p)
 
     def test_null_token_no_decay(self):
         """null_token should not be decayed."""
@@ -308,7 +314,7 @@ class TestEMA:
     def test_state_dict_roundtrip(self):
         policy = _tiny_policy()
         ema = _EMA(policy, decay=0.999)
-        policy.embed.card.id_emb.weight.data.fill_(1.0)
+        policy.embed.type_emb.weight.data.fill_(1.0)
         ema.update(policy)
         sd = ema.state_dict()
         ema2 = _EMA(policy, decay=0.999)
@@ -324,13 +330,13 @@ class TestEMA:
             p.data.fill_(1.0)
         ema = _EMA(policy, decay=0.999)
         # Modify original and update
-        policy.embed.card.id_emb.weight.data.fill_(5.0)
+        policy.embed.type_emb.weight.data.fill_(5.0)
         ema.update(policy)
         # Change policy back
-        policy.embed.card.id_emb.weight.data.fill_(0.0)
+        policy.embed.type_emb.weight.data.fill_(0.0)
         # Apply EMA back — should restore weighted version
         ema.apply(policy)
-        val = policy.embed.card.id_emb.weight.data.mean().item()
+        val = policy.embed.type_emb.weight.data.mean().item()
         # After one update with decay 0.999: shadow = 0.999*1 + 0.001*5 ≈ 1.004
         # After apply: should be ~1.004, which is > 0
         assert val > 0.0
@@ -338,11 +344,11 @@ class TestEMA:
     def test_multiple_updates_converge(self):
         policy = _tiny_policy()
         ema = _EMA(policy, decay=0.0)  # No smoothing → shadow = new value each step
-        policy.embed.card.id_emb.weight.data.fill_(3.0)
+        policy.embed.type_emb.weight.data.fill_(3.0)
         ema.update(policy)
-        policy.embed.card.id_emb.weight.data.fill_(0.0)
+        policy.embed.type_emb.weight.data.fill_(0.0)
         ema.apply(policy)
-        val = policy.embed.card.id_emb.weight.data.mean().item()
+        val = policy.embed.type_emb.weight.data.mean().item()
         assert abs(val - 3.0) < 1e-4  # with decay=0, shadow = new value
 
 
@@ -505,13 +511,13 @@ class TestOfflineEval:
         loader = DataLoader(ds, batch_size=4, collate_fn=collate_fn)
 
         # Record original weights
-        orig_w = policy.embed.card.id_emb.weight.data.clone()
+        orig_w = policy.embed.type_emb.weight.data.clone()
 
         device = torch.device("cpu")
         _ = offline_eval(policy, loader, device, ema=ema, max_batches=2)
 
         # Weights should be restored
-        restored_w = policy.embed.card.id_emb.weight.data
+        restored_w = policy.embed.type_emb.weight.data
         assert torch.equal(orig_w, restored_w)
 
 

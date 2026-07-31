@@ -87,7 +87,7 @@ def MLP(
     )
 
 
-from model.cards import CardEncoder, AttackEncoder  # noqa: E402
+from model.cards import CardFeaturizer, AttackFeaturizer  # noqa: E402
 from model.policy import Policy, select_multi  # noqa: E402
 '''
 
@@ -148,29 +148,62 @@ def _read_deck_csv() -> list[int]:
 # ── Import-time model loading ─────────────────────────────────────────────
 
 _vocab_raw = _load_json(os.path.join(DATA_DIR, "vocab.json"))
+
+
+def _index_to_id_map(raw):
+    """Normalize ``index_to_id`` to ``{index: engine_card_id}``.
+
+    ``vocab.json`` stores it as the list ``["PAD", "UNKNOWN", id2, ...]``, so
+    ``.items()`` on it raises — and it would raise here at agent *import* time,
+    which on Kaggle reads as a submission that simply does not start.  A dict
+    form (int- or str-keyed) is accepted too; the PAD/UNKNOWN placeholders are
+    dropped either way since they map to no engine card.
+    """
+    if not raw:
+        return {}
+    pairs = raw.items() if hasattr(raw, "items") else enumerate(raw)
+    out = {}
+    for k, v in pairs:
+        try:
+            out[int(k)] = int(v)
+        except (TypeError, ValueError):
+            continue  # "PAD" / "UNKNOWN"
+    return out
+
+
 _vocab = {
     "id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("id_to_index", {}).items()},
     "attack_id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("attack_id_to_index", {}).items()},
+    "index_to_id": _index_to_id_map(_vocab_raw.get("index_to_id")),
 }
 
-_card_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "card_static.npy")))
-_attack_static = torch.from_numpy(np.load(os.path.join(DATA_DIR, "attack_static.npy")))
+# Engine card/attack feature maps (built at packaging time from the bundled engine)
+_engine_card_features = np.load(
+    os.path.join(DATA_DIR, "engine_card_features.npy"), allow_pickle=True).item()
+_engine_attack_features = np.load(
+    os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
+
+# All-card feature matrix for belief heads (sorted by card id)
+_max_cid = max(_engine_card_features.keys()) if _engine_card_features else 0
+_all_card_feat = torch.zeros(_max_cid + 1, 94)
+for _cid, _feat in _engine_card_features.items():
+    _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
 _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+_cfg = _ckpt.get("config", {})
 _model = Policy(
-    V=_ckpt["V"], A=_ckpt["A"],
-    D=_ckpt.get("D", 256), heads=_ckpt.get("heads", 8),
-    layers=_ckpt.get("layers", 4), ff=_ckpt.get("ff", 1024),
-    n_opp_arch=_ckpt.get("n_opp_arch", 1),
-    card_static_table=_card_static, attack_static_table=_attack_static,
+    D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
+    layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
+    n_opp_arch=_cfg.get("n_opp_arch", 1),
+    n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
+    all_card_feat=_all_card_feat,
 )
 _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
-_sd = _model.state_dict()
-_loaded_ptrs = {_sd[k].data_ptr() for k in _ckpt["model_state_dict"] if k in _sd}
-_real_missing = [k for k in _missing
-                 if not k.endswith(".static") and _sd[k].data_ptr() not in _loaded_ptrs]
-if _real_missing:
-    print(f"[agent] WARNING: {len(_real_missing)} weights absent from checkpoint: {_real_missing[:6]}")
+if _missing:
+    _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
+    _other = [k for k in _missing if not k.startswith("belief_heads.")]
+    if _other:
+        print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
 _model.to(_device)
 _model.eval()
 
@@ -183,6 +216,12 @@ _archetypes = _load_json(os.path.join(DATA_DIR, "archetypes.json"))
 _opp_visible_cards: list[int] = []
 
 # ── Agent function ───────────────────────────────────────────────────────
+
+
+# Provide engine features to search_infer (it calls featurize internally)
+import model.search_infer as _si
+_si._engine_card_features = _engine_card_features
+_si._engine_attack_features = _engine_attack_features
 
 
 def agent(obs_dict: dict) -> list[int]:
@@ -224,24 +263,55 @@ def agent(obs_dict: dict) -> list[int]:
     return result.get("indices", [])
 
 
+def _libcg_name() -> str:
+    """Platform-specific engine library name, matching cg/sim.py's own choice."""
+    import platform
+    os_name = platform.system()
+    if os_name == "Windows":
+        return "cg.dll"
+    if os_name == "Darwin":
+        return "libcg.dylib"
+    if platform.machine() in ("arm64", "aarch64"):
+        return "libcg-arm64.so"
+    return "libcg.so"
+
+
 def _find_libcg() -> str:
-    """Locate libcg.so in the Kaggle environment."""
+    """Locate the engine shared library.
+
+    The Rust PUCT tree dlopens this itself, and ``puct_init`` returns NULL if
+    the path is wrong — which ``mcts_search`` used to swallow, turning every
+    decision into a greedy forward pass with no search at all.  So this has to
+    actually find the file, not return a hopeful bare name.
+
+    The most reliable source is the ``cg`` package itself: ``cg/sim.py``
+    resolves the library next to its own ``__file__``, so if ``cg`` is
+    importable at all, that directory holds the engine.
+    """
+    name = _libcg_name()
+    here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
-        "/kaggle_simulations/agent/libcg.so",
-        "libcg.so",
-        os.path.join(os.path.dirname(__file__), "libcg.so"),
+        f"/kaggle_simulations/agent/{name}",
+        name,
+        os.path.join(here, name),
+        os.path.join(here, "cg", name),
+        os.path.join("cg", name),
     ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    # Fallback: try cg package
+    # The cg package knows where its own engine is — ask it first among dirs.
     try:
-        from cg.sim import _lib_path
-        if _lib_path and os.path.exists(_lib_path):
-            return _lib_path
+        import cg.sim as _cgsim
+        candidates.insert(0, os.path.join(
+            os.path.dirname(os.path.abspath(_cgsim.__file__)), name))
     except Exception:
         pass
-    return "libcg.so"
+    for p in candidates:
+        if os.path.exists(p):
+            return os.path.abspath(p)
+    # Nothing found: return the bare name so ctypes can still try the loader
+    # path, but say so — a silent miss here costs the entire search.
+    print(f"[agent] WARNING: {name} not found; MCTS will fall back to greedy. "
+          f"Looked in: {candidates}")
+    return name
 '''
 
 
@@ -426,47 +496,22 @@ def build_model_weights(ckpt_path: Path, dst_dir: Path,
             raise KeyError("Checkpoint missing both 'ema_state_dict' and 'model_state_dict'")
         print(f"  EMA not found — falling back to raw model_state_dict")
 
-    # Infer V from card embedding, A from attack embedding
-    V = None
-    A = None
-    for key, tensor in model_state.items():
-        if key == "embed.card.id_emb.weight" and V is None:
-            V = int(tensor.shape[0])
-        if key == "pointer.attack.id_emb.weight" and A is None:
-            A = int(tensor.shape[0])
-
-    if V is None:
-        V = int(ckpt.get("V", ckpt.get("vocab_size", 262)))
-        print(f"  V not found in weights — using {V} from metadata")
-    if A is None:
-        A = int(ckpt.get("A", ckpt.get("attack_vocab_size", 181)))
-        print(f"  A not found in weights — using {A} from metadata")
-
-    print(f"  V={V}  A={A}")
-
-    # Architecture comes from the checkpoint's own record when present.
-    # Hardcoding it meant a model trained with non-default --d-model/--layers
-    # was rebuilt at the wrong shape on the Kaggle side; the loader uses
-    # strict=False, so the mismatched tensors are simply dropped and the agent
-    # plays with partly random weights.
+    # Architecture comes from the checkpoint's own config record.
     cfg = ckpt.get("config") or {}
     arch = {
         "D": int(cfg.get("D", 256)),
         "heads": int(cfg.get("heads", 8)),
         "layers": int(cfg.get("layers", 4)),
         "ff": int(cfg.get("ff", 1024)),
-        # Sizes the belief arch head.  Must round-trip: a wrong value is a shape
-        # mismatch, which raises at load time even under strict=False.
         "n_opp_arch": int(cfg.get("n_opp_arch", _infer_n_opp_arch(model_state))),
+        "n_all_cards": int(cfg.get("n_all_cards", 0)),
     }
     if cfg:
         print(f"  Architecture from checkpoint config: {arch}")
     else:
         print(f"  Checkpoint has no config record — assuming defaults {arch}")
 
-    submission_pt = {"model_state_dict": model_state, "V": V, "A": A, **arch}
-    # Keep the deck label with the weights so the shipped model.pt is
-    # self-describing and a wrong pairing is auditable after the fact.
+    submission_pt = {"model_state_dict": model_state, "config": arch}
     if deck_record is not None:
         submission_pt["deck"] = deck_record
     torch.save(submission_pt, dst_dir / "model.pt")
@@ -493,31 +538,61 @@ def read_ckpt_deck(ckpt_path: Path) -> tuple[list[int] | None, dict | None]:
     return [int(c) for c in record["deck"]], record
 
 
+def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
+    """Build engine_card_features.npy and engine_attack_features.npy from the
+    bundled engine's card/attack data.
+
+    This ensures the feature tables match the exact engine version used in
+    competition — cards added after training still get correct features.
+    """
+    import numpy as np
+    sys.path.insert(0, str(src_dir / "python" / "pokemon-tcg-ai-battle"
+                            / "sample_submission" / "sample_submission"))
+    # ptcg_mine lives under python/, and this script is run from the repo root
+    # (see scripts/build_submit.sh), so python/ has to be on the path too.
+    sys.path.insert(0, str(src_dir / "python"))
+    from cg.api import all_attack, all_card_data
+    from ptcg_mine.cards import card_static_row, attack_static_row
+
+    cards, attacks = all_card_data(), all_attack()
+    # card.attacks holds attack *ids*, so the row builder needs the lookup to
+    # fill the 52:94 attack half; without it those 42 dims would be all zeros.
+    attacks_by_id = {a.attackId: a for a in attacks}
+    card_feats = {c.cardId: card_static_row(c, attacks_by_id) for c in cards}
+    attack_feats = {a.attackId: attack_static_row(a) for a in attacks}
+    np.save(dst_dir / "engine_card_features.npy", card_feats)
+    np.save(dst_dir / "engine_attack_features.npy", attack_feats)
+    print(f"  Built engine_card_features.npy ({len(card_feats)} cards)")
+    print(f"  Built engine_attack_features.npy ({len(attack_feats)} attacks)")
+
+
 def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = None,
                      src_dir: Path | None = None) -> None:
-    """Copy vocab, static tables, archetypes, deck, and Rust .so into submission/data/.
+    """Copy vocab, archetypes, deck, and build engine features into submission/data/.
+
+    Engine card/attack features are built from the bundled engine at packaging
+    time, so they always match the competition engine — even if new cards were
+    added after training.
 
     Parameters
     ----------
     data_dir : Path
-        Directory containing ``vocab.json``, ``card_static_table.npy``,
-        ``attack_static_table.npy``, and ``archetypes.json``.
+        Directory containing ``vocab.json`` and ``archetypes.json``.
     dst_dir : Path
         Output directory for the submission data files.
     src_dir : Path or None
-        Project root (for finding libptcg_search.so).  Defaults to cwd.
+        Project root.  Defaults to cwd.
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
 
-    # Vocab (copy verbatim)
+    # Vocab (still needed for index_to_id reverse mapping in featurizer)
     shutil.copy(data_dir / "vocab.json", dst_dir / "vocab.json")
     print(f"  Copied vocab.json")
 
-    # Static tables (renamed for submission)
-    shutil.copy(data_dir / "card_static_table.npy", dst_dir / "card_static.npy")
-    print(f"  Copied card_static.npy")
-    shutil.copy(data_dir / "attack_static_table.npy", dst_dir / "attack_static.npy")
-    print(f"  Copied attack_static.npy")
+    # Engine card/attack features — built fresh from the bundled engine
+    if src_dir is None:
+        src_dir = Path.cwd()
+    _build_engine_features_from_engine(src_dir, dst_dir)
 
     # Archetypes — needed by belief posterior for opponent deck prediction
     arch_path = data_dir / "archetypes.json"

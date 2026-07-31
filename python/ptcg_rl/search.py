@@ -468,18 +468,15 @@ class SearchTarget:
 
 def _find_libcg() -> str:
     """Find libcg.so on the filesystem."""
+    base = Path(__file__).resolve().parent.parent.parent  # repo root
     candidates = [
-        Path("pokemon-tcg-ai-battle/cg/libcg.so"),
-        Path("python/pokemon-tcg-ai-battle/cg/libcg.so"),
+        base / "python/pokemon-tcg-ai-battle/sample_submission/sample_submission/cg/libcg.so",
+        base / "pokemon-tcg-ai-battle/sample_submission/sample_submission/cg/libcg.so",
     ]
-    # Also search relative to this file
-    base = Path(__file__).resolve().parent.parent.parent
-    candidates.append(base / "pokemon-tcg-ai-battle/cg/libcg.so")
-
     for p in candidates:
         if p.exists():
             return str(p)
-    raise FileNotFoundError("libcg.so not found")
+    raise FileNotFoundError(f"libcg.so not found, searched: {candidates}")
 
 
 def featurize_leaf(
@@ -622,7 +619,16 @@ class MctsForest:
         c_puct: float = 2.0,
         seed: int = 42,
     ) -> int:
-        """Add a search root to the forest.  Returns the tree_id."""
+        """Add a search root to the forest.
+
+        Returns the tree_id, or ``-1`` if the engine refused the root.
+        Refusal is routine and per-state — ``SearchBegin`` rejects some
+        positions outright (error code 2) — so it is reported through the
+        return value, not an exception: every caller adds roots in a loop
+        over decision points and must keep the surviving ones rather than
+        lose a whole self-play batch to one bad state.  The Rust side prints
+        the reason to stderr.
+        """
         obs_json = json.dumps(obs_dict)
         fixed_json = json.dumps(fixed_deck)
         opp_json = json.dumps(opp_deck_template if opp_deck_template else [])
@@ -637,7 +643,7 @@ class MctsForest:
             seed,
         )
         if tree_id < 0:
-            raise RuntimeError(f"puct_forest_add_root returned {tree_id}")
+            return -1
         self._tree_count = max(self._tree_count, tree_id + 1)
         return tree_id
 
@@ -756,9 +762,10 @@ def batch_evaluate_leaves(
     use_bf16 = bf16 and device.type == "cuda"
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else _NullContext()
     with torch.no_grad(), autocast_ctx:
-        h, _history_h = policy._encode(tensor_batch)
-        logits = policy.pointer(h, tensor_batch["opt_mask"])
-        values = policy.value(h[:, 0, :])
+        # Go through Policy.forward rather than driving _encode/pointer/value
+        # by hand: the pointer head takes (h, tok_mask, card_encoder, x) and
+        # applies the option mask itself.
+        logits, values, _history_h = policy(tensor_batch)
 
     # Always read back in fp32 for prior/softmax stability
     logits_np = logits.float().cpu().numpy()
@@ -791,7 +798,8 @@ def batch_evaluate_leaves(
         n_legal = int(mask.sum())
         priors = probs[:n_legal].tolist() if n_legal > 0 else []
 
-        value = float(values_np[valid_pos, 0])
+        # Policy.forward returns value as [B], not [B, 1]
+        value = float(values_np[valid_pos])
         valid_pos += 1
 
         expansions.append({

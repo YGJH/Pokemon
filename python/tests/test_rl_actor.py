@@ -38,10 +38,14 @@ N_REAL_OPTS = 7
 STOP_COL = 7
 
 
-def _tiny_policy(V: int = 100, A: int = 50, D: int = 64) -> Policy:
-    """A small policy on the same vocab sizes ``_make_synthetic_batch`` uses."""
+def _tiny_policy(D: int = 64) -> Policy:
+    """A small policy shaped for the batches ``_make_synthetic_batch`` emits.
+
+    There is no vocab size to pass: cards reach the model as static feature
+    vectors, so the only shape that matters here is *D*.
+    """
     torch.manual_seed(0)
-    p = Policy(V=V, A=A, D=D, heads=4, layers=1, ff=128)
+    p = Policy(D=D, heads=4, layers=1, ff=128)
     p.eval()
     return p
 

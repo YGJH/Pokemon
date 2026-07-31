@@ -193,16 +193,17 @@ class TestCheckpointConfig:
         torch = pytest.importorskip("torch")
         from ptcg_il.model.policy import Policy
 
-        p = Policy(V=40, A=12, D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
-        assert p.config == {"V": 40, "A": 12, "D": 32, "heads": 4,
-                            "layers": 1, "ff": 64, "n_opp_arch": 6}
+        p = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
+        # No V/A: cards are static features, so there is no vocab width to record.
+        assert p.config == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
+                            "n_opp_arch": 6, "n_all_cards": 0}
         del torch
 
     def test_config_roundtrips_through_policy_from_config(self):
         pytest.importorskip("torch")
         from ptcg_il.model.policy import Policy, load_policy_state, policy_from_config
 
-        original = Policy(V=40, A=12, D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
+        original = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
         rebuilt = policy_from_config(original.config)
         # A strict-enough load: only belief keys may be missing, and here none are.
         assert load_policy_state(rebuilt, original.state_dict()) == []

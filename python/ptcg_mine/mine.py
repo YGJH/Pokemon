@@ -18,7 +18,9 @@ import numpy as np
 from ptcg_mine import stamp
 from ptcg_mine.archetype import canon, cluster_decks, pick_fixed_deck, select_self_opp
 from ptcg_mine.artifacts import write_archetypes_json, write_mining_report, write_vocab_json
-from ptcg_mine.cards import build_static_tables, load_engine
+from ptcg_mine.cards import (build_engine_attack_features,
+                              build_engine_card_features,
+                              build_static_tables, load_engine)
 from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import deck_of, load_episode, project_for_selection, validate_episode
 from ptcg_mine.stats import select_experts, team_leaderboard
@@ -238,6 +240,10 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
     )
     np.save(out_dir / "card_static_table.npy", card_table)
     np.save(out_dir / "attack_static_table.npy", attack_table)
+    engine_card_features = build_engine_card_features(cards, attacks)
+    np.save(out_dir / "engine_card_features.npy", engine_card_features)
+    engine_attack_features = build_engine_attack_features(attacks)
+    np.save(out_dir / "engine_attack_features.npy", engine_attack_features)
 
     summary = {
         "vocab_size": vocab["size"],

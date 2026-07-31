@@ -29,6 +29,8 @@ def env(tmp_path):
     (data / "archetypes.json").write_text('{"self_ids": [0]}')
     (data / "card_static_table.npy").write_bytes(b"card")
     (data / "attack_static_table.npy").write_bytes(b"atk")
+    (data / "engine_card_features.npy").write_bytes(b"ecf")
+    (data / "engine_attack_features.npy").write_bytes(b"eaf")
     (data / "meta.parquet").write_bytes(b"meta")
     shards = data / "shards"
     shards.mkdir()
@@ -155,6 +157,37 @@ def test_shards_stale_when_vocab_changes(env):
     ok, reason = fresh("shards", env)
     assert not ok
     assert "upstream" in reason
+
+
+@pytest.mark.parametrize(
+    "table", ["engine_card_features.npy", "engine_attack_features.npy"]
+)
+def test_shards_stale_when_engine_feature_table_changes(env, table):
+    """A rebuilt static table must force a shard rebuild.
+
+    `shard_writer` loads these and the featurizer bakes their contents into
+    every `*_card_feat` tensor.  They are not in the shards stage's `code`
+    list, so without the upstream entry a `ptcg_mine/cards.py` edit invalidates
+    mine, rewrites the table, and leaves 20 GB of shards holding features from
+    the old one while this stage reports itself cached.
+    """
+    _, data, _ = env
+    stamp_it("shards", env)
+    (data / table).write_bytes(b"rebuilt-with-normalized-histogram")
+    ok, reason = fresh("shards", env)
+    assert not ok
+    assert "upstream" in reason
+
+
+def test_mine_requires_the_tables_it_feeds_downstream(env):
+    """Mine must not stamp itself complete without the engine feature tables."""
+    _, data, _ = env
+    stamp_it("mine", env)
+    assert fresh("mine", env)[0]
+    (data / "engine_card_features.npy").unlink()
+    ok, reason = fresh("mine", env)
+    assert not ok
+    assert "engine_card_features.npy" in reason
 
 
 def test_mine_ignores_vocab_since_it_produces_it(env):

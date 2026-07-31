@@ -177,15 +177,27 @@ def _load_policies(args: argparse.Namespace, device):
             f"(stage 4 writes it) — RL loads two policies and cannot infer shapes."
         )
 
-    static = _static_tables(Path(args.data_dir))
-    policy = policy_from_config(config, **static)
-    load_policy_state(policy, ckpt["model_state_dict"])
+    # Pure-feature model: there is no vocab width to reconcile and no static
+    # card/attack tables to inject.  The one card-derived tensor the policy
+    # still needs is the belief heads' [n_all_cards, F_CARD] matrix, built from
+    # engine_card_features.npy — without it BeliefHeads.forward raises.
+    config = dict(config)
+    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+
+    def _load_one(sd: dict) -> Any:
+        p = policy_from_config(config, all_card_feat=all_card_feat)
+        try:
+            load_policy_state(p, sd)
+        except RuntimeError:
+            _load_lenient(p, p.state_dict(), sd)
+        return p
+
+    policy = _load_one(ckpt["model_state_dict"])
     policy.to(device)
 
     reference = None
     if not args.no_anchor:
-        reference = policy_from_config(config, **static)
-        load_policy_state(reference, copy.deepcopy(ckpt["model_state_dict"]))
+        reference = _load_one(copy.deepcopy(ckpt["model_state_dict"]))
         reference.to(device).eval()
         for p in reference.parameters():
             p.requires_grad_(False)
@@ -193,16 +205,54 @@ def _load_policies(args: argparse.Namespace, device):
     return policy, reference, ckpt
 
 
-def _static_tables(data_dir: Path) -> dict:
+def _load_all_card_feat(data_dir: Path) -> Any:
+    """``[n_all_cards, F_CARD]`` static features for every engine card.
+
+    Indexed by raw engine card id, so row 0 and any gap stay zero (PAD).
+    Mirrors ``ptcg_il.cli._load_all_card_feat`` — the belief heads score against
+    every card the engine knows about, not against a vocab slice.
+    """
     import numpy as np
     import torch
 
-    out: dict[str, Any] = {}
-    for key, fname in (("card_static_table", "card_static_table.npy"),
-                       ("attack_static_table", "attack_static_table.npy")):
-        path = data_dir / fname
-        out[key] = torch.from_numpy(np.load(path)).float() if path.exists() else None
-    return out
+    from ptcg_il.featurizer import F_CARD
+
+    ecf_path = Path(data_dir) / "engine_card_features.npy"
+    if not ecf_path.exists():
+        return None
+    ecf = np.load(ecf_path, allow_pickle=True).item()
+    if not ecf:
+        return None
+    max_id = max(int(cid) for cid in ecf)
+    all_feat = torch.zeros(max_id + 1, F_CARD)
+    for cid, feat in ecf.items():
+        all_feat[int(cid)] = torch.from_numpy(np.asarray(feat, dtype=np.float32))
+    return all_feat
+
+
+def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> int:
+    """Load *ckpt_sd* into *policy*, handling size-mismatched params.
+
+    For any parameter whose checkpoint shape differs from the model, only
+    the overlapping prefix is copied.  Missing belief-head keys are tolerated.
+    """
+    loaded = 0
+    for key, model_param in model_sd.items():
+        ckpt_param = ckpt_sd.get(key)
+        if ckpt_param is None:
+            if key.startswith("belief_heads."):
+                continue
+            continue
+        if ckpt_param.shape != model_param.shape:
+            slices = tuple(
+                slice(0, min(cs, ms))
+                for cs, ms in zip(ckpt_param.shape, model_param.shape)
+            )
+            model_param[slices].copy_(ckpt_param[slices])
+        else:
+            model_param.copy_(ckpt_param)
+        loaded += 1
+    return loaded
 
 
 def _loaders(args, cfg, batch_size: int = 256):
@@ -823,7 +873,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(message)s",
-        handlers=[RichHandler(show_time=False, force_terminal=True)],
+        # force_terminal is a rich Console kwarg, not a RichHandler one — passing
+        # it here raised TypeError before a single R1 step could run.
+        handlers=[RichHandler(show_time=False)],
         force=True,
     )
 

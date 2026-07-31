@@ -47,12 +47,10 @@ W_LOST: float = 0.6
 
 # Keys that should stay on CPU as int64 (indices, masks, types)
 _INT_KEYS = frozenset({
-    "poke_card_id", "hand_card_id", "stadium_card_id",
-    "context_card_id", "effect_card_id", "discard_ids",
-    "prize_ids", "tok_type", "tok_owner", "tok_zone",
-    "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_card_id",
-    "opt_attack_idx", "sel_type", "sel_ctx", "action_idx",
-    "minCount", "maxCount", "action_len", "stop_column", "log_len",
+    "tok_type", "tok_owner", "tok_zone",
+    "opt_type", "opt_src_idx", "opt_tgt_idx", "sel_type", "sel_ctx",
+    "action_idx", "minCount", "maxCount", "action_len", "stop_column",
+    "log_len",
 })
 
 # Keys that should be float32 (can be cast to bf16)
@@ -60,6 +58,11 @@ _FLOAT_KEYS = frozenset({
     "cls_feat", "poke_feat", "hand_feat", "sum_feat",
     "stadium_present", "opt_scalar",
     "value_target", "sample_weight", "log_feat",
+    "poke_card_feat", "hand_card_feat", "stadium_card_feat",
+    "context_card_feat", "effect_card_feat",
+    "discard_card_feat", "prize_card_feat",
+    "opt_card_feat", "opt_attack_feat",
+    "log_card_feat",
 })
 
 # Boolean masks
@@ -245,21 +248,14 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         self.split = split
         self.archetype_self = archetype_self
 
-        # Vocab size, needed to densify the sparse belief labels.  Read from the
-        # artifact rather than inferred from the shards: the sparse label rows
-        # only reference the cards a deck actually contains, so the largest index
-        # seen is a lower bound on V, not V.
-        self.vocab_size: int | None = None
-        vocab_path = data_dir / "vocab.json"
-        if vocab_path.exists():
-            from ptcg_il.featurizer import normalize_vocab
-
-            # normalize_vocab, not a raw ["size"]: hand-written vocab files
-            # (tests, older artifacts) carry only id_to_index, and a missing
-            # key here would break loading for every dataset, belief or not.
-            with open(vocab_path) as fh:
-                size = normalize_vocab(json.load(fh)).get("size")
-            self.vocab_size = int(size) if size else None
+        # n_all_cards — total engine cards, needed to densify sparse belief
+        # labels.  Read from engine_card_features.npy (max engine card id + 1).
+        self.n_all_cards: int = 0
+        ecf_path = data_dir / "engine_card_features.npy"
+        if ecf_path.exists():
+            import numpy as _np
+            ecf = _np.load(ecf_path, allow_pickle=True).item()
+            self.n_all_cards = max(ecf.keys()) + 1 if ecf else 0
 
         # Load meta
         meta_path = data_dir / "meta.parquet"
@@ -419,7 +415,7 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         keys; those samples get zero-filled rows and ``bel_valid=False``, so an
         old corpus trains exactly as it did before.
         """
-        V = self.vocab_size
+        V = self.n_all_cards
         for dense_key, idx_key, cnt_key in _BELIEF_SPARSE:
             # No vocab.json => no way to size the row.  Fall through to the
             # zero-fill branch and mark the label invalid below, rather than

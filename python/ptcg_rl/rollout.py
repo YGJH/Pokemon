@@ -174,6 +174,8 @@ class PolicyActor:
         greedy: bool = False,
         bf16: bool = False,
         seed: int = 0,
+        engine_card_features: dict | None = None,
+        engine_attack_features: dict | None = None,
     ):
         self.policy = policy
         self.vocab = vocab
@@ -181,11 +183,18 @@ class PolicyActor:
         self.temperature = temperature
         self.greedy = greedy
         self.bf16 = bf16 and self.device.type == "cuda"
+        self.engine_card_features = engine_card_features
+        self.engine_attack_features = engine_attack_features
         # The generator must live on the same device as the tensors it samples
         # from: `torch.multinomial` rejects a CPU generator for a CUDA input
         # outright rather than falling back.
         self.generator = torch.Generator(device=self.device).manual_seed(seed)
         self.n_featurize_failures = 0
+        # Perf counters (reset each collect cycle)
+        self.perf_n_calls = 0
+        self.perf_t_featurize = 0.0
+        self.perf_t_forward = 0.0
+        self.perf_t_sample = 0.0
 
     def __call__(self, requests: list[dict]) -> list[dict]:
         """One reply per request, in the same order.
@@ -194,14 +203,21 @@ class PolicyActor:
         the first legal option — because a worker blocked forever on a missing
         action deadlocks the whole pool.  Those replies are never recorded.
         """
+        import time as _time
+        _t0 = _time.perf_counter()
         samples: list[dict | None] = []
         for req in requests:
             try:
-                samples.append(featurize(req["obs"], self.vocab))
+                samples.append(featurize(
+                    req["obs"], self.vocab,
+                    engine_card_features=self.engine_card_features,
+                    engine_attack_features=self.engine_attack_features))
             except (ValueError, TypeError, KeyError) as e:
                 logger.debug("featurize failed, falling back to first legal: %s", e)
                 self.n_featurize_failures += 1
                 samples.append(None)
+        _t1 = _time.perf_counter()
+        self.perf_t_featurize += _t1 - _t0
 
         usable = [i for i, s in enumerate(samples) if s is not None]
         replies: list[dict] = [
@@ -214,6 +230,8 @@ class PolicyActor:
 
         batch = _collate([samples[i] for i in usable], self.device)
 
+        import time as _time2
+        _t_pre_fwd = _time2.perf_counter()
         autocast = torch.autocast("cuda", dtype=torch.bfloat16) if self.bf16 else _NullCtx()
         with torch.no_grad(), autocast:
             # Encode once for both the pointer AR loop and the value head.
@@ -226,6 +244,8 @@ class PolicyActor:
                 encoded=h,
             )
             value = self.policy.value(h[:, 0])
+        _t_post_fwd = _time2.perf_counter()
+        self.perf_t_forward += _t_post_fwd - _t_pre_fwd
 
         logp = logp.float().cpu().numpy()
         value = value.float().cpu().numpy()

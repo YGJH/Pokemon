@@ -75,6 +75,11 @@ STAGES: dict[str, StageSpec] = {
             "archetypes.json",
             "card_static_table.npy",
             "attack_static_table.npy",
+            # Written by the same Phase-2 block and consumed by build-shards;
+            # a mine stamp that passes without them lets the next stage read a
+            # table left over from a previous run.
+            "engine_card_features.npy",
+            "engine_attack_features.npy",
         ),
     ),
     "shards": StageSpec(
@@ -91,7 +96,20 @@ STAGES: dict[str, StageSpec] = {
             "ptcg_mine/config.py",
         ),
         outputs=("meta.parquet", "shards/"),
-        upstream=("vocab.json", "archetypes.json"),
+        # The engine feature tables belong here even though no file in `code`
+        # builds them: `shard_writer` loads them and the featurizer bakes their
+        # *contents* into every `*_card_feat` tensor it writes.  Without them a
+        # `ptcg_mine/cards.py` edit invalidates the mine stamp, rewrites the
+        # tables, and leaves this stage reporting itself cached -- so 20 GB of
+        # shards keep features derived from the old table and nothing raises.
+        # These are the `engine_*` files, not `*_static_table.npy`: the latter
+        # are built off the mined vocab and no longer feed the featurizer.
+        upstream=(
+            "vocab.json",
+            "archetypes.json",
+            "engine_card_features.npy",
+            "engine_attack_features.npy",
+        ),
     ),
 }
 

@@ -4,11 +4,13 @@
 //! exposes a single C-ABI function `search_plan` for Python to call via
 //! `ctypes`.
 
+mod bridge;
 mod engine;
 mod ffi;
 mod guessing;
 mod mcts;
 mod puct;
+mod vec_env;
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -146,11 +148,15 @@ fn search_plan_impl(
         Err(e) => return error_json(&format!("build_guesses: {e}")),
     };
 
-    // Get search_begin_input from observation
+    // Get search_begin_input from observation.  Empty is fatal, not
+    // recoverable — see puct_forest_add_root_impl.
     let sbi = obs
         .get("search_begin_input")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if sbi.is_empty() {
+        return error_json("empty search_begin_input");
+    }
 
     // Start search
     let root = match engine.search_begin(
@@ -313,6 +319,9 @@ fn puct_init_impl(
         .get("search_begin_input")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if sbi.is_empty() {
+        return Err("empty search_begin_input".into());
+    }
 
     let root = engine
         .search_begin(
@@ -662,7 +671,7 @@ pub unsafe extern "C" fn puct_forest_create(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let lib_str = unsafe { cstr_to_str(lib_path) };
         let n = (n_engines.max(1)) as usize;
-        let pool = EnginePool::new(&lib_str, n, host_initialized != 0)
+        let pool = EnginePool::new(&lib_str, n, host_initialized == 0)
             .map_err(|e| format!("EnginePool::new: {e}"))?;
         let n_eng = pool.len();
         Ok::<PuctForestHandle, String>(PuctForestHandle {
@@ -694,7 +703,17 @@ pub unsafe extern "C" fn puct_forest_add_root(
     }));
     match result {
         Ok(Ok(id)) => id as i64,
-        Ok(Err(_)) | Err(_) => -1,
+        // A rejected root is routine (deck-selection steps have no `select`),
+        // but the caller only sees -1.  Print the reason so a systematic
+        // rejection is diagnosable without rebuilding with logging.
+        Ok(Err(e)) => {
+            eprintln!("puct_forest_add_root: {e}");
+            -1
+        }
+        Err(_) => {
+            eprintln!("puct_forest_add_root: panicked");
+            -1
+        }
     }
 }
 
@@ -731,9 +750,15 @@ fn puct_forest_add_root_impl(
     let guesses = guessing::build_guesses(&obs_str, &fixed_deck, &opp_deck_template, &mut rng)
         .map_err(|e| format!("build_guesses: {e}"))?;
 
+    // An empty sbi is not a recoverable search — `SearchBegin` dereferences
+    // the pointer and takes the whole process down with SIGSEGV, which no
+    // `catch_unwind` above can turn back into an error code.  Reject it here.
     let sbi = obs.get("search_begin_input")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    if sbi.is_empty() {
+        return Err("empty search_begin_input".into());
+    }
 
     // Use engine 0 for root creation (sequential, before rayon kicks in)
     let engine = h.pool.get(0);
@@ -912,4 +937,71 @@ pub unsafe extern "C" fn puct_forest_free(handle: i64) {
     if handle != 0 {
         drop(unsafe { Box::from_raw(handle as *mut PuctForestHandle) });
     }
+}
+
+// ── VecEnv C-ABI (Rust-backed parallel game env, via C bridge) ──────────
+
+use vec_env::{FinishedGame, VecEnv, VecEnvConfig};
+
+struct VecEnvHandle { env: VecEnv, }
+
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_create(
+    n_envs: c_int, lib_path: *const c_char,
+    deck_self_json: *const c_char, deck_opp_json: *const c_char,
+    our_player: c_int, seed: c_int, host_initialized: c_int,
+) -> i64 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let lib_str = unsafe { cstr_to_str(lib_path) };
+        let deck_self: Vec<i32> = serde_json::from_str(&unsafe { cstr_to_str(deck_self_json) })
+            .map_err(|e: serde_json::Error| format!("deck_self: {e}"))?;
+        let deck_opp: Vec<i32> = serde_json::from_str(&unsafe { cstr_to_str(deck_opp_json) })
+            .map_err(|e: serde_json::Error| format!("deck_opp: {e}"))?;
+        let cfg = VecEnvConfig { n_envs: n_envs.max(1) as usize, our_player: our_player as u8,
+                                 seed: seed as u64, ..VecEnvConfig::default() };
+        let env = VecEnv::new(&lib_str, &deck_self, &deck_opp, cfg)
+            .map_err(|e: String| format!("VecEnv: {e}"))?;
+        Ok::<VecEnvHandle, String>(VecEnvHandle { env })
+    }));
+    match result { Ok(Ok(h)) => Box::into_raw(Box::new(h)) as i64, _ => 0 }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_poll(handle: i64) -> *mut c_char {
+    if handle == 0 { return CString::new("[]").unwrap().into_raw(); }
+    let h = unsafe { &mut *(handle as *mut VecEnvHandle) };
+    let pending = h.env.poll();
+    let json = serde_json::to_string(&pending.iter().map(|p| serde_json::json!({
+        "battle_idx": p.battle_idx, "obs_json": p.obs_json,
+        "sbi": p.sbi, "select_player": p.select_player,
+    })).collect::<Vec<_>>()).unwrap_or("[]".into());
+    CString::new(json).unwrap().into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_reply(handle: i64, picks_json: *const c_char) -> c_int {
+    if handle == 0 { return 0; }
+    let h = unsafe { &mut *(handle as *mut VecEnvHandle) };
+    let picks: Vec<Vec<i32>> = match serde_json::from_str(&unsafe { cstr_to_str(picks_json) }) {
+        Ok(v) => v, Err(_) => return 0,
+    };
+    h.env.reply(&picks);
+    picks.len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_drain(handle: i64) -> *mut c_char {
+    if handle == 0 { return CString::new("[]").unwrap().into_raw(); }
+    let h = unsafe { &mut *(handle as *mut VecEnvHandle) };
+    let finished = h.env.drain();
+    let json = serde_json::to_string(&finished.iter().map(|g| serde_json::json!({
+        "battle_idx": g.battle_idx, "reward": g.reward,
+        "n_decisions": g.n_decisions, "error": g.error,
+    })).collect::<Vec<_>>()).unwrap_or("[]".into());
+    CString::new(json).unwrap().into_raw()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_free(handle: i64) {
+    if handle != 0 { drop(unsafe { Box::from_raw(handle as *mut VecEnvHandle) }); }
 }

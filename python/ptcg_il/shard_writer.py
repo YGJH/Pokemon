@@ -367,6 +367,18 @@ def build_shards(
             raise FileNotFoundError(f"Vocab not found at {vocab_path}")
         vocab = _load_vocab(vocab_path)
 
+    # Load engine card/attack features (needed for pure-feature featurizer)
+    import numpy as np
+    engine_card_features = None
+    engine_attack_features = None
+    ecf_path = out_dir / "engine_card_features.npy"
+    eaf_path = out_dir / "engine_attack_features.npy"
+    if ecf_path.exists():
+        engine_card_features = np.load(ecf_path, allow_pickle=True).item()
+    if eaf_path.exists():
+        engine_attack_features = np.load(eaf_path, allow_pickle=True).item()
+    _n_all_cards = max(engine_card_features.keys()) + 1 if engine_card_features else 0
+
     # Load archetypes
     if archetypes_data is None or self_ids is None or opp_ids is None:
         arch_path = out_dir / "archetypes.json"
@@ -467,7 +479,10 @@ def build_shards(
                 continue
 
             try:
-                sample = featurize(obs, vocab, action, value_target=value_target, sample_weight=1.0)
+                sample = featurize(obs, vocab, action, value_target=value_target,
+                                   sample_weight=1.0,
+                                   engine_card_features=engine_card_features,
+                                   engine_attack_features=engine_attack_features)
             except (ValueError, TypeError, KeyError) as exc:
                 logger.debug("Skipping sample %s/%d/%d: %s", eid, p, step_i, exc)
                 continue
@@ -482,8 +497,7 @@ def build_shards(
                         state=state,
                         your_index=int(your_index),
                         opp_deck=opp_deck,
-                        id_to_index=vocab["id_to_index"],
-                        vocab_size=vocab["size"],
+                        n_all_cards=_n_all_cards,
                         opp_arch_index=opp_arch_contig,
                         opp_hand_ids=hand_after(opp_hands, step_i),
                     )

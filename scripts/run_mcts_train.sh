@@ -14,10 +14,54 @@ set -euo pipefail
 
 # ── Repo root ────────────────────────────────────────────────────────────
 cd "$(cd "$(dirname "$0")/.." && pwd)"
-
 # ── 牌組選擇 ─────────────────────────────────────────────────────────────
 ARCH="${1:-a0}"
-IL_CKPT="checkpoints_${ARCH}/ckpt-best.pt"        # 相對於 python/
+
+# ── 基本路徑 (所有路徑相對於 python/) ───────────────────────────────────
+DATA_DIR="data"
+OUT_DIR="checkpoints_${ARCH}_mcts"
+IL_CKPT="checkpoints_${ARCH}/ckpt-best.pt"
+
+# ── IL 訓練（先跑 IL 再 MCTS；設 TRAIN_IL=1 啟用）─────────────────────────
+TRAIN_IL=0                  # 預設關閉，直接使用現有 checkpoint
+D_MODEL=256
+LAYERS=10
+HEADS=8
+FF=1024
+DROPOUT=0.1
+IL_BATCH_SIZE=512             # 大模型需降 batch（10層 × 512 ≈ 原 4層 × 2048）
+IL_EPOCHS=200
+IL_PEAK_LR=0.0003
+IL_WARMUP=1000
+IL_MIN_LR=0.00003
+IL_WEIGHT_DECAY=0.01
+
+# ── IL 訓練 ────────────────────────────────────────────────────────────────
+if [[ "$TRAIN_IL" == "1" ]]; then
+    cd python/
+    IL_OUT="${OUT_DIR}_il"
+    echo "=== Training IL from scratch: ${ARCH} ==="
+    echo "  d_model=$D_MODEL  layers=$LAYERS  heads=$HEADS  ff=$FF"
+    uv run python -m ptcg_il.cli train \
+        --data-dir "$DATA_DIR" \
+        --out-dir "$IL_OUT" \
+        --archetype-self 0 \
+        --d-model "$D_MODEL" \
+        --layers "$LAYERS" \
+        --heads "$HEADS" \
+        --ff "$FF" \
+        --dropout "$DROPOUT" \
+        --batch-size "$IL_BATCH_SIZE" \
+        --epochs "$IL_EPOCHS" \
+        --peak-lr "$IL_PEAK_LR" \
+        --warmup "$IL_WARMUP" \
+        --min-lr "$IL_MIN_LR" \
+        --weight-decay "$IL_WEIGHT_DECAY"
+    IL_CKPT="${IL_OUT}/ckpt-best.pt"
+    echo "  IL done: $IL_CKPT"
+    cd ..
+
+fi
 
 if [[ ! -f "python/$IL_CKPT" ]]; then
     echo "找不到 python/$IL_CKPT" >&2
@@ -26,42 +70,45 @@ if [[ ! -f "python/$IL_CKPT" ]]; then
     exit 1
 fi
 
-# ── 基本路徑 (所有路徑相對於 python/) ───────────────────────────────────
-DATA_DIR="data"
-OUT_DIR="checkpoints_${ARCH}_mcts"
-
 # ── MCTS 搜尋參數 ────────────────────────────────────────────────────────
-ALL_ARCHETYPES=1            # 1=全部 179 牌組, 0=只用 6 個 𝒟_opp
-MCTS_ITERATIONS=64          # PUCT iterations per tree (推論用較低)
+ALL_ARCHETYPES=1            # 1=全部 179 牌組, 0=先用 6 個 𝒟_opp 測試
+N_WORKERS=16                # RolloutPool 並行遊戲數 (libcg 實例)
+FORWARD_BATCH=4096            # GPU forward batch size
+MCTS_ITERATIONS=64          # PUCT iterations per tree
 MCTS_C_PUCT=2.0             # PUCT exploration constant
 MCTS_K_DET=4                # Determinizations per root (已知對手牌組,不需要 K=8)
-MCTS_LEAF_BATCH=512         # GPU forward batch size
-MCTS_RHO=0.05               # ρ: 多少比例的決策點要跑 MCTS
-MCTS_N_ENGINES=4            # libcg 並行數
+MCTS_LEAF_BATCH=4096         # MCTS GPU forward batch size
+MCTS_RHO=1.0               # ρ: 多少比例的決策點要跑 MCTS
+MCTS_N_ENGINES=20            # MCTS libcg 並行數
 
 # ── Replay buffer ────────────────────────────────────────────────────────
-BUFFER_CAPACITY=100000      # 最大容量 (決策點數)
-MIN_BUFFER=10000            # 開始訓練的最小 buffer 量
+BUFFER_CAPACITY=100000      # 最大容量 (決策點數) — ~1.2 GB
+MIN_BUFFER=1000            # 開始訓練的最小 buffer 量
 
 # ── 訓練參數 ─────────────────────────────────────────────────────────────
-TOTAL_GAMES=5000            # 總自我對弈場數
-GAMES_PER_ITER=50           # 每輪自我對弈場數
+TOTAL_GAMES=500000           # 總自我對弈場數
+GAMES_PER_ITER=1000           # 每輪自我對弈場數
 TRAIN_STEPS_PER_ITER=200    # 每輪訓練步數
-BATCH_SIZE=256
-LR=0.0001                   # 學習率 (fine-tuning, 低於 IL 的 3e-4)
+BATCH_SIZE=1024
+LR=0.00002                   # 學習率 (fine-tuning, 低於 IL 的 3e-4)
 C_VALUE=0.5                 # Value loss 權重
 C_PI=1.0                    # Policy CE loss 權重
-GRAD_CLIP=1.0
+GRAD_CLIP=0.5
 
 # ── League 評估 ───────────────────────────────────────────────────────────
 EVAL_GAMES=100              # 每個對手的對戰場數
-EVAL_EVERY_GAMES=250        # 每多少場自我對弈評估一次
+EVAL_EVERY_GAMES=100        # 每多少場自我對弈評估一次
 GATE_SCORE=0.70             # 對所有對手的最低勝率門檻
-MAX_CHAMPIONS=10            # 最多保留幾個 champion
+MAX_CHAMPIONS=8             # 最多保留幾個 champion（超過則淘汰最低 ELO）
 
 # ── 其他 ─────────────────────────────────────────────────────────────────
 SEED=0
-DEVICE="${DEVICE:-cuda}"    # 可透過環境變數覆蓋
+DEVICE="${DEVICE:-cuda}"
+
+# ── W&B logging ──────────────────────────────────────────────────────────
+WANDB_ENABLED=1             # 1=啟用, 0=關閉
+WANDB_PROJECT="pokemon-tcg-mcts"
+WANDB_ENTITY="poken"
 
 # ── 編譯 Rust MCTS library ──────────────────────────────────────────────
 RUST_DIR="python/ptcg_search"
@@ -92,8 +139,11 @@ exec uv run python -m ptcg_rl.mcts_train \
     --iterations "$MCTS_ITERATIONS" \
     --c-puct "$MCTS_C_PUCT" \
     --k-determinizations "$MCTS_K_DET" \
+    --n-workers "$N_WORKERS" \
+    --forward-batch "$FORWARD_BATCH" \
     --leaf-batch "$MCTS_LEAF_BATCH" \
     --rho "$MCTS_RHO" \
+    --mcts-distill \
     --n-engines "$MCTS_N_ENGINES" \
     --buffer-capacity "$BUFFER_CAPACITY" \
     --min-buffer "$MIN_BUFFER" \
@@ -105,10 +155,13 @@ exec uv run python -m ptcg_rl.mcts_train \
     --c-value "$C_VALUE" \
     --c-pi "$C_PI" \
     --grad-clip "$GRAD_CLIP" \
-    $([ "$ALL_ARCHETYPES" = "1" ] && echo "--all-archetypes" || echo "--no-all-archetypes") \
+    $([ "$ALL_ARCHETYPES" = "1" ] && echo "--all-archetypes") \
     --eval-games "$EVAL_GAMES" \
     --eval-every-games "$EVAL_EVERY_GAMES" \
     --gate-score "$GATE_SCORE" \
     --max-champions "$MAX_CHAMPIONS" \
     --seed "$SEED" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    $([ "$WANDB_ENABLED" = "1" ] && echo "--wandb" || echo "--no-wandb") \
+    --wandb-project "$WANDB_PROJECT" \
+    --wandb-entity "$WANDB_ENTITY"

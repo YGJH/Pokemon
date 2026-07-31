@@ -123,15 +123,17 @@ def test_main_reports_insufficient_data_cleanly(monkeypatch, capsys, tmp_path):
 
 
 def _stamped_data_dir(tmp_path, config, summary=None):
-    """A data dir holding mine's four outputs plus a matching fresh stamp."""
+    """A data dir holding every mine output plus a matching fresh stamp."""
     from ptcg_mine import stamp
 
     data = config.out_dir
     data.mkdir(parents=True, exist_ok=True)
     (data / "vocab.json").write_text('{"size": 296}')
     (data / "archetypes.json").write_text('{"self_ids": [0]}')
-    (data / "card_static_table.npy").write_bytes(b"card")
-    (data / "attack_static_table.npy").write_bytes(b"atk")
+    for rel in stamp.STAGES["mine"].outputs:
+        p = data / rel
+        if not p.exists():
+            p.write_bytes(rel.encode())
     stamp.write("mine", raw_dir=config.raw_dir, data_dir=data,
                 params=stamp.params_from_config("mine", config),
                 summary=summary or {"vocab_size": 296, "n_attacks": 216,

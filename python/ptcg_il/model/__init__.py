@@ -19,7 +19,7 @@ def MLP(in_features: int, hidden_features: int, out_features: int, dropout: floa
     )
 
 
-from ptcg_il.model.cards import CardEncoder, AttackEncoder  # noqa: E402, F401
+from ptcg_il.model.cards import CardFeaturizer, AttackFeaturizer  # noqa: E402, F401
 from ptcg_il.model.embed import TokenEmbedder  # noqa: E402, F401
 from ptcg_il.model.encoder import Encoder  # noqa: E402, F401
 from ptcg_il.model.pointer import PointerHead  # noqa: E402, F401
@@ -46,8 +46,8 @@ def init_weights(module: nn.Module, std: float = 0.02) -> None:
 
 __all__ = [
     "MLP",
-    "CardEncoder",
-    "AttackEncoder",
+    "CardFeaturizer",
+    "AttackFeaturizer",
     "TokenEmbedder",
     "Encoder",
     "PointerHead",

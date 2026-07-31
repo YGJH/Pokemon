@@ -239,7 +239,17 @@ pub(crate) fn select_leaf(
 /// * `leaf_idx` — index of the leaf node (must match the last node on the
 ///   selection path from `select_leaf`).
 /// * `priors` — P(s, a) for each legal option, should sum to ~1.0.
-/// * `value` — V(s) ∈ [-1, 1] from the NN value head.
+/// * `value` — V(s) ∈ [-1, 1] from the NN value head, **in the perspective of
+///   the player to move at this leaf**.  This function re-orients it into the
+///   root player's frame before backup; callers must not pre-negate.
+///
+///   The network cannot supply a root-relative value: every observation it
+///   sees is egocentric (the featurizer indexes every zone as
+///   `[your_index, 1 - your_index]`), so "this is the opponent's node" is not
+///   expressible in its input — it is a relation to a search root the network
+///   knows nothing about.  The tree owns `player_role`, so the tree owns the
+///   flip.
+///
 /// * `leaf_obs_json` — cached observation at the leaf (before any search_step).
 ///
 /// After expansion:
@@ -253,12 +263,18 @@ pub(crate) fn expand_leaf(
     value: f64,
     leaf_obs_json: String,
 ) -> Result<(), String> {
+    // Role of the player to move at this leaf: 0 = us (root player), 1 = them.
+    let player_role = tree.nodes[leaf_idx].player_role;
+    // Re-orient the NN value into the root player's frame.  `terminal_value`
+    // is exempt: it is already computed against `tree.our_player_index`.
+    let oriented = if player_role == 1 { -value } else { value };
+
     // ── Store priors on the leaf ─────────────────────────────────────────
     {
         let leaf = &tree.nodes[leaf_idx];
         if leaf.is_terminal {
             // Terminal: use the terminal value, don't expand children.
-            let tv = leaf.terminal_value.unwrap_or(value);
+            let tv = leaf.terminal_value.unwrap_or(oriented);
             backpropagate(tree, tv);
             tree.iter_count += 1;
             return Ok(());
@@ -267,7 +283,6 @@ pub(crate) fn expand_leaf(
 
     // Collect info needed for child creation
     let n_options = tree.nodes[leaf_idx].n_options;
-    let player_role = tree.nodes[leaf_idx].player_role;
 
     // Create placeholder children (no search_id yet — lazy creation).
     // The child at index `i` corresponds to option `i`.
@@ -298,7 +313,7 @@ pub(crate) fn expand_leaf(
     }
 
     // ── Backpropagate ───────────────────────────────────────────────────
-    backpropagate(tree, value);
+    backpropagate(tree, oriented);
 
     tree.iter_count += 1;
     Ok(())

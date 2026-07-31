@@ -2,11 +2,12 @@
 
 Layout is exact Appendix A.3 (feature slices) / A.2 (normalizers) of
 TRANSFORMER_IL_SPEC.md:
-  card_static_row[52]  = [hp/HP_N, retreat/RETREAT_N, cardType-onehot(7),
+  card_static_row[94]  = base[52] + 3 × attack_static_row[14]
+  base[52]             = [hp/HP_N, retreat/RETREAT_N, cardType-onehot(7),
                           stage-onehot(3), energyType-onehot(12),
                           weakness-onehot(12), resistance-onehot(12),
                           [ex, megaEx, tera, aceSpec](4)]
-  attack_static_row[14] = [damage/ATKDMG_N, energy-cost histogram(12),
+  attack_static_row[14] = [damage/ATKDMG_N, energy-cost histogram(12)/ATKCOST_N,
                            len(energies)/ATKCOST_N]
 
 Engine access: `all_card_data()` / `all_attack()` live in the bundled `cg`
@@ -27,7 +28,7 @@ ATKCOST_N = 5.0
 N_CARDTYPE = 7
 N_ENERGY = 12
 
-F_CARD = 52
+F_CARD = 94  # 52 base + 3 attacks × 14
 F_ATK = 14
 
 _ENGINE_DIR = (
@@ -57,9 +58,19 @@ def _onehot(index: int | None, size: int) -> np.ndarray:
     return vec
 
 
-def card_static_row(card) -> np.ndarray:
-    """float32[52] static feature row for a CardData, per Appendix A.3."""
+def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
+    """float32[94] static feature row for a CardData.
+
+    Layout: 52 base features + 3 attacks × 14 (damage, energy cost, cost count).
+    Attacks beyond the card's actual attacks are zero-padded.
+
+    ``card.attacks`` holds attack *ids*, not Attack objects, so *attacks_by_id*
+    (``{attackId: Attack}``) is required to resolve them.  It is a required
+    argument on purpose: defaulting it to ``{}`` would silently emit a 94-dim
+    row whose attack half is all zeros, which no assertion downstream catches.
+    """
     row = np.zeros(F_CARD, dtype=np.float32)
+    # Base features (0:52)
     row[0] = card.hp / HP_N
     row[1] = card.retreatCost / RETREAT_N
     row[2:9] = _onehot(card.cardType, N_CARDTYPE)
@@ -68,27 +79,46 @@ def card_static_row(card) -> np.ndarray:
     row[24:36] = _onehot(card.weakness, N_ENERGY)
     row[36:48] = _onehot(card.resistance, N_ENERGY)
     row[48:52] = [float(card.ex), float(card.megaEx), float(card.tera), float(card.aceSpec)]
+    # Attack features (52:94) — up to 3 attacks, each 14-dim, same layout as
+    # attack_static_row so the two views of an attack cannot drift apart.
+    attack_ids = getattr(card, "attacks", []) or []
+    for ai in range(min(len(attack_ids), 3)):
+        atk = attacks_by_id.get(int(attack_ids[ai]))
+        if atk is None:
+            continue
+        offset = 52 + ai * F_ATK
+        row[offset:offset + F_ATK] = attack_static_row(atk)
     return row
 
 
 def attack_static_row(attack) -> np.ndarray:
-    """float32[14] static feature row for an Attack, per Appendix A.3."""
+    """float32[14] static feature row for an Attack, per Appendix A.3.
+
+    The energy-cost histogram is divided by ``ATKCOST_N``, matching the
+    ``count/ENERGY_N`` treatment the featurizer already gives the *attached*
+    energy histogram in ``poke_feat[3:15]``.  Spec A.3 originally wrote this
+    histogram with no divisor while A.1 divided the other one, which left raw
+    counts up to 5.0 sitting in 36 of the 94 card-feature dims next to
+    everything else in [0, 1].  ``ATKCOST_N`` rather than ``ENERGY_N`` because
+    a cost is bounded by its own total, which ``row[13]`` already normalizes
+    the same way -- the two halves of the cost then share one scale.
+    """
     row = np.zeros(F_ATK, dtype=np.float32)
     row[0] = attack.damage / ATKDMG_N
     hist = np.zeros(N_ENERGY, dtype=np.float32)
     for e in attack.energies:
         assert int(e) < N_ENERGY, f"attack energy index {e} >= N_ENERGY={N_ENERGY}"
         hist[int(e)] += 1.0
-    row[1:13] = hist
+    row[1:13] = hist / ATKCOST_N
     row[13] = len(attack.energies) / ATKCOST_N
     return row
 
 
 def build_static_tables(vocab: dict, card_data: list, attack_data: list):
-    """Build the [V,52] card table and [A,14] attack table for the given vocab.
+    """Build the [V,94] card table and [A,14] attack table for the given vocab.
 
     Returns (card_table, attack_id_to_index, attack_table):
-      - card_table[V,52] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
+      - card_table[V,94] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
         in-vocab card rows), rows 2..V-1 = card_static_row(card) per vocab id.
       - attack_id_to_index: {attackId: index}, index >= 1 (0 is PAD).
       - attack_table[A,14] float32: row 0 = PAD (zeros); A = 1 + number of
@@ -105,7 +135,7 @@ def build_static_tables(vocab: dict, card_data: list, attack_data: list):
         cid = index_to_id[idx]
         card = cards_by_id.get(cid)
         if card is not None:
-            card_table[idx] = card_static_row(card)
+            card_table[idx] = card_static_row(card, attacks_by_id)
     if v_size > 2:
         card_table[1] = card_table[2:].mean(axis=0)
 
@@ -129,3 +159,21 @@ def build_static_tables(vocab: dict, card_data: list, attack_data: list):
             attack_table[idx] = attack_static_row(attack)
 
     return card_table, attack_id_to_index, attack_table
+
+
+def build_engine_card_features(card_data: list,
+                               attack_data: list) -> dict[int, np.ndarray]:
+    """Build ``{card_id: static_row_94}`` for ALL engine cards.
+
+    Unlike :func:`build_static_tables` which only covers vocab cards, this
+    dict maps every card the engine knows about to its 94-dim static
+    features.  Used at inference time to represent every card purely by its
+    features (no learned id embeddings).
+    """
+    attacks_by_id = {a.attackId: a for a in attack_data}
+    return {c.cardId: card_static_row(c, attacks_by_id) for c in card_data}
+
+
+def build_engine_attack_features(attack_data: list) -> dict[int, np.ndarray]:
+    """Build ``{attack_id: static_row_14}`` for ALL engine attacks."""
+    return {a.attackId: attack_static_row(a) for a in attack_data}

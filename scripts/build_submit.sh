@@ -1,6 +1,9 @@
 #!/bin/bash
 # 打包 Kaggle 提交檔。
 #
+# 預設自動挑選 ELO 最高的模型（從 elo_ratings.json 讀取），找不到才退回
+# ckpt-best.pt。也可以手動指定 checkpoint 路徑。
+#
 # checkpoint 一定要是「用現在這份 python/data 訓練出來的」那一個。
 # archetype id 只是分群索引，重跑 mine 就會重新編號，所以 checkpoints_a<N>/
 # 的 N 不代表任何固定的牌組 —— 舊語料留下來的目錄看起來完全正常，卻是對著
@@ -8,9 +11,10 @@
 # vocab/archetypes sha1，對不上就中止，而不是打包出一個「跑得完但幾乎全輸」
 # 的 bundle。
 #
-# 要打包哪一副牌用第一個參數指定，預設 a0（資料量最大的那副）:
-#   ./scripts/build_submit.sh          # checkpoints_a0
-#   ./scripts/build_submit.sh a1       # checkpoints_a1
+# 用法:
+#   ./scripts/build_submit.sh                         # a0, 自動選最高 ELO
+#   ./scripts/build_submit.sh a1                      # a1, 自動選最高 ELO
+#   ./scripts/build_submit.sh a0 path/to/ckpt.pt      # 手動指定 checkpoint
 #
 # 會自動編譯 Rust MCTS library (libptcg_search.so) 並打包進 submission。
 # 如果 cargo 找不到，會跳過並在 submission 中使用 greedy fallback。
@@ -18,7 +22,63 @@
 set -euo pipefail
 
 ARCH="${1:-a0}"
-CKPT="python/checkpoints_${ARCH}/ckpt-best.pt"
+EXPLICIT_CKPT="${2:-}"
+
+IL_DIR="python/checkpoints_${ARCH}"
+MCTS_DIR="python/checkpoints_${ARCH}_mcts"
+ELO_FILE="${MCTS_DIR}/elo_ratings.json"
+
+if [[ -n "$EXPLICIT_CKPT" ]]; then
+    # ── 手動指定 checkpoint ─────────────────────────────────────────────
+    CKPT="$EXPLICIT_CKPT"
+    echo "使用指定的 checkpoint: $CKPT"
+elif [[ -f "$ELO_FILE" ]]; then
+    # ── 從 elo_ratings.json 挑選 ELO 最高的模型 ─────────────────────────
+    # Python 把結果寫到 stdout（只有路徑或 FALLBACK），其他資訊寫到 stderr
+    CKPT=$(uv run python -c "
+import json, sys
+from pathlib import Path
+
+elo_path = Path('$ELO_FILE')
+data = json.loads(elo_path.read_text())
+ratings = data.get('ratings', {})
+fixed = set(data.get('fixed', []))
+
+candidates = [(r, n) for n, r in ratings.items() if n not in fixed]
+if not candidates:
+    print('FALLBACK')
+    sys.exit(0)
+
+candidates.sort(reverse=True)
+best_elo, best_name = candidates[0]
+print(f'ELO 最高: {best_name} ({best_elo:.0f})', file=sys.stderr)
+
+# 找出實際檔案路徑
+il_dir = Path('$IL_DIR')
+mcts_dir = Path('$MCTS_DIR')
+for d in (mcts_dir, il_dir):
+    p = d / f'{best_name}.pt'
+    if p.exists():
+        print(str(p))
+        sys.exit(0)
+
+# 找不到檔案，列出搜尋過的目錄
+print(f'找不到 ELO 最高模型 {best_name} 的檔案', file=sys.stderr)
+print(f'  搜尋過: {mcts_dir}, {il_dir}', file=sys.stderr)
+print('FALLBACK')
+")
+
+    if [[ "$CKPT" == "FALLBACK" ]] || [[ -z "$CKPT" ]]; then
+        CKPT="${IL_DIR}/ckpt-best.pt"
+        echo "自動選擇失敗，退回 $CKPT"
+    else
+        echo "自動選擇 ELO 最高模型: $CKPT"
+    fi
+else
+    # ── 沒有 ELO 檔案，退回 ckpt-best ───────────────────────────────────
+    CKPT="${IL_DIR}/ckpt-best.pt"
+    echo "沒有 ELO 資料 ($ELO_FILE 不存在)，退回 $CKPT"
+fi
 
 if [[ ! -f "$CKPT" ]]; then
     echo "找不到 $CKPT" >&2

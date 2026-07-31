@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ptcg_mine.cards import ATKCOST_N, ATKDMG_N, HP_N, RETREAT_N
 
-F_CARD = 52
+F_CARD = 94  # 52 base + 3 attacks × 14
 F_ATK = 14
 F_POKE = 26
 F_HAND = 2

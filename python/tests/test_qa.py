@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ptcg_il.featurizer import F_CARD
 from ptcg_il.qa import (
     CARDTYPE_BASIC_ENERGY,
     balance_report,
@@ -21,6 +22,15 @@ from ptcg_il.qa import (
     check_variable_length_multi_select,
     run_qa_checks,
 )
+
+
+def _card_row(seed: int) -> np.ndarray:
+    """A distinct, reproducible ``opt_card_feat`` row standing in for one card.
+
+    The collision check compares feature *rows*, so what matters is that
+    different cards get different rows and the same card gets the same one.
+    """
+    return np.full(F_CARD, float(seed), dtype=np.float32)
 
 
 # ============================================================
@@ -80,33 +90,33 @@ def test_oov_curve_single_card():
 # ============================================================
 
 
-def test_variable_length_none():
+def test_variable_length_none(tmp_path):
     meta = pd.DataFrame({
         "maxCount": [1, 1, 1],
         "minCount": [1, 1, 1],
     })
-    result = check_variable_length_multi_select(meta)
+    result = check_variable_length_multi_select(tmp_path, meta)
     assert result["n_variable_length"] == 0
     assert result["variable_length_share"] == 0.0
 
 
-def test_variable_length_some():
+def test_variable_length_some(tmp_path):
     meta = pd.DataFrame({
         "maxCount": [1, 3, 3, 3, 1],
         "minCount": [1, 1, 3, 1, 1],
     })
-    result = check_variable_length_multi_select(meta)
+    result = check_variable_length_multi_select(tmp_path, meta)
     # 3 multi-select rows, 2 have minCount < maxCount
     assert result["n_variable_length"] == 2
     assert result["variable_length_share"] == pytest.approx(2 / 3)
 
 
-def test_variable_length_all_same():
+def test_variable_length_all_same(tmp_path):
     meta = pd.DataFrame({
         "maxCount": [3, 3, 5, 5],
         "minCount": [3, 3, 5, 5],
     })
-    result = check_variable_length_multi_select(meta)
+    result = check_variable_length_multi_select(tmp_path, meta)
     assert result["n_variable_length"] == 0
 
 
@@ -120,29 +130,30 @@ def test_attachment_collision_no_collisions(tmp_path):
     S, O = 2, 64
     opt_type = np.zeros((S, O), dtype=np.int64)
     opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.zeros((S, O), dtype=np.int64)
+    opt_card = np.zeros((S, O, F_CARD), dtype=np.float32)
     opt_mask = np.zeros((S, O), dtype=bool)
 
-    # Sample 0: two ENERGY options on different pokemon
+    # Sample 0: two ENERGY options on different pokemon (same card features,
+    # different source — distinguishable)
     opt_type[0, 0] = 6  # ENERGY
     opt_type[0, 1] = 6
     opt_src[0, 0] = 1
     opt_src[0, 1] = 7
-    opt_card[0, 0] = 42
-    opt_card[0, 1] = 42
+    opt_card[0, 0] = _card_row(42)
+    opt_card[0, 1] = _card_row(42)
     opt_mask[0, :2] = True
 
     # Sample 1: CARD attachment
     opt_type[1, 0] = 3  # CARD
     opt_src[1, 0] = 1
-    opt_card[1, 0] = 99
+    opt_card[1, 0] = _card_row(99)
     opt_mask[1, :1] = True
 
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_id=opt_card, opt_mask=opt_mask)
+                        opt_card_feat=opt_card, opt_mask=opt_mask)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"] * S, "row": [0, 1]})
     result = check_attachment_collision(shard_dir, meta)
@@ -151,27 +162,27 @@ def test_attachment_collision_no_collisions(tmp_path):
 
 
 def test_attachment_collision_with_collisions(tmp_path):
-    """Two ENERGY options on the same pokemon with the same card id."""
+    """Two ENERGY options on the same pokemon with the same card features."""
     S, O = 1, 64
     opt_type = np.zeros((S, O), dtype=np.int64)
     opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.zeros((S, O), dtype=np.int64)
+    opt_card = np.zeros((S, O, F_CARD), dtype=np.float32)
     opt_mask = np.zeros((S, O), dtype=bool)
 
-    # Two identical options: same src, same card id
+    # Two identical options: same src, same card features
     opt_type[0, 0] = 6
     opt_type[0, 1] = 6
     opt_src[0, 0] = 1
     opt_src[0, 1] = 1  # same source!
-    opt_card[0, 0] = 9
-    opt_card[0, 1] = 9  # same card!
+    opt_card[0, 0] = _card_row(9)
+    opt_card[0, 1] = _card_row(9)  # same card!
     opt_mask[0, :2] = True
 
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_id=opt_card, opt_mask=opt_mask)
+                        opt_card_feat=opt_card, opt_mask=opt_mask)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"], "row": [0]})
     result = check_attachment_collision(shard_dir, meta)

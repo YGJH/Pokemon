@@ -49,8 +49,8 @@ _POINTER_KEYS = (
     "opt_type",
     "opt_src_idx",
     "opt_tgt_idx",
-    "opt_card_id",
-    "opt_attack_idx",
+    "opt_card_feat",
+    "opt_attack_feat",
     "opt_scalar",
     "opt_mask",
 )

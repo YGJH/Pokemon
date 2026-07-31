@@ -343,38 +343,62 @@ def _belief_weights(args: argparse.Namespace) -> dict[str, float] | None:
     return {name: float(getattr(args, f"belief_{name[2:]}")) for name in BELIEF_WEIGHTS}
 
 
-def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
-    """Create a Policy module from artifact sizes and CLI args."""
+def _load_all_card_feat(data_dir: Path) -> Any:
+    """``[n_all_cards, F_CARD]`` static features for every engine card.
+
+    The belief heads score against every card the engine knows about, so they
+    need this matrix; ``BeliefHeads.forward`` raises without it rather than
+    scoring against randomly-initialised rows.  Indexed by raw engine card id,
+    so row 0 and any gap stay zero (PAD).
+    """
+    import numpy as np
     import torch
+
+    from ptcg_il.featurizer import F_CARD
+
+    ecf_path = Path(data_dir) / "engine_card_features.npy"
+    if not ecf_path.exists():
+        return None
+    ecf = np.load(ecf_path, allow_pickle=True).item()
+    if not ecf:
+        return None
+    max_id = max(int(cid) for cid in ecf)
+    all_feat = torch.zeros(max_id + 1, F_CARD)
+    for cid, feat in ecf.items():
+        all_feat[int(cid)] = torch.from_numpy(np.asarray(feat, dtype=np.float32))
+    return all_feat
+
+
+def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
+    """Create a Policy module from artifact sizes and CLI args.
+
+    There is no vocab width to pass: cards reach the model purely as static
+    feature vectors (``CardFeaturizer``), so the only card-derived shape is
+    ``n_all_cards`` for the belief heads' output width.
+    """
     from ptcg_il.model.policy import Policy
 
-    V = artifacts["vocab_size"]
-    A = artifacts["attack_size"]
-
-    # Try to load static tables from data_dir if available
-    import numpy as np
-
-    card_static = None
-    attack_static = None
-    card_table_path = Path(args.data_dir) / "card_static_table.npy"
-    attack_table_path = Path(args.data_dir) / "attack_static_table.npy"
-    if card_table_path.exists():
-        card_static_np = np.load(card_table_path)
-        card_static = torch.from_numpy(card_static_np).float()
-    if attack_table_path.exists():
-        attack_static_np = np.load(attack_table_path)
-        attack_static = torch.from_numpy(attack_static_np).float()
+    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+    n_all_cards = int(all_card_feat.shape[0]) if all_card_feat is not None else 0
+    if all_card_feat is None:
+        # The belief heads raise without it; say so here rather than at the
+        # first forward pass, several minutes into a run.
+        logger.warning(
+            "no engine_card_features.npy in %s — belief heads will have no "
+            "card matrix", args.data_dir,
+        )
+    else:
+        logger.info("all_card_feat: %d cards x %d features",
+                    n_all_cards, int(all_card_feat.shape[1]))
 
     policy = Policy(
-        V=V,
-        A=A,
         D=args.d_model,
         heads=args.heads,
         layers=args.layers,
         ff=args.ff,
-        card_static_table=card_static,
-        attack_static_table=attack_static,
         n_opp_arch=artifacts.get("n_opp_arch", 0),
+        n_all_cards=n_all_cards,
+        all_card_feat=all_card_feat,
     )
     # Apply spec B.8 weight init (trunc_normal std=0.02 for Linear/Embedding weights)
     from ptcg_il.model import init_weights
@@ -469,13 +493,12 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Build policy
     logger.info(
-        "Building Policy(V=%d, A=%d, D=%d, heads=%d, layers=%d, ff=%d)",
-        artifacts["vocab_size"],
-        artifacts["attack_size"],
+        "Building Policy(D=%d, heads=%d, layers=%d, ff=%d, n_opp_arch=%d)",
         args.d_model,
         args.heads,
         args.layers,
         args.ff,
+        artifacts.get("n_opp_arch", 0),
     )
     policy = _build_policy(artifacts, args)
 
