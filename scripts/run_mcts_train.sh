@@ -93,7 +93,17 @@ BATCH_SIZE=1024
 LR=0.00002                   # 學習率 (fine-tuning, 低於 IL 的 3e-4)
 C_VALUE=0.5                 # Value loss 權重
 C_PI=1.0                    # Policy CE loss 權重
-GRAD_CLIP=0.5
+# 30, not 0.5.  Measured over a real a1 run, raw grad norms ranged 4.87–34.93
+# (median 12.68), so a 0.5 clip bound on **100%** of steps and rescaled each one
+# by a different factor between 10x and 70x.  That does not merely discard
+# gradient magnitude, it inverts it: every step leaves the clip at norm 0.5, so
+# the batch carrying 7x more signal was divided 7x harder.  |g|=15 is also not
+# large for this model — at 14.4M params it is a per-parameter RMS of 4e-3,
+# while the clipped 0.5 is 1.3e-4.  Step size does not grow from this change:
+# AdamW is scale-invariant in steady state (m and sqrt(v) both scale with the
+# gradient), so a constant clip is nearly a no-op and `lr` still sets the step.
+# Tune against train/grad_clip_frac — aim for 0.05–0.10, not 1.0.
+GRAD_CLIP=30
 
 # ── League 評估 ───────────────────────────────────────────────────────────
 EVAL_GAMES=100              # 每個對手的對戰場數

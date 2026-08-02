@@ -158,27 +158,28 @@ def _discover_all_checkpoints(il_ckpt_path: str, out_dir: Path) -> list[tuple[st
 
     Returns ``[(name, path), ...]``.  ``ckpt-best`` is always first.
     """
-    ckpt_dir = Path(il_ckpt_path).resolve().parent
-    result: list[tuple[str, str]] = []
+    # ckpt_dir = Path(il_ckpt_path).resolve().parent
+    # result: list[tuple[str, str]] = []
+    result = [(str(i.name), str(i)) for i in Path(il_ckpt_path).glob('*.pt')]
+    result.extend([(str(i.name), str(i)) for i in Path(out_dir).glob('*.pt')])
+    # # ckpt-best first (the reference)
+    # best = ckpt_dir / "ckpt-best.pt"
+    # if best.exists():
+    #     result.append(("ckpt-best", str(best)))
 
-    # ckpt-best first (the reference)
-    best = ckpt_dir / "ckpt-best.pt"
-    if best.exists():
-        result.append(("ckpt-best", str(best)))
+    # # Step checkpoints from IL directory
+    # for p in sorted(ckpt_dir.glob("ckpt-step-*.pt")):
+    #     result.append((p.stem, str(p)))
 
-    # Step checkpoints from IL directory
-    for p in sorted(ckpt_dir.glob("ckpt-step-*.pt")):
-        result.append((p.stem, str(p)))
+    # # MCTS champions from output directory
+    # for p in sorted(out_dir.glob("ckpt-mcts-champion-*.pt")):
+    #     result.append((p.stem, str(p)))
 
-    # MCTS champions from output directory
-    for p in sorted(out_dir.glob("ckpt-mcts-champion-*.pt")):
-        result.append((p.stem, str(p)))
-
-    # ckpt-last from IL directory
-    last = ckpt_dir / "ckpt-last.pt"
-    if last.exists():
-        result.append(("ckpt-last", str(last)))
-
+    # # ckpt-last from IL directory
+    # last = ckpt_dir / "ckpt-last.pt"
+    # if last.exists():
+    #     result.append(("ckpt-last", str(last)))
+    print(f'result : {result}')
     return result
 
 

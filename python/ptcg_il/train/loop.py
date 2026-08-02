@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 
 from ptcg_il.deck import build_deck_metadata
 from ptcg_il.deck import describe as describe_deck
-from ptcg_il.deck import update_sidecar, write_deck_csv
+from ptcg_il.deck import require_deck_record, update_sidecar, write_deck_csv
 from ptcg_il.belief_labels import BELIEF_WEIGHTS  # noqa: F401  (re-exported for the CLI)
 from ptcg_il.model.belief import belief_loss
 from ptcg_il.model.policy import Policy, load_policy_state, multiselect_ce
@@ -552,14 +552,17 @@ def train(
 
     # Deck identity — stamped into every checkpoint and the decks.json sidecar
     # so a .pt always says which archetype deck it plays.
-    try:
-        deck_meta = build_deck_metadata(data_dir, archetype_self)
-        logger.info("Training %s", describe_deck(deck_meta))
-    except (FileNotFoundError, KeyError) as e:
-        if archetype_self is not None:
-            raise  # a specialist run without deck metadata is not shippable
-        logger.warning("Could not build deck metadata: %s", e)
-        deck_meta = None
+    # Built before the first batch, not at the first save: a run that cannot
+    # label its checkpoints has nothing shippable to produce, and finding that
+    # out at save time throws away the training that preceded it.  The
+    # generalist used to be exempt (warn, `deck_meta = None`), but its record
+    # is the one that says `is_fixed_deck` — without it a generalist .pt is as
+    # unusable downstream as a specialist's.
+    deck_meta = require_deck_record(
+        build_deck_metadata(data_dir, archetype_self),
+        f"train(archetype_self={archetype_self})",
+    )
+    logger.info("Training %s", describe_deck(deck_meta))
 
     # Build datasets
     train_ds = ShardDataset(
@@ -599,11 +602,10 @@ def train(
 
     # Record the realised sample counts now, before the first checkpoint is
     # written, so every .pt carries them and not just the sidecar.
-    if deck_meta is not None:
-        deck_meta["samples_used"] = {
-            "train": len(train_ds),
-            "val": len(val_ds) if val_ds is not None else 0,
-        }
+    deck_meta["samples_used"] = {
+        "train": len(train_ds),
+        "val": len(val_ds) if val_ds is not None else 0,
+    }
 
     # Steps
     if total_steps is None:
@@ -893,14 +895,13 @@ def train(
 
     # Deck sidecar — same record as the one inside the .pt, but readable
     # without torch, and also emits deck.csv for the submission bundle.
-    if deck_meta is not None:
-        deck_meta["best_val_metric"] = float(best_val_metric)
-        available = [
-            p.name for p in sorted(save_dir.glob("ckpt-*.pt"))
-        ]
-        sidecar = update_sidecar(save_dir, deck_meta, checkpoints=available)
-        write_deck_csv(deck_meta, save_dir / "deck.csv")
-        logger.info("Wrote deck sidecar %s and deck.csv", sidecar)
+    deck_meta["best_val_metric"] = float(best_val_metric)
+    available = [
+        p.name for p in sorted(save_dir.glob("ckpt-*.pt"))
+    ]
+    sidecar = update_sidecar(save_dir, deck_meta, checkpoints=available)
+    write_deck_csv(deck_meta, save_dir / "deck.csv")
+    logger.info("Wrote deck sidecar %s and deck.csv", sidecar)
 
     # Reload best if we had val
     if best_val_metric >= 0:

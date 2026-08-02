@@ -5,6 +5,8 @@
 /// This module provides heuristics to generate plausible guesses from the
 /// current observation.
 
+use std::collections::HashSet;
+
 use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::Value;
@@ -31,11 +33,19 @@ pub struct HiddenGuesses {
 /// * `fixed_deck` — Our 60-card FIXED_DECK (card IDs).
 /// * `opponent_deck_template` — A plausible 60-card opponent deck list.
 ///   If empty, uses a copy of `fixed_deck` as a fallback heuristic.
+/// * `basic_pokemon` — Card ids the engine considers Basic Pokémon, used to
+///   guess a face-down opponent active.  `None` means "unknown", which falls
+///   back to drawing from the whole template — legal-looking but usually
+///   wrong: only ~16% of a template's slots are Basic, so `SearchBegin`
+///   rejects most such guesses with error 2 ("Active card must be the ID of
+///   a Pokémon card").  Callers should supply it; see
+///   `puct_forest_set_basic_pokemon`.
 /// * `rng` — Seeded random number generator for reproducible guesses.
 pub fn build_guesses(
     obs_json: &str,
     fixed_deck: &[i32],
     opponent_deck_template: &[i32],
+    basic_pokemon: Option<&HashSet<i32>>,
     rng: &mut impl Rng,
 ) -> Result<HiddenGuesses, String> {
     let obs: Value =
@@ -182,7 +192,7 @@ pub fn build_guesses(
 
     let opponent_active: Vec<i32> = if opp_active_face_down {
         // Pick a basic Pokémon from the opponent template
-        basic_pokemon_from_deck(&opp_template, rng)
+        basic_pokemon_from_deck(&opp_template, basic_pokemon, rng)
             .map(|id| vec![id])
             .unwrap_or_default()
     } else {
@@ -278,14 +288,37 @@ fn subtract_multiset(deck: &[i32], known: &[i32]) -> Vec<i32> {
 }
 
 /// Pick a basic Pokémon card ID from the given deck template.
-fn basic_pokemon_from_deck(deck: &[i32], rng: &mut impl Rng) -> Option<i32> {
-    // We don't have the static card data here to check `basic` flag.
-    // Common heuristic: return the first card ID from the deck (most decks
-    // are Pokémon-heavy, and the first card is likely a Pokémon).
-    // A better approach would be to accept a pre-computed list of basic Pokémon
-    // IDs, but for v1 this is sufficient.
-    let candidates: Vec<&i32> = deck.iter().collect();
-    candidates.choose(rng).copied().copied()
+/// Guess which card is sitting face-down as the opponent's active.
+///
+/// Only Basic Pokémon can legally be there.  With `basic_pokemon` supplied we
+/// draw from the template's Basic slots; without it we fall back to drawing
+/// from the whole template, which is what this did unconditionally before —
+/// "most decks are Pokémon-heavy" turned out to be false for this corpus
+/// (27.5% Pokémon, 15.6% Basic across the 179 opponent templates), so ~3 in 4
+/// guesses were Trainers or Energy and the engine refused the root.
+fn basic_pokemon_from_deck(
+    deck: &[i32],
+    basic_pokemon: Option<&HashSet<i32>>,
+    rng: &mut impl Rng,
+) -> Option<i32> {
+    if let Some(basics) = basic_pokemon {
+        let candidates: Vec<i32> =
+            deck.iter().copied().filter(|id| basics.contains(id)).collect();
+        if !candidates.is_empty() {
+            return candidates.choose(rng).copied();
+        }
+        // The template holds no Basic at all.  A legal 60-card decklist always
+        // does, but the opponent deck here is *predicted*: the belief chain's
+        // bag-of-cards tier samples cards independently and can produce a
+        // template with none.  Any Basic beats a card the engine will refuse —
+        // it determinizes the wrong Pokémon, where the alternative is losing
+        // the search for this decision entirely.
+        let any_basic: Vec<i32> = basics.iter().copied().collect();
+        if !any_basic.is_empty() {
+            return any_basic.choose(rng).copied();
+        }
+    }
+    deck.choose(rng).copied()
 }
 
 #[cfg(test)]
@@ -337,7 +370,7 @@ mod tests {
         let obs = OBS_MIRROR;
 
         let fixed = (1..=60).collect::<Vec<i32>>();
-        let result = build_guesses(obs, &fixed, &[], &mut rng).unwrap();
+        let result = build_guesses(obs, &fixed, &[], None, &mut rng).unwrap();
 
         assert!(result.opp_active_face_down);
         assert_eq!(result.opponent_active.len(), 1);
@@ -363,7 +396,7 @@ mod tests {
         // Seed-swept: one seed could get lucky, the bug is probabilistic.
         for seed in 0..32u64 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let result = build_guesses(obs, &fixed, &[], &mut rng).unwrap();
+            let result = build_guesses(obs, &fixed, &[], None, &mut rng).unwrap();
 
             let mut all = result.your_deck.clone();
             all.extend(result.your_prize.iter().copied());
@@ -376,5 +409,84 @@ mod tests {
                 "seed {seed}: a card is in both the deck and the prizes"
             );
         }
+    }
+
+    /// A face-down opponent active must be guessed from the Basic Pokémon in
+    /// the template.  Guessing any card meant `SearchBegin` refused ~3 of 4
+    /// roots with error 2 ("Active card must be the ID of a Pokémon card").
+    #[test]
+    fn test_face_down_active_is_drawn_from_basics_only() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        // 4 Basics among 40 slots — the real ratio is ~16%, so a whole-template
+        // draw picks a non-Basic the overwhelming majority of the time.
+        let mut deck: Vec<i32> = (100..136).collect();
+        deck.extend([1, 2, 3, 4]);
+        let basics: HashSet<i32> = [1, 2, 3, 4].into_iter().collect();
+
+        let mut examined = 0;
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let picked = basic_pokemon_from_deck(&deck, Some(&basics), &mut rng)
+                .expect("a deck with Basics must yield one");
+            assert!(basics.contains(&picked), "seed {seed}: picked {picked}, not a Basic");
+            examined += 1;
+        }
+        assert_eq!(examined, 64, "fixture examined nothing");
+    }
+
+    /// Without a Basic set the old whole-template behaviour stands: callers
+    /// that never call `puct_forest_set_basic_pokemon` must keep working.
+    #[test]
+    fn test_no_basic_set_falls_back_to_whole_template() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let deck: Vec<i32> = vec![7, 8, 9];
+        let mut seen: HashSet<i32> = HashSet::new();
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            seen.insert(basic_pokemon_from_deck(&deck, None, &mut rng).unwrap());
+        }
+        assert_eq!(seen.len(), 3, "fallback must still draw from the whole deck");
+    }
+
+    /// A *predicted* opponent deck can hold no Basic at all (the belief
+    /// chain's bag-of-cards tier samples cards independently).  Guessing an
+    /// arbitrary card there is a guaranteed `SearchBegin` error 2, so fall
+    /// back to a known Basic instead — wrong Pokémon beats no search.
+    #[test]
+    fn test_template_without_basics_falls_back_to_a_known_basic() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let deck: Vec<i32> = vec![7, 8, 9]; // none of these are Basic
+        let basics: HashSet<i32> = [900, 901].into_iter().collect();
+        let mut examined = 0;
+        for seed in 0..32u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let picked = basic_pokemon_from_deck(&deck, Some(&basics), &mut rng)
+                .expect("must still return a card");
+            assert!(
+                basics.contains(&picked),
+                "seed {seed}: picked {picked}, which the engine would refuse"
+            );
+            examined += 1;
+        }
+        assert_eq!(examined, 32, "fixture examined nothing");
+    }
+
+    /// With no set at all there is nothing better than the template.
+    #[test]
+    fn test_no_basics_known_still_returns_something() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let deck: Vec<i32> = vec![7, 8, 9];
+        let empty: HashSet<i32> = HashSet::new();
+        let mut rng = StdRng::seed_from_u64(0);
+        let picked = basic_pokemon_from_deck(&deck, Some(&empty), &mut rng);
+        assert!(deck.contains(&picked.expect("must still return a card")));
     }
 }

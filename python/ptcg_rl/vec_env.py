@@ -71,6 +71,13 @@ class Decision:
     turn: int
     """Decision index within the game.  R1 checks that value accuracy rises with
     it; a critic that is no better late than early has learned nothing."""
+    opp_id: int = -1
+    """Archetype id of the opponent deck in *this* battle.
+
+    A pool used to hold one opponent, so the archetype was a property of the
+    whole call; with mixed-opponent pools it varies per battle, and both the
+    seat-1 pilot and the MCTS ``opp_deck_template`` are chosen from it.  ``-1``
+    means the environment did not report one."""
     opp_visible_card_ids: list[int] | None = None
     """Engine card ids of opponent cards visible at this decision point
     (active, bench, discard, face-up prizes).  Feeds the Bayesian
@@ -80,6 +87,17 @@ class Decision:
     Preserved for MCTS distillation (Phase 3d): the determinizer needs
     ``search_begin_input``, ``current``, and ``select`` fields to
     construct search roots."""
+    your_index: int = 0
+    """Engine seat of the player who was to move here (``current.yourIndex``).
+
+    The observation is egocentric — the featurizer indexes every zone as
+    ``[your_index, 1 - your_index]`` — so the seat is *not* recoverable from
+    ``features``, while the engine reward is reported from one fixed seat's
+    perspective.  Without this field a decision cannot be paired with the
+    outcome of the player who actually made it, and the value target for the
+    opposite seat is sign-inverted.  ``puct.rs`` expand_leaf assumes the
+    critic speaks in the perspective of the player to move; this is what lets
+    training honour that contract."""
 
 
 def _extract_opp_visible_card_ids(obs: dict) -> list[int]:
@@ -147,6 +165,8 @@ class Trajectory:
     error: str | None = None
     battle_idx: int = -1
     """Rust battle index — used to match drain results to pending trajectories."""
+    opp_id: int = -1
+    """Archetype id of the opponent deck this game was played against."""
 
     def __len__(self) -> int:
         return len(self.decisions)

@@ -480,7 +480,10 @@ def _find_libcg() -> str:
 
 
 def featurize_leaf(
-    obs_json: str, policy: Any, vocab: dict, device: Any
+    obs_json: str, policy: Any, vocab: dict, device: Any,
+    *,
+    engine_card_features: dict | None = None,
+    engine_attack_features: dict | None = None,
 ) -> tuple[list[float], float]:
     """Featurize a leaf observation and run one forward pass.
 
@@ -503,7 +506,9 @@ def featurize_leaf(
     from ptcg_il.featurizer import featurize
 
     obs_dict = json.loads(obs_json)
-    feats = featurize(obs_dict, vocab)
+    feats = featurize(obs_dict, vocab,
+                      engine_card_features=engine_card_features,
+                      engine_attack_features=engine_attack_features)
 
     # Build batch of size 1
     batch = {}
@@ -550,7 +555,7 @@ class MctsForest:
 
     Wraps the ``puct_forest_*`` C-ABI.  The Python side drives the loop::
 
-        forest = MctsForest(n_engines=4, libcg_path=...)
+        forest = shared_forest(n_engines=4)   # not MctsForest(...)
         for state in tagged_states:
             forest.add_root(state.obs_dict, state.fixed_deck, ...)
         while forest.active_count > 0:
@@ -558,7 +563,11 @@ class MctsForest:
             priors_vals = batch_forward(leaves, policy, vocab, device)
             forest.expand_batch(priors_vals)
         results = forest.results()
-        forest.close()
+        forest.reset()
+
+    Construct one per process, through :func:`shared_forest`, and
+    ``reset()`` between batches.  Constructing one per batch and calling
+    ``close()`` leaks: see :meth:`reset`.
     """
 
     def __init__(
@@ -597,6 +606,14 @@ class MctsForest:
         self._lib.puct_forest_results.argtypes = [ctypes.c_int64]
         self._lib.puct_forest_results.restype = ctypes.c_void_p
 
+        self._lib.puct_forest_set_basic_pokemon.argtypes = [
+            ctypes.c_int64, ctypes.c_char_p,
+        ]
+        self._lib.puct_forest_set_basic_pokemon.restype = ctypes.c_int
+
+        self._lib.puct_forest_reset.argtypes = [ctypes.c_int64]
+        self._lib.puct_forest_reset.restype = ctypes.c_int
+
         self._lib.puct_forest_free.argtypes = [ctypes.c_int64]
         self._lib.puct_forest_free.restype = None
 
@@ -609,6 +626,23 @@ class MctsForest:
             raise RuntimeError("puct_forest_create returned null handle")
 
         self._tree_count = 0
+
+    def set_basic_pokemon(self, card_ids) -> int:
+        """Tell the determinizer which engine card ids are Basic Pokémon.
+
+        Only a Basic can legally sit face-down as the opponent's active.
+        Without this the guess is drawn from the whole deck template, and
+        since only ~16% of a template's slots are Basic, ``SearchBegin``
+        refuses most such roots with error 2.  Optional — a forest that is
+        never told keeps the old behaviour.  Returns the number of ids stored.
+        """
+        ids = sorted({int(c) for c in card_ids})
+        n = self._lib.puct_forest_set_basic_pokemon(
+            self._handle, json.dumps(ids).encode("utf-8"),
+        )
+        if n < 0:
+            raise RuntimeError("puct_forest_set_basic_pokemon failed")
+        return int(n)
 
     def add_root(
         self,
@@ -677,6 +711,25 @@ class MctsForest:
             return []
         return json.loads(raw)
 
+    def reset(self) -> int:
+        """Drop every tree, keeping the engines.  Returns trees dropped.
+
+        Use this, not ``close()``, between search batches.  ``close()``
+        frees the engine pool, and a freed engine's memory never comes
+        back: libcg exports no ``AgentEnd``, and ``SearchEnd`` only
+        returns the arena to that same agent for reuse (see
+        ``cg/api.py``'s ``search_end`` docstring).  A forest per search
+        batch therefore strands ``n_engines`` arenas per batch — the
+        leak that took self-play out at ~2000 games.
+        """
+        if self._handle == 0:
+            return 0
+        n = self._lib.puct_forest_reset(self._handle)
+        if n < 0:
+            raise RuntimeError("puct_forest_reset failed")
+        self._tree_count = 0
+        return int(n)
+
     def close(self) -> None:
         if self._handle != 0:
             self._lib.puct_forest_free(self._handle)
@@ -689,8 +742,69 @@ class MctsForest:
         self.close()
         return False
 
+
+# ── Process-wide forest ──────────────────────────────────────────────────
+
+_SHARED_FOREST: "MctsForest | None" = None
+_SHARED_FOREST_ENGINES: int = 0
+
+
+def shared_forest(n_engines: int = 4, libcg_path: str | None = None) -> "MctsForest":
+    """The one `MctsForest` for this process, created on first call.
+
+    Every later call resets it — trees dropped, engines kept — and hands
+    back the same object.  The engines have to be process-lived: libcg's
+    ``AgentStart`` has no counterpart in the ABI, so each pool that gets
+    freed strands everything its agents allocated, permanently.
+
+    *n_engines* is honoured on the first call only.  A later call asking
+    for a different count logs a warning and keeps the existing pool
+    rather than growing agents the process can never reclaim.
+    """
+    global _SHARED_FOREST, _SHARED_FOREST_ENGINES
+    if _SHARED_FOREST is None:
+        _SHARED_FOREST = MctsForest(n_engines=n_engines, libcg_path=libcg_path)
+        _SHARED_FOREST_ENGINES = n_engines
+        logger.info("MCTS forest created: %d engines (process-wide)", n_engines)
+    else:
+        if n_engines != _SHARED_FOREST_ENGINES:
+            logger.warning(
+                "shared_forest asked for %d engines but the process pool has "
+                "%d — keeping it (libcg agents cannot be freed, so resizing "
+                "leaks the old pool)",
+                n_engines, _SHARED_FOREST_ENGINES,
+            )
+        _SHARED_FOREST.reset()
+    return _SHARED_FOREST
+
+
+def close_shared_forest() -> None:
+    """Free the process-wide forest.  For tests and shutdown only."""
+    global _SHARED_FOREST, _SHARED_FOREST_ENGINES
+    if _SHARED_FOREST is not None:
+        _SHARED_FOREST.close()
+        _SHARED_FOREST = None
+        _SHARED_FOREST_ENGINES = 0
+
     def __del__(self) -> None:
         self.close()
+
+
+#: Sub-phases of :func:`batch_evaluate_leaves`, in seconds.  Module-level for
+#: the same reason as ``_MCTS_PERF``: the call sits inside the per-game search
+#: loop and threading an accumulator down would touch every frame between.
+LEAF_PERF: dict[str, float] = {
+    "t_featurize": 0.0,   # CPU: json.loads + featurize, per leaf, serial
+    "t_forward": 0.0,     # GPU: one batched forward
+    "n_leaves": 0.0,
+}
+
+
+def reset_leaf_perf() -> dict[str, float]:
+    snap = dict(LEAF_PERF)
+    for k in LEAF_PERF:
+        LEAF_PERF[k] = 0.0
+    return snap
 
 
 def batch_evaluate_leaves(
@@ -699,6 +813,9 @@ def batch_evaluate_leaves(
     vocab: dict,
     device: Any,
     bf16: bool = True,
+    *,
+    engine_card_features: dict | None = None,
+    engine_attack_features: dict | None = None,
 ) -> list[dict]:
     """Batch-featurize and GPU-forward a list of leaf dicts.
 
@@ -707,7 +824,22 @@ def batch_evaluate_leaves(
 
     Uses bf16 autocast when ``bf16=True`` and device is CUDA (matches
     rollout inference precision per §7).
+
+    **Pass the engine feature tables.**  Card identity reaches this model only
+    as static features looked up by engine card id (``featurizer._raw_card``),
+    and ``_ids_to_feat`` returns an all-zero block when ``engine_features`` is
+    ``None``.  Omitting them therefore evaluates every leaf on a board where no
+    card has any identity — only HP, energy and slot scalars survive — so the
+    priors and values driving the whole search are computed blind.  Nothing
+    raises: zeros are a valid feature row, indistinguishable from an empty
+    slot.  Measured on a real observation, dropping them took
+    ``poke_card_feat`` from 2 non-zero rows to 0, ``hand_card_feat`` from 7 to
+    0, and ``opt_card_feat``'s abs-sum from 14.0 to 0.0.  The rollout actor has
+    always passed them; only search did not, so ``mcts_pi`` was distilled from
+    a blind search while acting stayed sighted.
     """
+    import time as _time
+
     import torch
 
     from ptcg_il.featurizer import featurize
@@ -715,15 +847,24 @@ def batch_evaluate_leaves(
     if not leaves:
         return []
 
-    # Featurize all leaves
+    # Featurize all leaves.  Timed separately from the forward because the two
+    # are on different processors and have opposite fixes: this loop is
+    # single-threaded CPU (a json.loads plus a featurize per leaf), while the
+    # forward below is one batched GPU call.  Reporting them as one "eval"
+    # number pointed at the GPU when the cost was mostly here.
+    _t0 = _time.perf_counter()
     feat_list = []
     for leaf in leaves:
         if leaf.get("is_terminal") or leaf.get("n_options", 0) == 0:
             feat_list.append(None)
             continue
         obs_dict = json.loads(leaf["obs_json"])
-        feats = featurize(obs_dict, vocab)
+        feats = featurize(obs_dict, vocab,
+                          engine_card_features=engine_card_features,
+                          engine_attack_features=engine_attack_features)
         feat_list.append(feats)
+    LEAF_PERF["t_featurize"] += _time.perf_counter() - _t0
+    LEAF_PERF["n_leaves"] += len(leaves)
 
     # Build batch for non-terminal leaves
     valid_indices = [i for i, f in enumerate(feat_list) if f is not None]
@@ -761,12 +902,14 @@ def batch_evaluate_leaves(
     # GPU forward with bf16 autocast (matches rollout §7 precision)
     use_bf16 = bf16 and device.type == "cuda"
     autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else _NullContext()
+    _t_fwd = _time.perf_counter()
     with torch.no_grad(), autocast_ctx:
         # Go through Policy.forward rather than driving _encode/pointer/value
         # by hand: the pointer head takes (h, tok_mask, card_encoder, x) and
         # applies the option mask itself.
         logits, values, _history_h = policy(tensor_batch)
 
+    LEAF_PERF["t_forward"] += _time.perf_counter() - _t_fwd
     # Always read back in fp32 for prior/softmax stability
     logits_np = logits.float().cpu().numpy()
     values_np = values.float().cpu().numpy()
@@ -789,13 +932,31 @@ def batch_evaluate_leaves(
         mask = opt_mask_np[valid_pos]
         l = logits_np[valid_pos]
 
+        # The STOP column is a label for autoregressive multi-select, not an
+        # engine option — the tree has no child for it.  Leaving it in the
+        # softmax scaled every real option's prior by 1 - P(stop), and where
+        # the featurizer had to drop an option to make room for it (n_total ==
+        # O_MAX) P(stop) landed on a *different* action's slot.
+
+        stop_col = int(feat_list[i].get("stop_column", -1))
+        if stop_col >= 0:
+            mask = mask.copy()
+            mask[stop_col] = False
+
         # Mask and softmax
         l = np.where(mask, l, -np.inf)
         l = l - l.max()
         probs = np.exp(l)
         probs = probs / probs.sum()
 
-        n_legal = int(mask.sum())
+        # One prior per tree child, no more and no less.  The valid columns are
+        # packed from index 0, so the head of `probs` is exactly them.  The cap
+        # at n_options matters when the featurizer had to truncate a >O_MAX
+        # option list: it returns fewer priors than the engine has options, and
+        # the tree is built to match (expand_leaf takes the min), so options
+        # past O_MAX are simply not searched — the policy cannot express them
+        # either.
+        n_legal = min(int(mask.sum()), n_options)
         priors = probs[:n_legal].tolist() if n_legal > 0 else []
 
         # Policy.forward returns value as [B], not [B, 1]
@@ -884,6 +1045,9 @@ def mcts_distill_game(
     config: Any,  # RLConfig with MCTS params
     device: Any,
     seed: int = 0,
+    *,
+    engine_card_features: dict | None = None,
+    engine_attack_features: dict | None = None,
 ) -> list[dict]:
     """Run one self-play game with MCTS distillation targets.
 
@@ -946,6 +1110,8 @@ def mcts_distill_game(
                 mcts_targets = _run_mcts_on_decisions(
                     decisions, tagged_idx, policy, vocab,
                     fixed_deck, opp_decklist, config, device, seed,
+                    engine_card_features=engine_card_features,
+                    engine_attack_features=engine_attack_features,
                 )
 
             # ── Build enriched decision dicts ──────────────────────
@@ -976,6 +1142,9 @@ def _run_mcts_on_decisions(
     config: Any,
     device: Any,
     seed: int,
+    *,
+    engine_card_features: dict | None = None,
+    engine_attack_features: dict | None = None,
 ) -> dict[int, tuple]:
     """Run batched MCTS on tagged decisions, using the KNOWN opponent deck.
 
@@ -983,7 +1152,8 @@ def _run_mcts_on_decisions(
     """
     import json as _json
 
-    forest = MctsForest(
+    # Process-wide pool, not a fresh one per call — see `shared_forest`.
+    forest = shared_forest(
         n_engines=getattr(config, "mcts_n_engines", 4),
         libcg_path=None,
     )
@@ -1022,12 +1192,16 @@ def _run_mcts_on_decisions(
             leaves = forest.select_batch(leaf_batch)
             if not leaves:
                 break
-            expansions = batch_evaluate_leaves(leaves, policy, vocab, device)
+            expansions = batch_evaluate_leaves(
+                leaves, policy, vocab, device,
+                engine_card_features=engine_card_features,
+                engine_attack_features=engine_attack_features,
+            )
             forest.expand_batch(expansions)
 
         results = {r["tree_id"]: r for r in forest.results()}
     finally:
-        forest.close()
+        forest.reset()
 
     # Aggregate K determinizations per decision
     targets: dict[int, tuple] = {}

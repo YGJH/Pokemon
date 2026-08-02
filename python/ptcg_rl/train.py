@@ -168,6 +168,8 @@ def _load_policies(args: argparse.Namespace, device):
     from ptcg_il.model.policy import load_policy_state, policy_from_config
     from ptcg_il.train.checkpoint import load_checkpoint
 
+    from ptcg_il.deck import DECK_KEY, require_deck_record
+
     ckpt = load_checkpoint(args.il_ckpt, device="cpu")
     config = ckpt.get("config") or {}
     if not config:
@@ -176,6 +178,14 @@ def _load_policies(args: argparse.Namespace, device):
             f"reconstructed without guessing. Retrain with the current pipeline "
             f"(stage 4 writes it) — RL loads two policies and cannot infer shapes."
         )
+    # Checked here, next to `config`, because _save_checkpoint copies the deck
+    # record forward from this parent: a parent without one produces an RL
+    # checkpoint without one, and the gap propagates down the generations
+    # silently.  Refusing at load costs nothing; refusing at save costs the run.
+    try:
+        require_deck_record(ckpt.get(DECK_KEY), str(args.il_ckpt))
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
 
     # Pure-feature model: there is no vocab width to reconcile and no static
     # card/attack tables to inject.  The one card-derived tensor the policy
@@ -653,7 +663,8 @@ def _ppo_epochs(policy, batch, logp_ref_full, optimizer, beta, cfg, device) -> d
 
 
 def _run_mcts_distillation(
-    args, cfg, policy, vocab, decisions, device, wb=None
+    args, cfg, policy, vocab, decisions, device, wb=None,
+    engine_card_features=None, engine_attack_features=None,
 ) -> list:
     """Run batched MCTS PUCT search on ρ-tagged decision points.
 
@@ -669,9 +680,9 @@ def _run_mcts_distillation(
     import numpy as np
 
     from ptcg_rl.search import (
-        MctsForest,
         SearchTarget,
         batch_evaluate_leaves,
+        shared_forest,
     )
 
     n = len(decisions)
@@ -682,7 +693,8 @@ def _run_mcts_distillation(
     if not tagged_idx:
         return [None] * n
 
-    forest = MctsForest(
+    # Process-wide pool, not a fresh one per call — see `shared_forest`.
+    forest = shared_forest(
         n_engines=cfg.mcts_n_engines,
         libcg_path=None,
     )
@@ -724,12 +736,16 @@ def _run_mcts_distillation(
             leaves = forest.select_batch(cfg.mcts_leaf_batch)
             if not leaves:
                 break
-            expansions = batch_evaluate_leaves(leaves, policy, vocab, device)
+            expansions = batch_evaluate_leaves(
+                leaves, policy, vocab, device,
+                engine_card_features=engine_card_features,
+                engine_attack_features=engine_attack_features,
+            )
             forest.expand_batch(expansions)
 
         results = {r["tree_id"]: r for r in forest.results()}
     finally:
-        forest.close()
+        forest.reset()
 
     # ── Aggregate K determinizations per state ─────────────────────────
     targets: list = [None] * n
@@ -1130,7 +1146,7 @@ def _save_checkpoint(out_dir: Path, policy, il_ckpt: dict, cfg, report: dict) ->
     """
     import torch
 
-    from ptcg_il.deck import DECK_KEY
+    from ptcg_il.deck import DECK_KEY, require_deck_record
 
     ckpt: dict[str, Any] = {
         "step": report.get("r2", {}).get("steps", 0),
@@ -1147,8 +1163,10 @@ def _save_checkpoint(out_dir: Path, policy, il_ckpt: dict, cfg, report: dict) ->
             "gate": report.get("gate"),
         },
     }
-    if il_ckpt.get(DECK_KEY):
-        ckpt[DECK_KEY] = il_ckpt[DECK_KEY]
+    # _load_policies already refused an unlabelled parent at startup, so this
+    # is the backstop rather than the expected error site.
+    ckpt[DECK_KEY] = require_deck_record(
+        il_ckpt.get(DECK_KEY), "_save_checkpoint (inherited from --il-ckpt)")
 
     path = out_dir / "ckpt-rl-last.pt"
     torch.save(ckpt, path)

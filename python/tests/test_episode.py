@@ -8,7 +8,12 @@ import pytest
 
 from ptcg_mine.episode import deck_of, load_episode, rewards, teams, validate_episode
 
-FIXTURE_PATH = Path(__file__).parent.parent / "archive/sample_episodes/80169582.json"
+# parents[2] is the repo root — see the note in test_featurizer.py.  The
+# root-level tests/test_episode.py uses `.parent.parent` correctly because it
+# is one directory shallower; this copy inherited the expression unchanged.
+FIXTURE_PATH = (
+    Path(__file__).resolve().parents[2] / "archive/sample_episodes/80169582.json"
+)
 
 
 @pytest.fixture(scope="module")

@@ -32,6 +32,38 @@ DECK_KEY = "deck"
 SIDECAR_NAME = "decks.json"
 
 
+def require_deck_record(record: Any, who: str) -> dict[str, Any]:
+    """Return *record* if it is a usable deck identity, else raise.
+
+    The one rule every writer shares, so no save path can quietly become the
+    lenient one.  Every producer used to accept ``deck=None`` and drop the key
+    (``if deck is not None``), which made an unlabelled checkpoint look exactly
+    like a labelled one at write time; the mismatch then surfaced only at
+    submission build, hours later, or not at all — a specialist loaded with the
+    wrong deck does not crash, its unseen cards just map to ``UNKNOWN_CARD``.
+
+    *who* names the caller and goes into the message; this is read by someone
+    whose run just refused to start.
+    """
+    if not isinstance(record, dict):
+        raise ValueError(
+            f"{who}: deck record is {type(record).__name__}, not a dict. "
+            "Build it with ptcg_il.deck.build_deck_metadata — a checkpoint "
+            "that does not say which deck it plays cannot be evaluated "
+            "(ptcg_rl.mcts_train drops it from the league) or shipped "
+            "(scripts/build_submission.py refuses to guess)."
+        )
+    deck = record.get("deck")
+    if not isinstance(deck, list) or not deck:
+        raise ValueError(
+            f"{who}: deck record carries no decklist "
+            f"({DECK_KEY!r}[{DECK_KEY!r}] is {deck!r}). The record's other "
+            "fields — archetype_self, vocab_sha1, archetypes_sha1 — are "
+            "worthless without the 60 card ids they describe."
+        )
+    return record
+
+
 def _sha1(path: Path) -> str:
     """Short content hash of an artifact file."""
     return hashlib.sha1(path.read_bytes()).hexdigest()[:12]

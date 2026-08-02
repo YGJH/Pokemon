@@ -15,19 +15,34 @@
 #   ./scripts/build_submit.sh                         # a0, 自動選最高 ELO
 #   ./scripts/build_submit.sh a1                      # a1, 自動選最高 ELO
 #   ./scripts/build_submit.sh a0 path/to/ckpt.pt      # 手動指定 checkpoint
+#   ./scripts/build_submit.sh a0 --no-mcts            # 純 policy，不含任何搜尋
 #
 # 會自動編譯 Rust MCTS library (libptcg_search.so) 並打包進 submission。
 # 如果 cargo 找不到，會跳過並在 submission 中使用 greedy fallback。
+#
+# --no-mcts: 每個決策只跑一次 policy forward pass，不做樹搜尋。不編譯也不打包
+# libptcg_search.so，bundle 裡也不會有 search_infer.py / belief_posterior.py /
+# archetypes.json。輸出檔名改成 submission-greedy.tar.gz，才不會跟 MCTS 版本
+# 互相覆蓋 —— 兩個 bundle 長得一模一樣，覆蓋掉就分不出上傳的是哪一個。
 
 set -euo pipefail
 
-ARCH="${1:-a0}"
-EXPLICIT_CKPT="${2:-}"
+NO_MCTS=0
+POSITIONAL=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-mcts) NO_MCTS=1 ;;
+        *) POSITIONAL+=("$arg") ;;
+    esac
+done
+
+ARCH="${POSITIONAL[0]:-a0}"
+EXPLICIT_CKPT="${POSITIONAL[1]:-}"
 
 IL_DIR="python/checkpoints_${ARCH}"
 MCTS_DIR="python/checkpoints_${ARCH}_mcts"
 ELO_FILE="${MCTS_DIR}/elo_ratings.json"
-
+echo "$ELO_FILE"
 if [[ -n "$EXPLICIT_CKPT" ]]; then
     # ── 手動指定 checkpoint ─────────────────────────────────────────────
     CKPT="$EXPLICIT_CKPT"
@@ -43,7 +58,6 @@ elo_path = Path('$ELO_FILE')
 data = json.loads(elo_path.read_text())
 ratings = data.get('ratings', {})
 fixed = set(data.get('fixed', []))
-
 candidates = [(r, n) for n, r in ratings.items() if n not in fixed]
 if not candidates:
     print('FALLBACK')
@@ -53,11 +67,15 @@ candidates.sort(reverse=True)
 best_elo, best_name = candidates[0]
 print(f'ELO 最高: {best_name} ({best_elo:.0f})', file=sys.stderr)
 
-# 找出實際檔案路徑
+# 找出實際檔案路徑。
+# elo_ratings.json 的 key 混用兩種寫法（'ckpt-best' 跟 'ckpt-best.pt'），
+# 無條件補 .pt 會組出 'ckpt-step-0002000.pt.pt' —— 檔案永遠找不到，於是每次
+# 都安靜退回 ckpt-best.pt，看起來就像「ELO 選擇失敗」而不是路徑組錯。
+stem = best_name[:-3] if best_name.endswith('.pt') else best_name
 il_dir = Path('$IL_DIR')
 mcts_dir = Path('$MCTS_DIR')
 for d in (mcts_dir, il_dir):
-    p = d / f'{best_name}.pt'
+    p = d / f'{stem}.pt'
     if p.exists():
         print(str(p))
         sys.exit(0)
@@ -89,7 +107,9 @@ fi
 
 # ── Build Rust MCTS library ─────────────────────────────────────────────
 RUST_DIR="python/ptcg_search"
-if command -v cargo &>/dev/null && [[ -f "$RUST_DIR/Cargo.toml" ]]; then
+if [[ "$NO_MCTS" == 1 ]]; then
+    echo "--no-mcts: 跳過 Rust build，打包純 policy submission"
+elif command -v cargo &>/dev/null && [[ -f "$RUST_DIR/Cargo.toml" ]]; then
     echo "Building libptcg_search.so..."
     (cd "$RUST_DIR" && cargo build --release 2>&1) || echo "WARNING: cargo build failed — submission will use greedy fallback"
 else
@@ -97,7 +117,15 @@ else
 fi
 # ─────────────────────────────────────────────────────────────────────────
 
-uv run python scripts/build_submission.py \
-    --data-dir python/data \
-    --ckpt "$CKPT" \
-    --out submission.tar.gz
+if [[ "$NO_MCTS" == 1 ]]; then
+    uv run python scripts/build_submission.py \
+        --data-dir python/data \
+        --ckpt "$CKPT" \
+        --no-mcts \
+        --out submission-greedy.tar.gz
+else
+    uv run python scripts/build_submission.py \
+        --data-dir python/data \
+        --ckpt "$CKPT" \
+        --out submission.tar.gz
+fi

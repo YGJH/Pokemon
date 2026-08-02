@@ -1,7 +1,8 @@
 /// Raw FFI bindings to libcg.so — mirrors sim.py ctypes definitions.
 ///
 /// All functions are loaded dynamically via libloading.  The library is
-/// leaked so Symbol references remain valid for the process lifetime.
+/// leaked so Symbol references remain valid for the process lifetime —
+/// but leaked *once per path*, via `LIB_CACHE`, not once per load.
 
 use libloading::{Library, Symbol};
 use std::ffi::CStr;
@@ -73,9 +74,33 @@ pub struct CgLib {
     pub search_release: Symbol<'static, FnSearchRelease>,
 }
 
+/// Process-wide cache of loaded libraries, keyed by path.
+///
+/// The `Symbol<'static, _>` fields above require a library that outlives
+/// every `CgLib`, which is why one is leaked.  Caching makes that leak
+/// happen *once per path* rather than once per `CgLib::load`: the pool
+/// loads one `CgLib` per engine, so an uncached leak scaled with the
+/// number of engines ever created.  `dlopen` on an already-open path only
+/// bumps a refcount, so the mapping was never duplicated — but the
+/// `Library` handle and its refcount were, permanently.
+static LIB_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, &'static Library>>,
+> = std::sync::OnceLock::new();
+
+fn load_library_cached(lib_path: &str) -> Result<&'static Library, Box<dyn std::error::Error>> {
+    let cache = LIB_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().map_err(|_| "LIB_CACHE poisoned")?;
+    if let Some(lib) = guard.get(lib_path) {
+        return Ok(lib);
+    }
+    let lib: &'static Library = Box::leak(Box::new(unsafe { Library::new(lib_path)? }));
+    guard.insert(lib_path.to_string(), lib);
+    Ok(lib)
+}
+
 impl CgLib {
     pub unsafe fn load(lib_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let lib = Box::leak(Box::new(Library::new(lib_path)?));
+        let lib = load_library_cached(lib_path)?;
 
         macro_rules! sym {
             ($name:ident, $ty:ty) => {

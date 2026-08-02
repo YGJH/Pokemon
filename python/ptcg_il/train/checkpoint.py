@@ -20,7 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ptcg_il.deck import DECK_KEY, write_deck_csv
+from ptcg_il.deck import DECK_KEY, require_deck_record, write_deck_csv
 
 
 def _rng_state() -> dict[str, Any]:
@@ -49,7 +49,7 @@ def save_checkpoint(
     step: int,
     save_dir: str | Path,
     tag: str | None = None,
-    deck: dict[str, Any] | None = None,
+    deck: dict[str, Any],
 ) -> Path:
     """Save a training checkpoint (C.7).
 
@@ -67,16 +67,31 @@ def save_checkpoint(
         Output directory.
     tag : str or None
         Suffix for the filename (e.g. "best", "last", "step-0004000").
-    deck : dict, optional
+    deck : dict
         Deck identity record from :func:`ptcg_il.deck.build_deck_metadata`,
         stored under the ``"deck"`` key.  Without it a checkpoint does not say
         which of the near-disjoint archetype decks it was trained to play, and a
         wrong pairing fails silently (unseen cards just map to UNKNOWN).
 
+        **Required.**  It used to default to ``None`` and be dropped, so an
+        unlabelled checkpoint was indistinguishable from a labelled one until
+        something downstream needed the deck.  Callers that genuinely have no
+        deck have nothing shippable to save.
+
     Returns
     -------
     Path to the saved checkpoint.
+
+    Raises
+    ------
+    ValueError
+        If *deck* is not a usable record.  Every caller reaching here should
+        already have failed at startup — :func:`ptcg_il.train.loop.train`
+        builds the record before the first batch — so this is the backstop,
+        not the expected error site.
     """
+    require_deck_record(deck, f"save_checkpoint(tag={tag!r})")
+
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,8 +110,7 @@ def save_checkpoint(
         # anything else (a test double, say) simply gets an empty dict.
         "config": dict(getattr(policy, "config", {})),
     }
-    if deck is not None:
-        ckpt[DECK_KEY] = deck
+    ckpt[DECK_KEY] = deck
 
     torch.save(ckpt, path)
     return path

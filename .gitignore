@@ -19,7 +19,12 @@ checkpoints/
 python/checkpoints*/
 submission.tar.gz
 data/
+*.stdout
+
+
 *.pyc
+*.tar.gz
+*.log
 .pytest_cache/
 # Rust build artifacts
 python/ptcg_search/target/

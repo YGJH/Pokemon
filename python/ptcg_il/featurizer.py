@@ -57,6 +57,15 @@ F_SUM = 11
 F_GLOBAL = 93
 F_OPT = 6
 
+# Columns 9:12 of a card static row are (basic, stage1, stage2) — see
+# ``ptcg_mine.cards.card_static_row``.  Named here rather than written as a
+# literal at each use because the MCTS determinizer reads it to decide which
+# cards can legally be a face-down active: pointing at column 10 instead yields
+# a plausible non-empty set that the engine then refuses one search root at a
+# time.  ``search_infer`` ships standalone in the submission bundle and cannot
+# import ``ptcg_rl``, so this module is the one place both sides can share.
+CARD_FEAT_BASIC_COL = 9
+
 # ============================================================
 # Enum sizes (A.1)
 # ============================================================

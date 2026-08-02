@@ -22,6 +22,55 @@ use engine::Engine;
 use guessing::build_guesses;
 use mcts::MctsConfig;
 
+// ── Basic-Pokémon set (process-global) ─────────────────────────────────────
+//
+// Only a Basic Pokémon can legally sit face-down as the opponent's active, and
+// the determinizer has to guess one.  Without this set it draws from the whole
+// deck template, where ~16% of slots are Basic, so `SearchBegin` refuses most
+// such roots with error 2 ("Active card must be the ID of a Pokémon card").
+//
+// `puct_forest_*` carries the set on its handle.  The single-tree entry points
+// (`puct_init`, `search_plan`) have no handle to hang it on and are called once
+// per decision, so it lives here instead: set once per process, read by both.
+// Empty (never set) reproduces the old whole-template behaviour exactly.
+static BASIC_POKEMON: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<i32>>> =
+    std::sync::OnceLock::new();
+
+fn basic_pokemon() -> &'static std::sync::RwLock<std::collections::HashSet<i32>> {
+    BASIC_POKEMON.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Register the engine card ids that are Basic Pokémon, process-wide.
+///
+/// `ids_json` is a JSON array of card ids.  Optional and idempotent: call it
+/// once after loading the library.  Returns the number of ids stored, -1 on
+/// error.
+///
+/// # Safety
+///
+/// `ids_json` must be a valid UTF-8, null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn puct_set_basic_pokemon(ids_json: *const c_char) -> c_int {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let s = unsafe { cstr_to_str(ids_json) };
+        let ids: Vec<i32> =
+            serde_json::from_str(&s).map_err(|e| format!("ids_json parse: {e}"))?;
+        let mut guard = basic_pokemon()
+            .write()
+            .map_err(|_| "basic-pokemon lock poisoned".to_string())?;
+        *guard = ids.into_iter().collect();
+        Ok::<usize, String>(guard.len())
+    }));
+    match result {
+        Ok(Ok(n)) => n as c_int,
+        Ok(Err(e)) => {
+            eprintln!("puct_set_basic_pokemon: {e}");
+            -1
+        }
+        Err(_) => -1,
+    }
+}
+
 // ── C FFI entry point ──────────────────────────────────────────────────────
 
 /// Run MCTS search for the best action at a decision point.
@@ -143,7 +192,11 @@ fn search_plan_impl(
 
     // Build hidden-state guesses
     let mut rng = StdRng::seed_from_u64(seed as u64);
-    let guesses = match build_guesses(&obs_str, &fixed_deck, &opp_deck_template, &mut rng) {
+    // Basic-Pokémon set comes from the process-global registry (there is no
+    // handle on this path); empty = unset = old whole-template behaviour.
+    let _basics = basic_pokemon().read().ok();
+    let basics = _basics.as_deref().filter(|s| !s.is_empty());
+    let guesses = match build_guesses(&obs_str, &fixed_deck, &opp_deck_template, basics, &mut rng) {
         Ok(g) => g,
         Err(e) => return error_json(&format!("build_guesses: {e}")),
     };
@@ -275,7 +328,19 @@ pub unsafe extern "C" fn puct_init(
     }));
     match result {
         Ok(Ok(handle)) => Box::into_raw(Box::new(handle)) as i64,
-        Ok(Err(_)) | Err(_) => 0, // error: null handle
+        // The caller only sees a null handle, and every failure here — a bad
+        // libcg path, an uninitialised engine, a refused root — collapses into
+        // that one value.  The submission agent then reports a single
+        // "puct_init returned null" and silently plays greedy for the rest of
+        // the game, so print which one it was.
+        Ok(Err(e)) => {
+            eprintln!("puct_init: {e}");
+            0
+        }
+        Err(_) => {
+            eprintln!("puct_init: panicked");
+            0
+        }
     }
 }
 
@@ -312,8 +377,11 @@ fn puct_init_impl(
 
     // Build hidden-state guesses
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
-    let guesses = guessing::build_guesses(&obs_str, &fixed_deck, &opp_deck_template, &mut rng)
-        .map_err(|e| format!("build_guesses: {e}"))?;
+    let _basics = basic_pokemon().read().ok();
+    let basics = _basics.as_deref().filter(|s| !s.is_empty());
+    let guesses =
+        guessing::build_guesses(&obs_str, &fixed_deck, &opp_deck_template, basics, &mut rng)
+            .map_err(|e| format!("build_guesses: {e}"))?;
 
     let sbi = obs
         .get("search_begin_input")
@@ -656,6 +724,10 @@ use puct::{ForestExpansion, PuctForest};
 struct PuctForestHandle {
     pool: EnginePool,
     forest: PuctForest,
+    /// Card ids the engine treats as Basic Pokémon.  Empty until
+    /// `puct_forest_set_basic_pokemon` is called; the determinizer then falls
+    /// back to drawing a face-down active from the whole deck template.
+    basic_pokemon: std::collections::HashSet<i32>,
 }
 
 /// Create a PUCT forest with an engine pool.
@@ -677,11 +749,47 @@ pub unsafe extern "C" fn puct_forest_create(
         Ok::<PuctForestHandle, String>(PuctForestHandle {
             pool,
             forest: PuctForest::new(n_eng),
+            basic_pokemon: std::collections::HashSet::new(),
         })
     }));
     match result {
         Ok(Ok(handle)) => Box::into_raw(Box::new(handle)) as i64,
         Ok(Err(_)) | Err(_) => 0,
+    }
+}
+
+/// Tell the forest which card ids are Basic Pokémon.
+///
+/// `ids_json` is a JSON array of engine card ids.  Optional and additive:
+/// a forest that never receives it behaves exactly as before.  Supplying it
+/// lets the determinizer guess a *legal* face-down opponent active instead of
+/// any card in the template — the difference between a root the engine
+/// accepts and one it refuses with error 2.
+///
+/// Returns the number of ids stored, or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn puct_forest_set_basic_pokemon(
+    handle: i64,
+    ids_json: *const c_char,
+) -> c_int {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle == 0 {
+            return Err("null handle".to_string());
+        }
+        let h = unsafe { &mut *(handle as *mut PuctForestHandle) };
+        let ids_str = unsafe { cstr_to_str(ids_json) };
+        let ids: Vec<i32> = serde_json::from_str(&ids_str)
+            .map_err(|e| format!("ids_json parse: {e}"))?;
+        h.basic_pokemon = ids.into_iter().collect();
+        Ok::<usize, String>(h.basic_pokemon.len())
+    }));
+    match result {
+        Ok(Ok(n)) => n as c_int,
+        Ok(Err(e)) => {
+            eprintln!("puct_forest_set_basic_pokemon: {e}");
+            -1
+        }
+        Err(_) => -1,
     }
 }
 
@@ -747,8 +855,10 @@ fn puct_forest_add_root_impl(
     }
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
-    let guesses = guessing::build_guesses(&obs_str, &fixed_deck, &opp_deck_template, &mut rng)
-        .map_err(|e| format!("build_guesses: {e}"))?;
+    let basics = if h.basic_pokemon.is_empty() { None } else { Some(&h.basic_pokemon) };
+    let guesses =
+        guessing::build_guesses(&obs_str, &fixed_deck, &opp_deck_template, basics, &mut rng)
+            .map_err(|e| format!("build_guesses: {e}"))?;
 
     // An empty sbi is not a recoverable search — `SearchBegin` dereferences
     // the pointer and takes the whole process down with SIGSEGV, which no
@@ -760,8 +870,12 @@ fn puct_forest_add_root_impl(
         return Err("empty search_begin_input".into());
     }
 
-    // Use engine 0 for root creation (sequential, before rayon kicks in)
-    let engine = h.pool.get(0);
+    // Mint the root on the engine this tree is about to bind to, not on
+    // engine 0.  A `search_id` only exists inside the agent that created
+    // it, and every later `SearchStep`/`SearchRelease` for this tree goes
+    // to `ForestTree::engine_idx`.
+    let engine_idx = h.forest.next_engine_idx();
+    let engine = h.pool.get(engine_idx);
     let root = engine.search_begin(
         sbi,
         &guesses.your_deck, &guesses.your_prize,
@@ -775,9 +889,16 @@ fn puct_forest_add_root_impl(
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
 
+    // From here on the root state is live but not yet owned by a tree, so
+    // nothing else will ever release it.  Every early return must.
     let root_obs: engine::SearchObservation =
-        serde_json::from_str(&root.observation_json)
-            .map_err(|e| format!("root obs parse: {e}"))?;
+        match serde_json::from_str(&root.observation_json) {
+            Ok(v) => v,
+            Err(e) => {
+                engine.search_release(root.search_id);
+                return Err(format!("root obs parse: {e}"));
+            }
+        };
 
     let n_options = root_obs.select.as_ref()
         .map(|s| s.option.len()).unwrap_or(0);
@@ -809,7 +930,7 @@ fn puct_forest_add_root_impl(
         ..PuctConfig::default()
     };
 
-    Ok(h.forest.add_tree(root_node, our_player_index, config))
+    Ok(h.forest.add_tree(root_node, our_player_index, config, engine_idx))
 }
 
 /// Select up to `batch_size` leaves across all active trees.
@@ -931,6 +1052,36 @@ fn puct_forest_results_impl(handle: i64) -> String {
     }).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".to_string())
 }
 
+/// Drop every tree in the forest, keeping its engine pool alive.
+///
+/// Returns the number of trees dropped, or -1 on a null handle.
+///
+/// This exists so one forest can serve the whole process.  libcg exports
+/// no `AgentEnd`, and `SearchEnd` only hands the arena back to the same
+/// agent for reuse, so every `Engine` dropped strands its arena
+/// permanently — freeing and recreating a forest per search batch leaks
+/// `n_engines` agents each time.
+#[no_mangle]
+pub unsafe extern "C" fn puct_forest_reset(handle: i64) -> c_int {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if handle == 0 {
+            return -1;
+        }
+        let h = unsafe { &mut *(handle as *mut PuctForestHandle) };
+        let engines_ptr: *const engine::Engine = h.pool.get(0) as *const engine::Engine;
+        let n_engines = h.pool.len();
+        let engines_slice = unsafe { std::slice::from_raw_parts(engines_ptr, n_engines) };
+        h.forest.reset(engines_slice) as c_int
+    }));
+    match result {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("puct_forest_reset: panicked");
+            -1
+        }
+    }
+}
+
 /// Free a PUCT forest handle.
 #[no_mangle]
 pub unsafe extern "C" fn puct_forest_free(handle: i64) {
@@ -966,6 +1117,37 @@ pub unsafe extern "C" fn vec_env_create(
     match result { Ok(Ok(h)) => Box::into_raw(Box::new(h)) as i64, _ => 0 }
 }
 
+/// Create a pool whose battles hold **different** opponent decks.
+///
+/// `opp_decks_json` is `[[id, [60 card ids]], ...]`; battle `i` takes entry
+/// `i % len` and keeps it across restarts.  `vec_env_create` remains the
+/// single-opponent form and is unchanged.
+///
+/// Returns 0 on any failure, matching `vec_env_create` — the caller checks for
+/// a null handle.
+#[no_mangle]
+pub unsafe extern "C" fn vec_env_create_multi(
+    n_envs: c_int, lib_path: *const c_char,
+    deck_self_json: *const c_char, opp_decks_json: *const c_char,
+    our_player: c_int, seed: c_int, host_initialized: c_int,
+) -> i64 {
+    let _ = host_initialized;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let lib_str = unsafe { cstr_to_str(lib_path) };
+        let deck_self: Vec<i32> = serde_json::from_str(&unsafe { cstr_to_str(deck_self_json) })
+            .map_err(|e: serde_json::Error| format!("deck_self: {e}"))?;
+        let opp_decks: Vec<(i32, Vec<i32>)> =
+            serde_json::from_str(&unsafe { cstr_to_str(opp_decks_json) })
+                .map_err(|e: serde_json::Error| format!("opp_decks: {e}"))?;
+        let cfg = VecEnvConfig { n_envs: n_envs.max(1) as usize, our_player: our_player as u8,
+                                 seed: seed as u64, ..VecEnvConfig::default() };
+        let env = VecEnv::new_multi(&lib_str, &deck_self, &opp_decks, cfg)
+            .map_err(|e: String| format!("VecEnv: {e}"))?;
+        Ok::<VecEnvHandle, String>(VecEnvHandle { env })
+    }));
+    match result { Ok(Ok(h)) => Box::into_raw(Box::new(h)) as i64, _ => 0 }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn vec_env_poll(handle: i64) -> *mut c_char {
     if handle == 0 { return CString::new("[]").unwrap().into_raw(); }
@@ -974,6 +1156,7 @@ pub unsafe extern "C" fn vec_env_poll(handle: i64) -> *mut c_char {
     let json = serde_json::to_string(&pending.iter().map(|p| serde_json::json!({
         "battle_idx": p.battle_idx, "obs_json": p.obs_json,
         "sbi": p.sbi, "select_player": p.select_player,
+        "opp_id": p.opp_id,
     })).collect::<Vec<_>>()).unwrap_or("[]".into());
     CString::new(json).unwrap().into_raw()
 }
@@ -997,6 +1180,7 @@ pub unsafe extern "C" fn vec_env_drain(handle: i64) -> *mut c_char {
     let json = serde_json::to_string(&finished.iter().map(|g| serde_json::json!({
         "battle_idx": g.battle_idx, "reward": g.reward,
         "n_decisions": g.n_decisions, "error": g.error,
+        "opp_id": g.opp_id,
     })).collect::<Vec<_>>()).unwrap_or("[]".into());
     CString::new(json).unwrap().into_raw()
 }

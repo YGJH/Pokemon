@@ -125,11 +125,21 @@ from model.search_infer import (
 DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# The Kaggle runner execs this file into a namespace with no ``__file__``, so
+# anything reaching for it raises NameError at *decision* time — invisible to a
+# build-time `import main` smoke test, which does bind ``__file__``.  Resolve
+# the agent directory once, here, and never touch ``__file__`` again.
+_AGENT_DIR = (
+    "/kaggle_simulations/agent" if os.path.exists("/kaggle_simulations/agent/")
+    else os.path.dirname(os.path.abspath(globals()["__file__"]))
+    if "__file__" in globals() else os.getcwd()
+)
+
 # ── MCTS config (inference-time) ─────────────────────────────────────────
 
-_MCTS_ITERATIONS = int(os.environ.get("MCTS_ITERATIONS", "64"))
-_MCTS_C_PUCT = float(os.environ.get("MCTS_C_PUCT", "2.0"))
-_MCTS_SEED = int(os.environ.get("MCTS_SEED", "0"))
+_MCTS_ITERATIONS = int("16")
+_MCTS_C_PUCT = float("2.0")
+_MCTS_SEED = int("0")
 
 
 def _load_json(path: str) -> dict:
@@ -202,6 +212,21 @@ _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict
 if _missing:
     _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
     _other = [k for k in _missing if not k.startswith("belief_heads.")]
+    # Policy ties one CardEncoder into three places (`policy.py`:
+    # `self.pointer.card = self.embed.card`, same for the belief heads), and
+    # EMA's shadow de-duplicates shared parameters, so those aliases are absent
+    # from the packaged state dict while the tensors they name are loaded
+    # through `embed.card.*`.  Reporting them as missing cried wolf on every
+    # single run, which is how a real gap would have gone unnoticed.  Compare
+    # object identity rather than guessing at name prefixes.
+    # remove_duplicate=False is the whole point: the default de-duplicates
+    # shared parameters, so the alias names are absent and would be misread as
+    # genuinely missing — the exact false alarm this is here to stop.
+    _params = dict(_model.named_parameters(remove_duplicate=False))
+    _params.update(dict(_model.named_buffers(remove_duplicate=False)))
+    _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
+    _other = [k for k in _other
+              if k not in _params or id(_params[k]) not in _loaded_ids]
     if _other:
         print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
 _model.to(_device)
@@ -289,7 +314,7 @@ def _find_libcg() -> str:
     importable at all, that directory holds the engine.
     """
     name = _libcg_name()
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = _AGENT_DIR
     candidates = [
         f"/kaggle_simulations/agent/{name}",
         name,
@@ -315,6 +340,234 @@ def _find_libcg() -> str:
 '''
 
 
+MAIN_PY_TEMPLATE_GREEDY = r'''"""Pokémon TCG AI Agent — Kaggle submission entry point (no-MCTS build).
+
+One policy forward pass per decision: featurize -> encode -> pointer logits ->
+argmax over the legal options (autoregressive greedy for multi-select).  There
+is no tree search, no engine rollout, and no ``libptcg_search.so`` — nothing
+here dlopens anything, so the only way this agent fails is a genuine model or
+data problem, not a missing native library.
+
+The belief heads are still present in the packaged weights; they are simply
+never called, because their only consumer was the MCTS determinizer.
+
+Model loads at import time.  Any failure raises immediately.
+"""
+
+import json
+import os
+import numpy as np
+import torch
+
+try:
+    from cg.api import to_observation_class
+except ImportError:
+    def to_observation_class(obs_dict: dict):
+        select = obs_dict.get("select")
+        return type("Observation", (), {
+            "select": None if select is None else type("SelectData", (), select)(),
+        })()
+
+from model import Policy, select_multi
+from model.featurizer import featurize
+
+DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
+_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _load_json(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _read_deck_csv() -> list[int]:
+    path = os.path.join(DATA_DIR, "deck.csv")
+    if not os.path.exists(path):
+        path = "/kaggle_simulations/agent/data/deck.csv"
+    with open(path) as f:
+        return [int(line.strip()) for line in f if line.strip()]
+
+
+# ── Import-time model loading ─────────────────────────────────────────────
+
+_vocab_raw = _load_json(os.path.join(DATA_DIR, "vocab.json"))
+
+
+def _index_to_id_map(raw):
+    """Normalize ``index_to_id`` to ``{index: engine_card_id}``.
+
+    ``vocab.json`` stores it as the list ``["PAD", "UNKNOWN", id2, ...]``, so
+    ``.items()`` on it raises — and it would raise here at agent *import* time,
+    which on Kaggle reads as a submission that simply does not start.  A dict
+    form (int- or str-keyed) is accepted too; the PAD/UNKNOWN placeholders are
+    dropped either way since they map to no engine card.
+    """
+    if not raw:
+        return {}
+    pairs = raw.items() if hasattr(raw, "items") else enumerate(raw)
+    out = {}
+    for k, v in pairs:
+        try:
+            out[int(k)] = int(v)
+        except (TypeError, ValueError):
+            continue  # "PAD" / "UNKNOWN"
+    return out
+
+
+_vocab = {
+    "id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("id_to_index", {}).items()},
+    "attack_id_to_index": {int(k): int(v) for k, v in _vocab_raw.get("attack_id_to_index", {}).items()},
+    "index_to_id": _index_to_id_map(_vocab_raw.get("index_to_id")),
+}
+
+# Engine card/attack feature maps (built at packaging time from the bundled engine)
+_engine_card_features = np.load(
+    os.path.join(DATA_DIR, "engine_card_features.npy"), allow_pickle=True).item()
+_engine_attack_features = np.load(
+    os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
+
+# All-card feature matrix.  The belief heads own it, and Policy builds them
+# unconditionally, so it is still required to construct the module and load the
+# packaged state dict — even though this build never runs a belief head.
+_max_cid = max(_engine_card_features.keys()) if _engine_card_features else 0
+_all_card_feat = torch.zeros(_max_cid + 1, 94)
+for _cid, _feat in _engine_card_features.items():
+    _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
+
+_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+_cfg = _ckpt.get("config", {})
+_model = Policy(
+    D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
+    layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
+    n_opp_arch=_cfg.get("n_opp_arch", 1),
+    n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
+    all_card_feat=_all_card_feat,
+)
+_missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
+if _missing:
+    _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
+    _other = [k for k in _missing if not k.startswith("belief_heads.")]
+    # Policy ties one CardEncoder into three places (`policy.py`:
+    # `self.pointer.card = self.embed.card`, same for the belief heads), and
+    # EMA's shadow de-duplicates shared parameters, so those aliases are absent
+    # from the packaged state dict while the tensors they name are loaded
+    # through `embed.card.*`.  Reporting them as missing cried wolf on every
+    # single run, which is how a real gap would have gone unnoticed.  Compare
+    # object identity rather than guessing at name prefixes.
+    # remove_duplicate=False is the whole point: the default de-duplicates
+    # shared parameters, so the alias names are absent and would be misread as
+    # genuinely missing — the exact false alarm this is here to stop.
+    _params = dict(_model.named_parameters(remove_duplicate=False))
+    _params.update(dict(_model.named_buffers(remove_duplicate=False)))
+    _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
+    _other = [k for k in _other
+              if k not in _params or id(_params[k]) not in _loaded_ids]
+    if _other:
+        print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
+_model.to(_device)
+_model.eval()
+
+_fixed_deck = _read_deck_csv()
+
+
+# ── Inference helpers ────────────────────────────────────────────────────
+
+def _to_batch(feats: dict) -> dict:
+    """Convert single-sample featurizer output to batch-1 torch tensors."""
+    batch = {}
+    for k, v in feats.items():
+        # np.int64(3) is an np.generic *scalar*, not an ndarray, so an
+        # isinstance(v, np.ndarray) filter silently drops every 0-d key the
+        # featurizer emits: minCount, maxCount, stop_column, sel_type, sel_ctx,
+        # action_len, log_len, value_target, sample_weight.  `select_multi`
+        # reads minCount/maxCount, so multi-select decisions would die with
+        # KeyError: 'minCount' while single-select ones — which never touch
+        # those keys — went through fine.
+        if not isinstance(v, (np.ndarray, np.generic)):
+            continue
+        # np.asarray keeps a scalar 0-d so unsqueeze(0) yields [B]; going via
+        # ascontiguousarray would promote it to 1-d and give [B, 1], which
+        # broadcasts wrongly inside _select_multi_raw instead of failing.
+        arr = np.asarray(v)
+        if arr.ndim:
+            arr = np.ascontiguousarray(arr)
+        t = torch.from_numpy(arr).unsqueeze(0)
+        if v.dtype == np.bool_:
+            t = t.bool()
+        elif np.issubdtype(v.dtype, np.integer):
+            t = t.long()
+        else:
+            t = t.float()
+        batch[k] = t.to(device=_device)
+    return batch
+
+
+def _legal(indices: list[int], n_options: int, min_count: int, max_count: int) -> list[int]:
+    """Force the engine's Select contract: distinct, in range, minCount<=k<=maxCount.
+
+    Engine error codes 4 (count out of range), 5 (index OOB) and 6 (duplicate)
+    all forfeit the game, so the return value is clamped here rather than
+    trusted.  ``maxCount == 0`` legitimately means "select nothing", so this
+    must not floor the count at 1.
+    """
+    seen, out = set(), []
+    for i in indices:
+        i = int(i)
+        if 0 <= i < n_options and i not in seen:
+            seen.add(i)
+            out.append(i)
+    for i in range(n_options):          # top up toward minCount
+        if len(out) >= min_count:
+            break
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out[:max_count]
+
+
+# ── Agent function ───────────────────────────────────────────────────────
+
+def agent(obs_dict: dict) -> list[int]:
+    obs = to_observation_class(obs_dict)
+
+    # Deck selection step
+    if obs.select is None:
+        return list(_fixed_deck)
+
+    select = obs_dict.get("select") or {}
+    n_options = len(select.get("option") or [])
+    min_count = int(select.get("minCount", 1) or 0)
+    max_count = int(select.get("maxCount", 1) or 0)
+
+    try:
+        feats = featurize(
+            obs_dict, _vocab,
+            engine_card_features=_engine_card_features,
+            engine_attack_features=_engine_attack_features,
+        )
+        batch = _to_batch(feats)
+        feat_max_count = int(feats.get("maxCount", max_count))
+
+        with torch.no_grad():
+            if feat_max_count == 1:
+                logits, _value, _hist = _model(batch)
+                logits = logits.masked_fill(~batch["opt_mask"], -1e9)
+                indices = [int(logits.argmax(dim=-1)[0].item())]
+            else:
+                chosen = select_multi(_model, batch)
+                # -1 pads beyond maxCount, -2 marks the STOP pick.
+                indices = [int(p) for p in chosen[0].tolist() if p >= 0]
+    except Exception as e:
+        # A featurizer or shape failure must not forfeit the game outright;
+        # the first minCount legal options at least keep play going.
+        print(f"[agent] WARNING: greedy inference failed ({type(e).__name__}: {e})"
+              f" — falling back to the first {min_count} option(s)")
+        indices = []
+
+    return _legal(indices, n_options, min_count, max_count)
+'''
+
+
 def rewrite_imports(text: str) -> str:
     """Apply all REWRITE_RULES to *text*, returning the rewritten source."""
     for pattern, replacement in REWRITE_RULES:
@@ -328,7 +581,7 @@ def write_init(dst_dir: Path) -> None:
     print(f"  Wrote __init__.py")
 
 
-def build_model_package(src_dir: Path, dst_dir: Path) -> None:
+def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None:
     """Copy model files from ptcg_il/model/ to submission/model/, rewriting imports.
 
     Also bundles ``search_infer.py``, ``belief_posterior.py``, and
@@ -341,6 +594,11 @@ def build_model_package(src_dir: Path, dst_dir: Path) -> None:
     dst_dir : Path
         Submission root (``submission/``).  Model files land in
         ``dst_dir / "model" /``.
+    mcts : bool
+        When False, ``search_infer.py`` and ``belief_posterior.py`` are left
+        out: the greedy ``main.py`` imports neither, and shipping the MCTS
+        module in a bundle with no ``libptcg_search.so`` only invites a
+        fallback path that reads as working search.
     """
     model_src = src_dir / "python" / "ptcg_il" / "model"
     model_dst = dst_dir / "model"
@@ -358,7 +616,7 @@ def build_model_package(src_dir: Path, dst_dir: Path) -> None:
 
     # Extra files: search_infer.py, belief_posterior.py
     python_src = src_dir / "python"
-    for rel_path, dest_name in EXTRA_FILES:
+    for rel_path, dest_name in (EXTRA_FILES if mcts else []):
         src = python_src / rel_path
         if not src.exists():
             print(f"WARNING: {src} not found — skipping")
@@ -393,10 +651,11 @@ def build_model_package(src_dir: Path, dst_dir: Path) -> None:
     write_init(model_dst)
 
 
-def build_main_py(dst_dir: Path) -> None:
-    """Generate submission/main.py from the MAIN_PY_TEMPLATE."""
-    (dst_dir / "main.py").write_text(MAIN_PY_TEMPLATE)
-    print(f"  Wrote main.py")
+def build_main_py(dst_dir: Path, mcts: bool = True) -> None:
+    """Generate submission/main.py from the appropriate template."""
+    (dst_dir / "main.py").write_text(
+        MAIN_PY_TEMPLATE if mcts else MAIN_PY_TEMPLATE_GREEDY)
+    print(f"  Wrote main.py ({'MCTS' if mcts else 'greedy, no search'})")
 
 
 # ============================================================
@@ -415,25 +674,75 @@ def _infer_n_opp_arch(model_state: dict) -> int:
     return 1
 
 
+# What each pinned artifact actually controls at inference.  These are not
+# interchangeable, and the guard used to describe both as one fatal error.
+#
+# vocab.json — governs which engine ids count as in-vocab, and nothing else.
+#   `CardFeaturizer` is a pure MLP over 94 static features with *no learned id
+#   embeddings* (`model/cards.py`), and `featurize` passes ``index_to_id=None``
+#   so card ids stay raw engine ids resolved against `engine_card_features.npy`
+#   — which this builder regenerates from the bundled engine anyway.  A vocab
+#   index therefore never selects an embedding row.  The old message claimed it
+#   did and promised "scrambled card identities"; that failure mode belongs to
+#   an architecture this repo does not have.
+#
+# archetypes.json — genuinely load-bearing, and only for MCTS builds.
+#   `BeliefHead.arch_head` is `Linear(D, n_arch)` whose output position *k*
+#   means "cluster k of the archetypes.json seen during training".  Cluster ids
+#   are reassigned on every mining run, so a mismatch silently points the
+#   opponent-deck posterior at the wrong decklists and feeds the MCTS
+#   determinizer bad decks.  `--no-mcts` bundles neither ship this file nor
+#   call the belief heads, so there it is inert.
+_PIN_CONSEQUENCE: dict[str, str] = {
+    "vocab.json":
+        "decides only which ids are in-vocab; card representation is pure "
+        "static features (no learned id embeddings), so this alone is mostly "
+        "cosmetic — but it does prove checkpoint and data/ came from "
+        "different mining runs",
+    "archetypes.json":
+        "sets what each belief arch-head output position MEANS. Cluster ids "
+        "are reassigned every mining run, so the opponent-deck posterior "
+        "would name the wrong decks and mislead the MCTS determinizer. "
+        "Inert in a --no-mcts build, which ships no archetypes.json",
+}
+
+# Which build types actually dereference each artifact.  Severity is derived
+# from this rather than asserted, so the guard cannot drift from what the
+# bundle really reads.
+#
+# vocab.json is in *neither* set: `featurize`'s own signature documents the
+# parameter as "retained for API compatibility ... card and attack identity no
+# longer routes through it", and `_raw_card`/`_raw_attack` pass engine ids
+# straight through to `engine_card_features.npy` — which this builder
+# regenerates from the bundled engine at packaging time.  A vocab mismatch is
+# therefore always evidence, never a defect, and always warns.
+_PIN_CONSUMED_BY: dict[str, frozenset[str]] = {
+    "vocab.json": frozenset(),
+    "archetypes.json": frozenset({"mcts"}),
+}
+
+
 def check_artifact_pairing(deck_record: dict | None, data_dir: Path,
-                           force: bool = False) -> None:
-    """Abort if the checkpoint was trained against different artifacts.
+                           force: bool = False, mcts: bool = True) -> None:
+    """Warn — or abort — when the checkpoint was trained against other artifacts.
 
     ``save_checkpoint`` pins ``vocab_sha1``/``archetypes_sha1`` precisely so
-    this can be checked, but the builder only ever *printed* them.  The failure
-    it guards is silent by construction: the model's card embedding is indexed
-    by vocab position, so a vocab of the same length with a different id→index
-    assignment produces a bundle that loads, imports, plays every game to the
-    end, and loses nearly all of them.  Nothing raises at any point.
+    this can be checked, but the builder only ever *printed* them.  A stale
+    checkpoint from an earlier mining run is the normal way to hit this.
 
-    A stale checkpoint from an earlier mining run is the normal way to hit
-    this — archetype ids and vocab indices are both reassigned whenever mining
-    re-runs.
+    A mismatch aborts only when the packaged bundle actually *reads* the
+    artifact in question (``_PIN_CONSUMED_BY``).  A ``--no-mcts`` bundle ships
+    no ``archetypes.json`` and never calls the belief heads, and no build type
+    routes card identity through the vocab, so refusing to package those was
+    blocking correct bundles over pairings nothing dereferences.  Everything
+    still *reports*, because a mismatch remains real evidence that checkpoint
+    and ``data/`` came from different mining runs.
     """
     if deck_record is None:
         return  # build_data_files already refuses an unlabelled checkpoint
 
-    mismatches = []
+    build = "mcts" if mcts else "greedy"
+    mismatches, fatal = [], []
     for key, fname in (("vocab_sha1", "vocab.json"),
                        ("archetypes_sha1", "archetypes.json")):
         pinned = deck_record.get(key)
@@ -446,22 +755,31 @@ def check_artifact_pairing(deck_record: dict | None, data_dir: Path,
         # length so a full digest and a truncated pin still agree.
         actual = hashlib.sha1(path.read_bytes()).hexdigest()
         if actual[:len(pinned)] != pinned:
-            mismatches.append(f"    {fname}: checkpoint pins {pinned}, "
-                              f"{data_dir}/{fname} is {actual[:len(pinned)]}")
+            consumed = build in _PIN_CONSUMED_BY[fname]
+            mismatches.append(
+                f"    {fname}: checkpoint pins {pinned}, {data_dir}/{fname} "
+                f"is {actual[:len(pinned)]}\n"
+                f"      -> {_PIN_CONSEQUENCE[fname]}\n"
+                f"      -> this {build} build "
+                + ("READS this file — fatal." if consumed
+                   else "does not read this file."))
+            if consumed:
+                fatal.append(fname)
 
     if not mismatches:
         return
+
     msg = ("Checkpoint was trained against different artifacts than the ones "
-           "being packaged:\n" + "\n".join(mismatches) +
-           "\n  The shipped vocab decides which embedding row each card id "
-           "reads, so this bundle would play with scrambled card identities "
-           "and lose almost every game — without erroring.\n"
-           "  Point --ckpt at a checkpoint trained on this data/, or rebuild "
-           "the corpus and retrain. Use --force to package anyway.")
-    if force:
-        print(f"WARNING: {msg}")
-        return
-    raise SystemExit(f"ERROR: {msg}")
+           "being packaged:\n" + "\n".join(mismatches))
+    if fatal and not force:
+        raise SystemExit(
+            f"ERROR: {msg}\n"
+            f"  {', '.join(fatal)} is consumed by this build, so the bundle "
+            f"would be wrong. Point --ckpt at a checkpoint trained on this "
+            f"data/, or rebuild the corpus and retrain. "
+            f"Use --force to package anyway.")
+    print(f"WARNING: {msg}\n"
+          f"  Nothing this {build} build reads is affected — packaging anyway.")
 
 
 def build_model_weights(ckpt_path: Path, dst_dir: Path,
@@ -567,7 +885,7 @@ def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
 
 
 def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = None,
-                     src_dir: Path | None = None) -> None:
+                     src_dir: Path | None = None, mcts: bool = True) -> None:
     """Copy vocab, archetypes, deck, and build engine features into submission/data/.
 
     Engine card/attack features are built from the bundled engine at packaging
@@ -582,6 +900,10 @@ def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = Non
         Output directory for the submission data files.
     src_dir : Path or None
         Project root.  Defaults to cwd.
+    mcts : bool
+        When False, ``archetypes.json`` and ``libptcg_search.so`` are not
+        bundled — the greedy agent reads neither.  The archetype sanity check
+        below still runs, against ``data_dir``'s copy rather than the bundle's.
     """
     dst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -596,27 +918,28 @@ def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = Non
 
     # Archetypes — needed by belief posterior for opponent deck prediction
     arch_path = data_dir / "archetypes.json"
-    if arch_path.exists():
+    if mcts and arch_path.exists():
         shutil.copy(arch_path, dst_dir / "archetypes.json")
         print(f"  Copied archetypes.json")
 
     # Rust MCTS library
-    if src_dir is None:
-        src_dir = Path.cwd()
-    so_candidates = [
-        src_dir / "python" / "ptcg_search" / "target" / "release" / "libptcg_search.so",
-        src_dir / "ptcg_search" / "target" / "release" / "libptcg_search.so",
-    ]
-    bundled = False
-    for so_path in so_candidates:
-        if so_path.exists():
-            shutil.copy(so_path, dst_dir / "libptcg_search.so")
-            size_kb = so_path.stat().st_size / 1024
-            print(f"  Copied libptcg_search.so ({size_kb:.0f} KB)")
-            bundled = True
-            break
-    if not bundled:
-        print(f"  WARNING: libptcg_search.so not found — MCTS will fall back to greedy policy")
+    if mcts:
+        so_candidates = [
+            src_dir / "python" / "ptcg_search" / "target" / "release" / "libptcg_search.so",
+            src_dir / "ptcg_search" / "target" / "release" / "libptcg_search.so",
+        ]
+        bundled = False
+        for so_path in so_candidates:
+            if so_path.exists():
+                shutil.copy(so_path, dst_dir / "libptcg_search.so")
+                size_kb = so_path.stat().st_size / 1024
+                print(f"  Copied libptcg_search.so ({size_kb:.0f} KB)")
+                bundled = True
+                break
+        if not bundled:
+            print(f"  WARNING: libptcg_search.so not found — MCTS will fall back to greedy policy")
+    else:
+        print(f"  Skipped archetypes.json + libptcg_search.so (no-MCTS build)")
 
     # deck.csv (one card ID per line) — MUST be the deck this checkpoint was
     # trained on, not archetypes.json's `fixed_deck`.
@@ -727,7 +1050,12 @@ def main():
                    help="Override the deck with this csv (one card id per line). "
                         "By default the deck stamped into the checkpoint is used; "
                         "only pass this if the checkpoint predates deck labelling.")
+    p.add_argument("--no-mcts", action="store_true",
+                   help="Build a pure-policy bundle: one greedy forward pass per "
+                        "decision, no tree search. Drops search_infer.py, "
+                        "belief_posterior.py, archetypes.json and libptcg_search.so.")
     args = p.parse_args()
+    mcts = not args.no_mcts
 
     work = Path(args.work_dir)
     if work.exists():
@@ -737,8 +1065,8 @@ def main():
     model_dir = work / "model"
     data_dir = work / "data"
 
-    print("Building model package...")
-    build_model_package(Path.cwd(), work)
+    print(f"Building model package ({'MCTS' if mcts else 'greedy, no search'})...")
+    build_model_package(Path.cwd(), work, mcts=mcts)
     write_init(work / "model")
     print("  OK")
 
@@ -759,15 +1087,17 @@ def main():
                   "label; using --deck-csv as instructed.")
         deck = override
 
-    check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force)
+    check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force,
+                           mcts=mcts)
 
     print("Building data files...")
-    build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd())
+    build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd(),
+                     mcts=mcts)
     build_model_weights(Path(args.ckpt), data_dir, deck_record=deck_record)
     print("  OK")
 
     print("Generating main.py...")
-    build_main_py(work)
+    build_main_py(work, mcts=mcts)
     print("  OK")
 
     print("Verifying packaged model imports...")

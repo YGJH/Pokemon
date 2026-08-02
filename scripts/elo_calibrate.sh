@@ -23,9 +23,9 @@ GAMES="${2:-}"
 
 DATA_DIR="data"
 OUT_DIR="checkpoints_${ARCH}_mcts"
-IL_CKPT="checkpoints_${ARCH}/ckpt-best.pt"
+IL_CKPT="checkpoints_${ARCH}"
 
-if [[ ! -f "python/$IL_CKPT" ]]; then
+if [[ ! -d "python/$IL_CKPT" ]]; then
     echo "找不到 python/$IL_CKPT" >&2
     exit 1
 fi

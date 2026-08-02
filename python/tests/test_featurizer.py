@@ -45,8 +45,13 @@ from ptcg_il.ref_map import build_ref_map, card_id_at
 # Test fixtures
 # ---------------------------------------------------------------------------
 
+# parents[2] is the repo root, not `python/`.  This expression was copied from
+# `tests/test_featurizer.py`, which sits one level shallower, so the inherited
+# `.parent.parent` resolved to `python/archive/` — a directory that exists but
+# holds only manifest.csv.  Every test in this file then died in its fixture
+# with FileNotFoundError, which reads as 70 broken featurizer assertions.
 SAMPLE_PATH = (
-    Path(__file__).resolve().parent.parent
+    Path(__file__).resolve().parents[2]
     / "archive"
     / "sample_episodes"
     / "80169582.json"
@@ -1530,3 +1535,36 @@ def _remap(card_id, id_to_index):
     if card_id is None:
         return 0
     return id_to_index.get(card_id, 1)
+
+
+class TestEngineTablesCarryCardIdentity:
+    """Card identity reaches the model *only* as static features looked up by
+    engine card id (``featurizer._raw_card``), so omitting the tables is not a
+    degradation — it erases the cards entirely.  ``_ids_to_feat`` returns an
+    all-zero block for a ``None`` table, and zeros are a legal feature row,
+    indistinguishable from an empty slot, so nothing raises.
+
+    Pinned here because ``ptcg_rl.search.batch_evaluate_leaves`` omitted them
+    for every MCTS leaf: the search that produced ``mcts_pi`` was blind to
+    which cards were in play while the rollout actor stayed sighted.
+    """
+
+    def _sums(self, **kw):
+        ep = _load_episode()
+        obs, action = _get_active_step(ep, 8, 0)
+        feats = featurize(obs, _build_test_vocab(ep), action, **kw)
+        keys = [k for k in feats if k.endswith("card_feat")]
+        assert keys, "fixture produced no card-feature tensors to examine"
+        return {k: float(np.abs(feats[k]).sum()) for k in keys}
+
+    def test_tables_present_gives_nonzero_card_features(self):
+        sums = self._sums(engine_card_features=_engine_card_features())
+        nonzero = {k: v for k, v in sums.items() if v > 0.0}
+        assert nonzero, f"no card features carried any signal: {sums}"
+
+    def test_tables_absent_zeroes_every_card_feature(self):
+        sums = self._sums()
+        assert sums, "fixture examined nothing"
+        assert all(v == 0.0 for v in sums.values()), (
+            f"expected an all-zero card block without the engine table: {sums}"
+        )

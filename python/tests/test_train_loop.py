@@ -37,6 +37,20 @@ from ptcg_il.train.loop import (
 # ============================================================
 
 
+def _deck_record(cards: int = 60) -> dict:
+    """A minimal record satisfying `ptcg_il.deck.require_deck_record`.
+
+    `save_checkpoint` requires one: a checkpoint that does not say which of the
+    near-disjoint archetype decks it plays cannot be evaluated or shipped, and
+    the old `deck=None` default made an unlabelled .pt indistinguishable from a
+    labelled one at write time.
+    """
+    return {
+        "archetype_self": 0, "specialist": True,
+        "deck": [7] * cards, "deck_size": cards,
+    }
+
+
 def _tiny_policy() -> Policy:
     """Create a tiny Policy (D=32, layers=1) for fast tests."""
     return Policy(D=32, heads=4, layers=1, ff=64)
@@ -410,6 +424,50 @@ class TestTrainStep:
 
 
 class TestCheckpoint:
+    def test_every_saved_checkpoint_carries_its_deck(self):
+        """The record is what says which of the near-disjoint archetype decks
+        a policy plays.  It used to default to None and be dropped, so an
+        unlabelled .pt was indistinguishable from a labelled one until
+        something downstream needed the deck — by which point the training
+        that produced it was long finished."""
+        policy = _tiny_policy()
+        opt = create_optimizer(policy)
+        ema = _EMA(policy)
+        sched = create_schedule(opt, total_steps=500)
+        rec = _deck_record()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_checkpoint(policy, opt, sched, ema, step=1,
+                                   save_dir=tmp, deck=rec)
+            assert load_checkpoint(path, device="cpu")["deck"] == rec
+
+    @pytest.mark.parametrize("bad", [
+        None, {}, "not-a-dict",
+        {"specialist": True},            # record with no decklist
+        {"specialist": True, "deck": []},
+    ])
+    def test_saving_without_a_usable_deck_record_raises(self, bad):
+        policy = _tiny_policy()
+        opt = create_optimizer(policy)
+        ema = _EMA(policy)
+        sched = create_schedule(opt, total_steps=500)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(ValueError):
+                save_checkpoint(policy, opt, sched, ema, step=1,
+                                save_dir=tmp, deck=bad)
+            assert not list(Path(tmp).glob("*.pt")), (
+                "the checkpoint was written before the record was validated — "
+                "an unlabelled .pt is on disk despite the raise")
+
+    def test_deck_is_a_required_argument(self):
+        """Not merely validated when supplied: omitting it must be a TypeError,
+        so no caller can go back to writing an unlabelled checkpoint."""
+        import inspect
+        sig = inspect.signature(save_checkpoint)
+        assert sig.parameters["deck"].default is inspect.Parameter.empty, (
+            "save_checkpoint's deck argument has a default again")
+
     def test_save_load_roundtrip(self):
         policy = _tiny_policy()
         opt = create_optimizer(policy)
@@ -417,7 +475,8 @@ class TestCheckpoint:
         sched = create_schedule(opt, total_steps=500)
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp)
+            path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp,
+                                   deck=_deck_record())
             assert path.exists()
 
             ckpt = load_checkpoint(path, device="cpu")
@@ -435,7 +494,8 @@ class TestCheckpoint:
         sched = create_schedule(opt, total_steps=500)
 
         with tempfile.TemporaryDirectory() as tmp:
-            path = save_checkpoint(policy, opt, sched, ema, step=2000, save_dir=tmp, tag="best")
+            path = save_checkpoint(policy, opt, sched, ema, step=2000, save_dir=tmp,
+                                   tag="best", deck=_deck_record())
             assert "best" in str(path)
 
     def test_build_submission_bundle(self):
@@ -446,9 +506,11 @@ class TestCheckpoint:
         data_dir = _build_tiny_data(32)
 
         with tempfile.TemporaryDirectory() as tmp:
-            ckpt_path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp, tag="best")
+            ckpt_path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp,
+                                        tag="best", deck=_deck_record())
             ema.apply(policy)  # Apply EMA before saving
-            ckpt_path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp, tag="best")
+            ckpt_path = save_checkpoint(policy, opt, sched, ema, step=100, save_dir=tmp,
+                                        tag="best", deck=_deck_record())
 
             sub_dir = build_submission_bundle(
                 ckpt_path, data_dir, tmp,

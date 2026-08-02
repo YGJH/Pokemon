@@ -68,7 +68,24 @@ K_EXPERTS=10
 G_MIN=50
 JACCARD_THRESH=0.90
 BATCH_SIZE=256
-EPOCHS=200
+EPOCHS=2000
+
+# ── 模型架構（階段 4a/4b，TRANSFORMER_IL_SPEC Appendix B）─────────────────
+# 一律留空 = 沿用 ptcg_il.cli 的 DEFAULTS（d_model 256 / layers 4 / heads 8 /
+# ff 1024 / dropout 0.1）。這裡刻意不寫死一份預設值：那會變成第二個真相來源，
+# 改了 cli.py 而忘了改這裡，管線就會安靜地用舊架構訓練。空值 = 不傳旗標。
+#
+# 只影響階段 4。階段 5 不需要這些旗標：mcts_train 從 checkpoint 的
+# Policy.config 讀架構（見 CLAUDE.md「Every checkpoint records its own
+# architecture」），傳了反而會有兩個來源不一致的風險。
+#
+# 分片不受影響：build-shards 的指紋只含 featurizer 的維度（h_max/o_max/d_max），
+# 不含模型架構，所以改這些不會觸發那 ~35 分鐘的重建。
+IL_D_MODEL="256"
+IL_LAYERS="14"
+IL_HEADS="8"
+IL_FF="1024"
+IL_DROPOUT="0.0"
 # 每个牌组训练一个专家模型（archetype specialist）。
 # 六个 D_self 原型近乎互斥（pairwise multiset-Jaccard <= 0.17，没有任何一张卡同时
 # 出现在全部六个里），单一通才模型必须同时拟合数个互不相干的策略，因此
@@ -89,6 +106,12 @@ N_SELF="6"
 # 階段 5 跑 AlphaZero 式的 MCTS 蒸餾（ptcg_rl.mcts_train），不是 PPO。
 # 預設值一律取自 scripts/run_mcts_train.sh，兩邊要一起改。
 GENERALIST=""
+# 預訓練 + 微調：階段 4 先在「全部 archetype」上訓一個通才模型，階段 5 再拿它當
+# θ_init，對 --rl-archetype 指定的那一副牌做 MCTS 微調。通才吃得到整個語料
+# （本語料 70,375 筆，最大的專家只有 37,883 筆），專家模型則負責提供 KL anchor
+# 與 league baseline —— 兩者由 mcts_train 的 --init-ckpt / --il-ckpt 分開接。
+# 這是額外的一種模式，--generalist 與預設的 specialist 路徑都不受影響。
+PRETRAIN_FINETUNE=""
 NO_RL=""
 RL_ARCHETYPE=""     # 非空 = 只對這一副牌跑，蓋過 RL_TOP_N 的排名挑選
 # 階段 5 只對「表現最好的這麼多副牌」跑。一副牌動輒數小時，
@@ -108,20 +131,30 @@ MCTS_FORWARD_BATCH=4096     # rollout GPU forward batch
 MCTS_ALL_ARCHETYPES=1       # 1=對全部 179 牌組訓練, 0=只用 6 個 𝒟_opp
 
 # Replay buffer
-MCTS_BUFFER_CAPACITY=100000 # 最大決策點數 — ~1.2 GB
+MCTS_BUFFER_CAPACITY=10000 # 最大決策點數 — ~1.2 GB
 MCTS_MIN_BUFFER=1000        # 開始訓練的最小 buffer 量
 
 # 訓練
 # 5000000 場等於「跑到你把它停掉為止」。這是刻意的：checkpoint 只在通過 league
 # gate 時才寫出，中途停掉不會丟掉已通過的成果。要有限預算就調 --mcts-games。
 MCTS_GAMES=5000000
-MCTS_GAMES_PER_ITER=1000
+MCTS_GAMES_PER_ITER=200
 MCTS_TRAIN_STEPS_PER_ITER=200
 MCTS_BATCH_SIZE=1024
-MCTS_LR=0.00002             # fine-tuning，低於 IL 的 3e-4
+MCTS_LR=0.00002            # fine-tuning，低於 IL 的 3e-4
 MCTS_C_VALUE=0.5
 MCTS_C_PI=1.0
-MCTS_GRAD_CLIP=0.5
+# 30, not 0.5.  Measured over a real a1 run, raw grad norms ranged 4.87–34.93
+# (median 12.68), so a 0.5 clip bound on **100%** of steps and rescaled each one
+# by a different factor between 10x and 70x.  That does not merely discard
+# gradient magnitude, it inverts it: every step leaves the clip at norm 0.5, so
+# the batch carrying 7x more signal was divided 7x harder.  |g|=15 is also not
+# large for this model — at 14.4M params it is a per-parameter RMS of 4e-3,
+# while the clipped 0.5 is 1.3e-4.  Step size does not grow from this change:
+# AdamW is scale-invariant in steady state (m and sqrt(v) both scale with the
+# gradient), so a constant clip is nearly a no-op and `lr` still sets the step.
+# Tune against train/grad_clip_frac — aim for 0.05–0.10, not 1.0.
+MCTS_GRAD_CLIP=30
 
 # League 評估
 MCTS_EVAL_GAMES=100         # 每個對手的對戰場數
@@ -186,6 +219,21 @@ while [[ $# -gt 0 ]]; do
         --epochs)
             EPOCHS="$2"; shift 2
             ;;
+        --d-model)
+            IL_D_MODEL="$2"; shift 2
+            ;;
+        --layers)
+            IL_LAYERS="$2"; shift 2
+            ;;
+        --heads)
+            IL_HEADS="$2"; shift 2
+            ;;
+        --ff)
+            IL_FF="$2"; shift 2
+            ;;
+        --dropout)
+            IL_DROPOUT="$2"; shift 2
+            ;;
         --resume)
             RESUME_CKPT="--resume $2"; shift 2
             ;;
@@ -203,6 +251,9 @@ while [[ $# -gt 0 ]]; do
             ;;
         --generalist)
             GENERALIST="true"; ARCHETYPES=""; shift
+            ;;
+        --pretrain-finetune)
+            PRETRAIN_FINETUNE="true"; shift
             ;;
         --no-eval)
             NO_EVAL="true"; shift
@@ -295,6 +346,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --batch-size N         训练 batch size (默认: 256)"
             echo "  --epochs N             训练 epoch 数 (默认: 500)"
             echo "  --resume PATH          从指定 checkpoint 恢复训练"
+            echo ""
+            echo "模型架構 (只影響階段 4；預設值來自 ptcg_il.cli，這裡不重複一份):"
+            echo "  --d-model N            模型維度 D (預設: 256)"
+            echo "  --layers N             Transformer encoder 層數 (預設: 4)"
+            echo "  --heads N              attention head 數 (預設: 8)。D 必須能被它整除。"
+            echo "  --ff N                 feed-forward 隱藏維度 (預設: 1024)"
+            echo "  --dropout F            dropout (預設: 0.1)"
+            echo "                         改架構不會重建分片；但新舊 checkpoint 形狀不同，"
+            echo "                         --resume 舊的會失敗，階段 5 請用同一輪訓練的產物。"
             echo "  --archetypes \"0 1\"     為這些 archetype 各訓練一個專家模型"
             echo "                         (預設: 從 artifacts 自動挑資料量最大的 N 個)"
             echo "  --n-archetypes N|all   要訓練幾副牌的專家模型 (預設: 2；all = 全部"
@@ -331,6 +391,12 @@ while [[ $# -gt 0 ]]; do
             echo "                         (held-out test top-1)，且只挑訓練成功的。"
             echo "                         all = 每副都跑（很慢：一副要數小時）"
             echo "  --rl-archetype ID      只對這一個專家模型跑，蓋過 --rl-top"
+            echo "  --pretrain-finetune    預訓練 + 微調：階段 4 訓一個吃全部語料的通才"
+            echo "                         (${CHECKPOINT_DIR}_generalist) 加上目標牌組的專家，"
+            echo "                         階段 5 拿通才當 θ_init、專家當 KL anchor 與"
+            echo "                         league baseline 做 MCTS 微調。目標牌組取"
+            echo "                         --rl-archetype，沒給就取排名第一的那副。"
+            echo "                         與 --generalist / --no-rl 互斥。"
             echo ""
             echo "  --verbose, -v          所有階段的完整輸出都印到終端 (預設只印階段 4、5)"
             echo "  --quiet, -q            全部階段只印摘要，完整輸出僅寫入日誌檔"
@@ -343,6 +409,20 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# 旗標衝突在這裡就要擋掉。之前擺在階段 4，等於先跑完 mine + build-shards
+# （本語料約 50 分鐘）才告訴使用者參數根本不能一起用。
+if [[ "$PRETRAIN_FINETUNE" == "true" ]]; then
+    if [[ "$GENERALIST" == "true" ]]; then
+        echo "[錯誤] --pretrain-finetune 與 --generalist 互斥：後者跳過階段 5，" >&2
+        echo "       前者的重點正是要跑階段 5。" >&2
+        exit 1
+    fi
+    if [[ "$NO_RL" == "true" ]]; then
+        echo "[錯誤] --pretrain-finetune 與 --no-rl 互斥：微調就是階段 5。" >&2
+        exit 1
+    fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -377,13 +457,31 @@ ln -sfn "$LOG_DIR" "$PY_DIR/logs/latest"
 # 训练动辄数小时，只留一行 "[4/5] training..." 等于整段没有进度可看；
 # 但 mine/build-shards 会刷上千行，所以不是把 VERBOSE 直接翻成预设。
 # 回传指令本身的 exit code（pipefail 之下 tee 管线也一样）。
+# 少传一个参数不会报错，只会静静地做错事：`run_stage "$CMD" true` 会把整条
+# 指令当成 logfile、把 "true" 当成要执行的指令，于是该阶段「成功」了却什么都
+# 没跑。階段 5 就這樣空轉過。所以这里明确检查参数个数。
 run_stage() {
+    if [[ $# -lt 2 ]]; then
+        echo "[內部錯誤] run_stage 需要 <logfile> <cmd-string> [live]，收到 $# 個參數" >&2
+        return 2
+    fi
     local log="$1" cmd="$2" live="${3:-false}"
-    echo command "$cmd"\n
+    # 少传的是 logfile 时参数会整体左移，cmd 就变成 live 旗标本身——`eval true`
+    # 永远成功，阶段于是「通过」却什么都没跑。指令字串不可能正好是 true/false。
+    case "$cmd" in
+        true|false)
+            echo "[內部錯誤] run_stage 第 2 個參數是 '$cmd' —— 少傳了 logfile？" >&2
+            return 2
+            ;;
+    esac
+    # 指令本身写进 log 头，方便事后复现；只有 --verbose 才同时印到终端，
+    # 免得摘要行被一条几百字的指令挤掉。
+    printf '$ %s\n\n' "$cmd" > "$log"
+    if [[ "$VERBOSE" == "true" ]]; then echo "  \$ $cmd"; fi
     if stage_is_live "$live"; then
-        eval "$cmd" 2>&1 | tee "$log"
+        eval "$cmd" 2>&1 | tee -a "$log"
     else
-        eval "$cmd" >"$log" 2>&1
+        eval "$cmd" >>"$log" 2>&1
     fi
 }
 
@@ -552,6 +650,26 @@ if ! uv run python -c "import torch" >/dev/null 2>&1; then
     exit 1
 fi
 
+# 架構旗標的前置檢查。nn.MultiheadAttention 要求 D % heads == 0，違反時會在
+# torch 深處才炸，而那時候管線已經跑完 mine 與分片了。只設其中一個也要檢查，
+# 所以另一個的預設值從 ptcg_il.cli 讀 —— 不在這裡再抄一份。
+if [[ -n "$IL_D_MODEL$IL_HEADS" ]]; then
+    set +e
+    uv run python - "$IL_D_MODEL" "$IL_HEADS" <<'PY'
+import sys
+from ptcg_il.cli import DEFAULTS
+d = int(sys.argv[1]) if sys.argv[1] else DEFAULTS["d_model"]
+h = int(sys.argv[2]) if sys.argv[2] else DEFAULTS["heads"]
+if d % h:
+    sys.exit(f"[錯誤] --d-model {d} 不能被 --heads {h} 整除 "
+             f"(nn.MultiheadAttention 的硬性要求)")
+print(f"  arch: d_model={d} heads={h}")
+PY
+    ARCH_CHECK_RC=$?
+    set -e
+    if [[ $ARCH_CHECK_RC -ne 0 ]]; then exit $ARCH_CHECK_RC; fi
+fi
+
 build_train_cmd() {
     local out_dir="$1" arch="$2"
     local cmd="uv run python -m ptcg_il.cli train \
@@ -559,6 +677,12 @@ build_train_cmd() {
     --out-dir $out_dir \
     --batch-size $BATCH_SIZE \
     --epochs $EPOCHS"
+    # 只在使用者真的指定時才傳 —— 沒傳就讓 ptcg_il.cli 用自己的預設。
+    if [[ -n "$IL_D_MODEL" ]]; then cmd="$cmd --d-model $IL_D_MODEL"; fi
+    if [[ -n "$IL_LAYERS"  ]]; then cmd="$cmd --layers $IL_LAYERS"; fi
+    if [[ -n "$IL_HEADS"   ]]; then cmd="$cmd --heads $IL_HEADS"; fi
+    if [[ -n "$IL_FF"      ]]; then cmd="$cmd --ff $IL_FF"; fi
+    if [[ -n "$IL_DROPOUT" ]]; then cmd="$cmd --dropout $IL_DROPOUT"; fi
     if [[ -n "$arch" ]]; then
         cmd="$cmd --archetype-self $arch"
     fi
@@ -589,9 +713,36 @@ if [[ "$GENERALIST" != "true" ]] && [[ -z "${ARCHETYPES// /}" ]]; then
     echo "$ARCHETYPES"
 fi
 
+# ── 預訓練 + 微調模式 ────────────────────────────────────────────────────
+# 階段 4 訓兩個模型：一個吃全部語料的通才（θ_init），一個微調目標牌組的專家
+# （KL anchor + league baseline）。階段 5 只跑那一副牌，用 --init-ckpt 把兩者接
+# 起來。要兩個模型是因為「這樣做有沒有比原本好」只有拿專家當 baseline 才答得出來。
+if [[ "$PRETRAIN_FINETUNE" == "true" ]]; then
+    # --generalist / --no-rl 的衝突已在參數解析後擋掉。
+    # 沒指定就取排名第一的那副。archetype id 是分群索引，不寫死。
+    if [[ -z "${RL_ARCHETYPE// /}" ]]; then
+        RL_ARCHETYPE=$(echo "$ARCHETYPES" | tr ' ' '\n' | head -n 1)
+        echo "  finetune target: a${RL_ARCHETYPE} (未指定 --rl-archetype，取排名第一)"
+    else
+        # 指定的那副也得真的訓練得起來，否則階段 5 會找不到 ckpt-best.pt。
+        if ! echo " $ARCHETYPES " | grep -q " $RL_ARCHETYPE "; then
+            echo "[錯誤] --rl-archetype $RL_ARCHETYPE 不在可訓練的 archetype 列表內 ($ARCHETYPES)。" >&2
+            echo "       用 'uv run python -m ptcg_il.cli archetypes --data-dir $DATA_DIR --describe' 看哪些 usable。" >&2
+            exit 1
+        fi
+        echo "  finetune target: a${RL_ARCHETYPE}"
+    fi
+    # 階段 4 只訓這一副的專家 —— 其他副在這個模式下沒有用途，訓了只是白花時間。
+    ARCHETYPES="$RL_ARCHETYPE"
+fi
+
 # 收集要训练的 (输出目录, archetype) 组合
 TRAIN_TARGETS=()
-if [[ -z "${ARCHETYPES// /}" ]]; then
+if [[ "$PRETRAIN_FINETUNE" == "true" ]]; then
+    # 通才排前面：階段 5 需要它當 θ_init，先訓好才不會白跑一輪專家。
+    TRAIN_TARGETS+=("${CHECKPOINT_DIR}_generalist|")
+    TRAIN_TARGETS+=("${CHECKPOINT_DIR}_a${RL_ARCHETYPE}|${RL_ARCHETYPE}")
+elif [[ -z "${ARCHETYPES// /}" ]]; then
     TRAIN_TARGETS+=("$CHECKPOINT_DIR|")
 else
     for arch in $ARCHETYPES; do
@@ -626,9 +777,33 @@ for target in "${TRAIN_TARGETS[@]}"; do
     TRAINED_DIRS+=("$out_dir")
 done
 
-cd "$PROJECT_DIR"
-./scripts/elo_calibrate.sh
-cd "$PY_DIR"
+# ELO 校正跑在「即將進階段 5 的那副牌」上。之前是無參數呼叫，而
+# elo_calibrate.sh 的預設是 a0 —— 本語料的 self_ids 是 [1, 17, 25, 16, 36, 21]，
+# 根本沒有 a0，於是它 exit 1，而這裡在 `set -e` 底下，整條管線就死在階段 5 前面。
+# archetype id 是分群索引，不能寫死；沿用上面已經推導出來的那個。
+ELO_ARCH=""
+if [[ -n "${RL_ARCHETYPE// /}" ]]; then
+    ELO_ARCH="a${RL_ARCHETYPE}"
+elif [[ -n "${ARCHETYPES// /}" ]]; then
+    ELO_ARCH="a$(echo "$ARCHETYPES" | tr ' ' '\n' | head -n 1)"
+fi
+if [[ -z "$ELO_ARCH" ]]; then
+    # 純通才模式沒有「某一副牌」可校正。
+    echo "  elo: ⊘ (generalist — 沒有對應的 checkpoints_a<N>)"
+elif [[ ! -d "$PY_DIR/${CHECKPOINT_DIR}_${ELO_ARCH}" ]]; then
+    echo "  elo: ⊘ (找不到 ${CHECKPOINT_DIR}_${ELO_ARCH})"
+else
+    cd "$PROJECT_DIR"
+    # 校正失敗不該讓已經訓練好的模型跟著陪葬 —— 它只是排名，不是產物。
+    set +e
+    ./scripts/elo_calibrate.sh "$ELO_ARCH"
+    ELO_RC=$?
+    set -e
+    if [[ $ELO_RC -ne 0 ]]; then
+        echo "  elo: ✗ (exit $ELO_RC) — 繼續跑階段 5" >&2
+    fi
+    cd "$PY_DIR"
+fi
 
 # ── 步驟 5: MCTS 自我對弈蒸餾 (AlphaZero 式) ───────────────────────────────
 # 對每個訓練好的專家模型各跑一次，依序而非同時。RL_SPEC §10.1 決定用交替
@@ -644,6 +819,9 @@ cd "$PY_DIR"
 # 只是「最好的那個 𝒟_self 原型」的代表牌組（本語料是 archetype 4），拿它去配
 # 別的專家模型，模型會收到自己從沒見過的卡 —— 那些卡如今是全零特徵列，不會
 # 報錯。mcts_train 會比對 checkpoint 上蓋的 deck 記錄，不符就直接中止。
+
+echo "═══ pipeline 完成，產物在: $DATA_DIR/ ═══ 不想跑階段 5 可用 --no-rl ═══"
+
 RL_DIRS=()
 RL_FAILED=()
 if [[ "$NO_RL" == "true" ]]; then
@@ -706,6 +884,8 @@ PY
         RL_IL_CKPT="$RL_CKPT_DIR/ckpt-best.pt"
         RL_OUT_DIR="${RL_CKPT_DIR}_mcts"
 
+        RL_LOG="$LOG_DIR/5-mcts-a${rl_arch}.log"
+
         stage_label "a${rl_arch}" true
 
         if [[ ! -f "$RL_IL_CKPT" ]]; then
@@ -715,9 +895,30 @@ PY
             continue
         fi
 
+        # 預訓練 + 微調：θ_init 換成通才，--il-ckpt 仍是專家，繼續當 KL anchor
+        # 與 league baseline。gate 問的因此是「通才微調過後有沒有贏過專家」——
+        # 兩邊都指向通才的話這題就問不出來了。
+        RL_INIT=""
+        if [[ "$PRETRAIN_FINETUNE" == "true" ]]; then
+            RL_GENERALIST_CKPT="${CHECKPOINT_DIR}_generalist/ckpt-best.pt"
+            if [[ ! -f "$RL_GENERALIST_CKPT" ]]; then
+                stage_done "a${rl_arch}" true "✗"
+                echo "[錯誤] 找不到 $RL_GENERALIST_CKPT —— --pretrain-finetune 需要階段 4 的通才模型" >&2
+                RL_FAILED+=("a${rl_arch} (缺 generalist ckpt-best.pt)")
+                continue
+            fi
+            RL_INIT=" --init-ckpt $RL_GENERALIST_CKPT"
+        fi
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+        # --init-ckpt 只由 $RL_INIT 提供。這裡本來還額外寫死一行
+        # `--init-ckpt checkpoints_generalist/ckpt-best.pt`，於是
+        # --pretrain-finetune 之下同一個旗標出現兩次 —— argparse 取最後一個，
+        # 不會報錯；而在非 --pretrain-finetune 之下，那個寫死的路徑根本不保證
+        # 存在，卻讓每一次階段 5 都偷偷從通才起跑。
         RL_CMD="uv run python -m ptcg_rl.mcts_train \
     --data-dir $DATA_DIR \
-    --il-ckpt $RL_IL_CKPT \
+    --il-ckpt $RL_IL_CKPT$RL_INIT \
     --out-dir $RL_OUT_DIR \
     --deck-archetype $rl_arch \
     --iterations $MCTS_ITERATIONS \
@@ -751,8 +952,17 @@ PY
         || echo "--no-wandb")$RL_EXTRA"
 
         set +e
-        run_stage "$RL_CMD" true
+        run_stage "$RL_LOG" "$RL_CMD" true
+        RL_RC=$?
         set -e
+        # 之前这里无条件打 ✓ 并把 out-dir 记进 RL_DIRS —— 阶段 5 整个没跑成
+        # 也照样「成功」，摘要还列出一个空目录。exit code 才是唯一凭据。
+        if [[ $RL_RC -ne 0 ]]; then
+            stage_done "a${rl_arch}" true "✗"
+            fail_tail "$RL_LOG" "$RL_RC"
+            RL_FAILED+=("a${rl_arch} (exit $RL_RC)")
+            continue
+        fi
         stage_done "a${rl_arch}" true "✓"
         RL_DIRS+=("$RL_OUT_DIR")
     done

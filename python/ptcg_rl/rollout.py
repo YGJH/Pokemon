@@ -20,6 +20,7 @@ that PPO works here at all.
 from __future__ import annotations
 
 import logging
+import os
 from rich.logging import RichHandler
 from dataclasses import dataclass
 from typing import Sequence
@@ -194,7 +195,24 @@ class PolicyActor:
         self.perf_n_calls = 0
         self.perf_t_featurize = 0.0
         self.perf_t_forward = 0.0
-        self.perf_t_sample = 0.0
+        # `_collate` builds the tensors and pushes them across PCIe.  It used
+        # to fall between the featurize and forward timers and land in neither,
+        # so the one phase whose cost is bus-bound was invisible.
+        self.perf_t_collate = 0.0
+        # The trailing `.cpu()` readback plus reply assembly — likewise after
+        # the forward timer closed.  On CUDA this is where the queued forward
+        # actually gets waited on, so a large value here means the GPU is the
+        # bottleneck even though `perf_t_forward` looks small.
+        self.perf_t_d2h = 0.0
+        self.perf_n_rows = 0
+        # Wall-clock attribution across a CUDA stream is only meaningful with a
+        # sync at each boundary; without one the forward's cost migrates into
+        # whatever next touches the result.  Opt-in because the sync itself
+        # serialises the pipeline and slows the run it is measuring.
+        self.perf_sync = (
+            os.environ.get("PTCG_PERF_SYNC") == "1"
+            and self.device.type == "cuda"
+        )
 
     def __call__(self, requests: list[dict]) -> list[dict]:
         """One reply per request, in the same order.
@@ -226,12 +244,25 @@ class PolicyActor:
             for i in range(len(requests))
         ]
         if not usable:
+            # Still a call, and its featurize time is already banked — bailing
+            # without counting it left perf_n_calls at 0, and mcts_train gates
+            # the whole PERF report on `perf_n_calls > 0`.
+            self.perf_n_calls += 1
+            self.perf_n_rows += len(requests)
             return replies
 
+        import time as _time2
+
+        def _mark() -> float:
+            if self.perf_sync:
+                torch.cuda.synchronize(self.device)
+            return _time2.perf_counter()
+
+        _t_pre_collate = _mark()
         batch = _collate([samples[i] for i in usable], self.device)
 
-        import time as _time2
-        _t_pre_fwd = _time2.perf_counter()
+        _t_pre_fwd = _mark()
+        self.perf_t_collate += _t_pre_fwd - _t_pre_collate
         autocast = torch.autocast("cuda", dtype=torch.bfloat16) if self.bf16 else _NullCtx()
         with torch.no_grad(), autocast:
             # Encode once for both the pointer AR loop and the value head.
@@ -244,7 +275,7 @@ class PolicyActor:
                 encoded=h,
             )
             value = self.policy.value(h[:, 0])
-        _t_post_fwd = _time2.perf_counter()
+        _t_post_fwd = _mark()
         self.perf_t_forward += _t_post_fwd - _t_pre_fwd
 
         logp = logp.float().cpu().numpy()
@@ -265,6 +296,9 @@ class PolicyActor:
                 "logp": float(logp[slot]),
                 "value": float(value[slot]),
             }
+        self.perf_t_d2h += _time2.perf_counter() - _t_post_fwd
+        self.perf_n_calls += 1
+        self.perf_n_rows += len(requests)
         return replies
 
 

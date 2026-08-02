@@ -21,8 +21,59 @@ _engine_attack_features: dict | None = None
 # ── Rust library loading ──────────────────────────────────────────────────
 
 
+_LIB: ctypes.CDLL | None = None
+_BASICS_REGISTERED = False
+
+
+def _register_basic_pokemon(lib: ctypes.CDLL) -> None:
+    """Tell the Rust determinizer which card ids are Basic Pokémon.
+
+    Only a Basic can legally be the opponent's face-down active.  Without this
+    the guess is drawn from the whole predicted deck — where only ~16% of slots
+    are Basic — and ``SearchBegin`` refuses the root with error 2, costing that
+    decision its search and dropping the agent to a greedy forward pass.
+
+    Deferred rather than done at load time: the agent assigns
+    ``_engine_card_features`` at import, and this runs on the first decision, so
+    it cannot race that assignment.  Best-effort — a failure here only returns
+    the determinizer to its previous behaviour.
+    """
+    global _BASICS_REGISTERED
+    if _BASICS_REGISTERED or not _engine_card_features:
+        return
+    try:
+        from model.featurizer import CARD_FEAT_BASIC_COL
+    except ImportError:  # running from the repo, not the bundle
+        from ptcg_il.featurizer import CARD_FEAT_BASIC_COL
+    try:
+        ids = sorted(
+            int(cid) for cid, row in _engine_card_features.items()
+            if len(row) > CARD_FEAT_BASIC_COL and row[CARD_FEAT_BASIC_COL] > 0.5
+        )
+        if not ids:
+            return
+        n = lib.puct_set_basic_pokemon(json.dumps(ids).encode("utf-8"))
+        _BASICS_REGISTERED = n >= 0
+        # Printed on purpose: whether this ran is the first question asked when
+        # "SearchBegin error code 2" shows up, and a bundle carrying an old
+        # search_infer.py against a new .so is silent about it otherwise.
+        print(f"[agent] MCTS determinizer: {n} Basic Pokémon ids registered")
+    except AttributeError:
+        print("[agent] WARNING: libptcg_search.so has no puct_set_basic_pokemon "
+              "— rebuild it (cargo build --release) or the determinizer will "
+              "guess the opponent's face-down active from the whole deck")
+    except Exception as exc:  # noqa: BLE001 — never fail a decision over this
+        print(f"[agent] WARNING: could not register Basic-Pokémon set ({exc})")
+
+
 def _load_search_lib() -> ctypes.CDLL:
-    """Find and load ``libptcg_search.so`` from the submission data dir."""
+    """Find and load ``libptcg_search.so`` from the submission data dir.
+
+    Cached: this used to re-resolve and re-register argtypes on every decision.
+    """
+    global _LIB
+    if _LIB is not None:
+        return _LIB
     candidates = [
         os.path.join(os.path.dirname(__file__), "..", "data", "libptcg_search.so"),
         os.path.join("/kaggle_simulations/agent/data", "libptcg_search.so"),
@@ -64,6 +115,15 @@ def _load_search_lib() -> ctypes.CDLL:
             lib.search_plan_free.argtypes = [ctypes.c_void_p]
             lib.search_plan_free.restype = None
 
+            # Optional: an older .so without it still works, just with the
+            # whole-template active guess.
+            try:
+                lib.puct_set_basic_pokemon.argtypes = [ctypes.c_char_p]
+                lib.puct_set_basic_pokemon.restype = ctypes.c_int
+            except AttributeError:
+                pass
+
+            _LIB = lib
             return lib
 
     raise FileNotFoundError(
@@ -143,15 +203,23 @@ def predict_opponent_deck(
                 pass
 
         # ── Tier 3: card distribution ─────────────────────────────────
+        # `deck` is [n_all_cards] and indexed by **engine card id**, not by
+        # vocab index: `belief_labels.deck_counts_dense` writes `out[cid]` for
+        # a raw engine id, and `cli` sizes the head from the engine feature
+        # matrix.  Routing it through `_index_to_id(vocab)` (≈311 entries
+        # against a 1268-wide head) both relabelled every card and silently
+        # dropped every id past the end of the vocab, so this tier returned a
+        # short deck of the wrong cards — inside a bare `except Exception`,
+        # with the empty-list mirror fallback right below it to absorb the
+        # damage.  Positions are already engine ids; there is no hop to make.
         deck_logits = belief_logits.get("deck")
         if deck_logits is not None:
             probs = deck_logits[0].float().cpu().numpy()
-            probs[:2] = 0.0  # mask PAD, UNKNOWN
+            probs[0] = 0.0  # id 0 is "no card"; 1 is a real card, keep it
             total = probs.sum()
             if total > 0:
                 probs = probs / total
-                index_to_id = _index_to_id(vocab)
-                return _deck_from_distribution(probs, index_to_id, rng=rng)
+                return _deck_from_distribution(probs, None, rng=rng)
 
     except Exception:
         pass
@@ -203,20 +271,28 @@ def extract_opp_visible_cards(obs_dict: dict) -> list[int]:
 
 
 _FALLBACK_WARNED: set[str] = set()
+_FALLBACK_COUNTS: dict[str, int] = {}
 
 
 def _warn_fallback(reason: str) -> None:
-    """Report a degradation to greedy — once per distinct reason.
+    """Report a degradation to greedy, with how often it has happened.
 
     ``mcts_search`` used to swallow every failure, so a run with no search at
     all was indistinguishable from a working one: the agent still returned
-    legal moves, just from a single forward pass.  Printing once per reason
-    keeps that visible without one line per decision.
+    legal moves, just from a single forward pass.
+
+    Printing strictly once per reason overcorrected — a single transient
+    rejection (one refused search root out of hundreds) produced a line that
+    reads as though search never runs at all.  Re-reporting on a widening
+    interval distinguishes "happened twice" from "happens every turn" without
+    one line per decision.
     """
-    if reason in _FALLBACK_WARNED:
-        return
+    n = _FALLBACK_COUNTS.get(reason, 0) + 1
+    _FALLBACK_COUNTS[reason] = n
     _FALLBACK_WARNED.add(reason)
-    print(f"[agent] WARNING: MCTS unavailable, falling back to greedy ({reason})")
+    if n == 1 or n in (10, 100) or n % 500 == 0:
+        suffix = "" if n == 1 else f" — {n} times so far"
+        print(f"[agent] WARNING: MCTS fell back to greedy ({reason}){suffix}")
 
 
 def mcts_search(
@@ -253,6 +329,7 @@ def mcts_search(
 
     try:
         lib = _load_search_lib()
+        _register_basic_pokemon(lib)
 
         obs_json = json.dumps(obs_dict)
         fixed_json = json.dumps(fixed_deck)
@@ -481,11 +558,16 @@ def _index_to_id(vocab: dict) -> list[int]:
 
 def _deck_from_distribution(
     probs: np.ndarray,
-    index_to_id: list[int],
+    index_to_id: list[int] | None,
     deck_size: int = 60,
     rng: np.random.Generator | None = None,
 ) -> list[int]:
-    """Sample deck_size cards from a vocab distribution."""
+    """Sample *deck_size* cards from a card distribution.
+
+    *index_to_id* maps position → engine card id.  Pass ``None`` when *probs*
+    is already indexed by engine card id — the same convention
+    ``featurizer._ids_to_feat`` uses, and what the belief ``deck`` head emits.
+    """
     if rng is not None:
         counts = rng.multinomial(deck_size, probs)
     else:
@@ -498,9 +580,12 @@ def _deck_from_distribution(
 
     deck = []
     for idx in np.nonzero(counts)[0]:
-        if idx >= len(index_to_id):
+        if index_to_id is None:
+            cid = int(idx)
+        elif idx >= len(index_to_id):
             continue
-        cid = index_to_id[idx]
+        else:
+            cid = index_to_id[idx]
         if cid < 0:
             continue
         deck.extend([cid] * int(counts[idx]))

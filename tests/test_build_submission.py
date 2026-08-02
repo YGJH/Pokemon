@@ -56,25 +56,83 @@ def test_matching_pair_is_accepted(bs, data_dir):
     bs.check_artifact_pairing(_record(data_dir), data_dir)
 
 
-def test_stale_vocab_aborts(bs, data_dir):
-    """The real case: checkpoints_a2 pinned d43bb2e2 while data/ held f9470f51."""
-    rec = _record(data_dir, vocab_sha1="d43bb2e28112")
+def test_each_pin_explains_its_own_consequence(bs, data_dir):
+    """The two pins mean different things; one shared sentence described neither.
+
+    The old text promised "scrambled card identities" for the vocab pin, which
+    requires learned card-id embeddings — `model/cards.py` has none.
+    """
+    rec = _record(data_dir, vocab_sha1="deadbeefdead",
+                  archetypes_sha1="deadbeefdead")
     with pytest.raises(SystemExit) as exc:
-        bs.check_artifact_pairing(rec, data_dir)
-    assert "vocab.json" in str(exc.value)
-    assert "d43bb2e28112" in str(exc.value)
+        bs.check_artifact_pairing(rec, data_dir, mcts=True)
+    msg = str(exc.value)
+
+    assert bs._PIN_CONSEQUENCE["vocab.json"] in msg
+    assert bs._PIN_CONSEQUENCE["archetypes.json"] in msg
+    assert (bs._PIN_CONSEQUENCE["vocab.json"]
+            != bs._PIN_CONSEQUENCE["archetypes.json"])
+    assert "scrambled card identities" not in msg
 
 
-def test_stale_archetypes_aborts(bs, data_dir):
+def test_only_the_mismatched_pin_is_explained(bs, data_dir, capsys):
+    """A vocab-only mismatch must not lecture about the belief arch head."""
+    rec = _record(data_dir, vocab_sha1="deadbeefdead")
+    bs.check_artifact_pairing(rec, data_dir, mcts=True)
+    msg = capsys.readouterr().out
+    assert bs._PIN_CONSEQUENCE["vocab.json"] in msg
+    assert bs._PIN_CONSEQUENCE["archetypes.json"] not in msg
+
+
+# ── Severity follows what the bundle actually reads ──────────────────────
+#
+# The guard used to abort on either pin for every build type.  That refused to
+# package bundles whose correctness the mismatch could not affect: no build
+# routes card identity through the vocab, and a --no-mcts bundle ships no
+# archetypes.json at all.  Severity is now derived from `_PIN_CONSUMED_BY`.
+
+
+def test_vocab_only_mismatch_never_aborts(bs, data_dir, capsys):
+    """The real case: checkpoints_a2 pinned d43bb2e2 while data/ held f9470f51.
+
+    Still reported — it is real evidence of a mismatched pair — but the vocab
+    is read by neither build type, so it cannot make a bundle wrong.
+    """
+    rec = _record(data_dir, vocab_sha1="d43bb2e28112")
+    for mcts in (True, False):
+        bs.check_artifact_pairing(rec, data_dir, mcts=mcts)
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "vocab.json" in out and "d43bb2e28112" in out
+    assert not bs._PIN_CONSUMED_BY["vocab.json"], (
+        "this test asserts the vocab is consumed by nothing")
+
+
+def test_stale_archetypes_aborts_only_for_mcts(bs, data_dir, capsys):
+    rec = _record(data_dir, archetypes_sha1="c6b5e71baaaa")
+
+    with pytest.raises(SystemExit) as exc:
+        bs.check_artifact_pairing(rec, data_dir, mcts=True)
+    assert "READS this file" in str(exc.value)
+
+    # --no-mcts ships no archetypes.json and never calls the belief heads.
+    bs.check_artifact_pairing(rec, data_dir, mcts=False)
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "does not read this file" in out
+
+
+def test_force_downgrades_a_fatal_mismatch_to_a_warning(bs, data_dir, capsys):
+    rec = _record(data_dir, archetypes_sha1="c6b5e71baaaa")
+    bs.check_artifact_pairing(rec, data_dir, force=True, mcts=True)
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_default_build_type_is_mcts(bs, data_dir):
+    """`mcts` defaults to True, so an omitted argument keeps the strict path."""
     rec = _record(data_dir, archetypes_sha1="c6b5e71baaaa")
     with pytest.raises(SystemExit):
         bs.check_artifact_pairing(rec, data_dir)
-
-
-def test_force_downgrades_to_a_warning(bs, data_dir, capsys):
-    rec = _record(data_dir, vocab_sha1="d43bb2e28112")
-    bs.check_artifact_pairing(rec, data_dir, force=True)
-    assert "WARNING" in capsys.readouterr().out
 
 
 def test_truncated_pin_matches_full_digest(bs, data_dir):
@@ -94,3 +152,125 @@ def test_unlabelled_checkpoint_is_left_to_the_deck_check(bs, data_dir):
 def test_absent_pins_are_not_treated_as_mismatches(bs, data_dir):
     """Checkpoints predating the deck record carry no SHAs to compare."""
     bs.check_artifact_pairing({"archetype_self": 0}, data_dir)
+
+
+# ── --no-mcts bundle ──────────────────────────────────────────────────────
+#
+# The greedy bundle ships no libptcg_search.so, so anything left in it that
+# still reaches for MCTS degrades to `search_infer`'s own greedy fallback:
+# same moves, but the failure prints as a warning and reads like search that
+# merely underperformed.  These assert the two templates and the file lists
+# actually diverge.
+
+
+def test_greedy_main_py_calls_no_search(bs):
+    """Parsed, not grepped: the template's prose mentions the search it drops."""
+    import ast
+
+    tree = ast.parse(bs.MAIN_PY_TEMPLATE_GREEDY)
+    imported, called = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+            imported.update(a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(a.name for a in node.names)
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            called.add(fn.id if isinstance(fn, ast.Name)
+                       else fn.attr if isinstance(fn, ast.Attribute) else "")
+
+    assert not any("search_infer" in m for m in imported), imported
+    assert "mcts_search" not in called
+    assert "predict_opponent_deck" not in called
+    assert "select_multi" in called, "multi-select decisions still need the AR path"
+    assert "featurize" in called
+
+
+def test_build_main_py_selects_the_template(bs, tmp_path):
+    bs.build_main_py(tmp_path, mcts=False)
+    assert "mcts_search" not in (tmp_path / "main.py").read_text()
+    bs.build_main_py(tmp_path, mcts=True)
+    assert "mcts_search" in (tmp_path / "main.py").read_text()
+
+
+def test_greedy_package_omits_the_search_modules(bs, tmp_path, monkeypatch):
+    """EXTRA_FILES (search_infer.py, belief_posterior.py) must not be bundled."""
+    src = tmp_path / "src"
+    model_src = src / "python" / "ptcg_il" / "model"
+    model_src.mkdir(parents=True)
+    for fname in bs.MODEL_FILES:
+        (model_src / fname).write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "ref_map.py").write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "featurizer.py").write_text("# stub\n")
+    n_extra = 0
+    for rel, _dest in bs.EXTRA_FILES:
+        p = src / "python" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# stub\n")
+        n_extra += 1
+    assert n_extra, "EXTRA_FILES is empty — this test would pass vacuously"
+
+    bs.build_model_package(src, tmp_path / "greedy", mcts=False)
+    bs.build_model_package(src, tmp_path / "with_mcts", mcts=True)
+
+    for _rel, dest in bs.EXTRA_FILES:
+        assert not (tmp_path / "greedy" / "model" / dest).exists(), dest
+        assert (tmp_path / "with_mcts" / "model" / dest).exists(), dest
+    # The shared model files still ship in both.
+    for fname in bs.MODEL_FILES:
+        assert (tmp_path / "greedy" / "model" / fname).exists(), fname
+
+
+# ── The Kaggle runner does not define __file__ ───────────────────────────
+#
+# `kaggle_environments.agent` execs main.py into a namespace without
+# ``__file__``, so a template that reads it raises NameError.  `_find_libcg`
+# is only reached from `agent()`, i.e. on the first *decision*, which is why
+# `verify_model_imports`' `import main` (which does bind ``__file__``) passed
+# a bundle that died on move one of every game.
+
+
+@pytest.mark.parametrize("template", ["MAIN_PY_TEMPLATE", "MAIN_PY_TEMPLATE_GREEDY"])
+def test_main_py_never_reads_bare_dunder_file(bs, template):
+    """`_cgsim.__file__` is fine — an imported module has one.  A bare read is not."""
+    import ast
+
+    tree = ast.parse(getattr(bs, template))
+    bare = [n for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and n.id == "__file__"]
+    assert not bare, (
+        f"{template} reads __file__ as a bare name at line(s) "
+        f"{[n.lineno for n in bare]}; the Kaggle runner does not define it")
+
+
+def test_find_libcg_runs_without_dunder_file(bs, tmp_path, monkeypatch):
+    """Exec the real template fragments the way Kaggle does: no ``__file__``."""
+    import ast
+
+    src = bs.MAIN_PY_TEMPLATE
+    tree = ast.parse(src)
+    wanted = {"_AGENT_DIR", "_libcg_name", "_find_libcg"}
+    chunks = []
+    for node in tree.body:
+        names = ({t.id for t in node.targets if isinstance(t, ast.Name)}
+                 if isinstance(node, ast.Assign)
+                 else {node.name} if isinstance(node, ast.FunctionDef) else set())
+        if names & wanted:
+            chunks.append(ast.get_source_segment(src, node))
+            wanted -= names
+    assert not wanted, f"template no longer defines {wanted}"
+
+    # cwd is the fallback when neither /kaggle_simulations/agent nor __file__
+    # exists, so put a plausible engine there and confirm it is found.
+    monkeypatch.chdir(tmp_path)
+    ns = {"os": __import__("os"), "__name__": "main"}
+    assert "__file__" not in ns
+    exec(compile("\n".join(chunks), "main.py", "exec"), ns)
+
+    name = ns["_libcg_name"]()
+    assert not (tmp_path / name).exists()
+    assert ns["_find_libcg"]() == name, "missing engine should degrade, not raise"
+
+    (tmp_path / name).write_bytes(b"\x7fELF")
+    assert ns["_find_libcg"]() == str(tmp_path / name)

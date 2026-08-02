@@ -210,9 +210,14 @@ pub(crate) fn select_leaf(
         // puct_score function already handles the sign, so the comparison is
         // always "larger score wins" (max for us, min for opp encoded in sign).
 
+        // `expand_leaf` keeps children and priors the same length.  Reading
+        // through `get` anyway means a future caller that breaks that contract
+        // gets a badly-explored node, not a panic on a rayon worker that takes
+        // the whole select_batch down with it.
+        debug_assert_eq!(node.children.len(), node.priors.len());
         for i in 0..n_opts {
             let child_idx = node.children[i];
-            let prior = node.priors[i];
+            let prior = node.priors.get(i).copied().unwrap_or(0.0);
             let child = &tree.nodes[child_idx];
             let score = puct_score(child, parent_visits, prior, config.c_puct, player_role);
             if score > best_score {
@@ -284,10 +289,27 @@ pub(crate) fn expand_leaf(
     // Collect info needed for child creation
     let n_options = tree.nodes[leaf_idx].n_options;
 
+    // One child per *scored* option.  `select_leaf` walks children and reads
+    // the prior at the same index, so the two vectors must be the same length;
+    // they were not, and the shorter one was `priors`:
+    //
+    //   - The featurizer caps an option list at O_MAX (64), so a node with
+    //     more options than that came back with 64 priors against n_options
+    //     children — an out-of-bounds index at exactly 64.
+    //   - Multi-select added a STOP column with no child behind it, making
+    //     priors one *longer* instead.
+    //
+    // The evaluator now drops STOP, and taking the min here caps the tree at
+    // what the network actually scored: options past O_MAX go unsearched,
+    // which is where the policy stands on them anyway.
+    let mut priors = priors;
+    let n_children = n_options.min(priors.len());
+    priors.truncate(n_children);
+
     // Create placeholder children (no search_id yet — lazy creation).
     // The child at index `i` corresponds to option `i`.
-    let mut child_indices: Vec<usize> = Vec::with_capacity(n_options);
-    for opt_idx in 0..n_options {
+    let mut child_indices: Vec<usize> = Vec::with_capacity(n_children);
+    for opt_idx in 0..n_children {
         let child = PuctNode {
             search_id: 0, // lazy: created when first visited
             action: Some(opt_idx as i32),
@@ -564,6 +586,20 @@ struct ForestTree {
     iter_count: u32,
     /// This tree's fixed config.
     config: PuctConfig,
+    /// The engine that owns every `search_id` in this tree.
+    ///
+    /// A `search_id` is meaningful only to the agent that minted it:
+    /// `SearchStep` and `SearchRelease` both take the agent pointer, and
+    /// libcg looks the id up in *that* agent's table.  Binding the engine
+    /// once, at `add_tree`, is what keeps the root — created before the
+    /// tree has an id — on the same agent as every child and every
+    /// release.  Deriving it as `tree_id % n_engines` at each call site
+    /// did not: the root was minted on engine 0 while `realise_leaves`,
+    /// `all_results` and `reset` addressed engine `tid % n`, so for every
+    /// tree with `tid % n != 0` the child steps failed and the root state
+    /// was never freed.  libcg exports no `AgentEnd`, so that leak is
+    /// permanent — ~22 KB per root, measured.
+    engine_idx: usize,
 }
 
 /// A leaf that needs NN evaluation, tagged with its tree id.
@@ -605,8 +641,8 @@ pub struct ForestTreeResult {
 /// the loop: select a batch of leaves → GPU forward → expand batch.
 pub struct PuctForest {
     trees: Vec<ForestTree>,
-    /// Reference to the engine pool (indexed by tree_id % n_engines).
-    /// We store the pool length to map tree → engine.
+    /// Size of the engine pool, used to round-robin new trees across it.
+    /// Each tree then keeps its own `engine_idx` — see [`ForestTree`].
     n_engines: usize,
 }
 
@@ -618,12 +654,24 @@ impl PuctForest {
         }
     }
 
+    /// The engine the next [`add_tree`](Self::add_tree) will bind to.
+    ///
+    /// The caller must mint the root's `search_id` on this engine, because
+    /// the root is created before the tree exists.
+    pub fn next_engine_idx(&self) -> usize {
+        self.trees.len() % self.n_engines
+    }
+
     /// Add a new tree to the forest.  Returns the tree_id.
+    ///
+    /// `engine_idx` must be the engine that minted `root_node.search_id` —
+    /// pass what [`next_engine_idx`](Self::next_engine_idx) returned.
     pub fn add_tree(
         &mut self,
         root_node: PuctNode,
         our_player_index: i32,
         config: PuctConfig,
+        engine_idx: usize,
     ) -> usize {
         let id = self.trees.len();
         self.trees.push(ForestTree {
@@ -632,6 +680,7 @@ impl PuctForest {
             last_leaf: 0,
             iter_count: 0,
             config,
+            engine_idx,
         });
         id
     }
@@ -736,7 +785,7 @@ impl PuctForest {
                 continue;
             }
 
-            let engine = &engines[leaf.tree_id % engines.len()];
+            let engine = &engines[ft.engine_idx % engines.len()];
             let parent_idx = if ft.selection_path.len() >= 2 {
                 ft.selection_path[ft.selection_path.len() - 2]
             } else {
@@ -809,16 +858,24 @@ impl PuctForest {
     }
 
     /// Collect results for all trees.
-    pub fn all_results(&self, engines: &[crate::engine::Engine]) -> Vec<ForestTreeResult> {
+    ///
+    /// Takes `&mut self` because it releases each node's engine state and
+    /// zeroes the id afterwards.  That zeroing is what makes [`reset`]
+    /// safe to call on a forest whose results were already collected —
+    /// `SearchRelease` on an id the engine has already freed is not a
+    /// no-op on libcg's side.
+    pub fn all_results(&mut self, engines: &[crate::engine::Engine]) -> Vec<ForestTreeResult> {
         self.trees
-            .iter()
+            .iter_mut()
             .enumerate()
             .map(|(tid, ft)| {
-                // Release engine states for this tree
-                let engine = &engines[tid % engines.len()];
-                for node in &ft.tree.nodes {
+                // Release engine states for this tree, on the agent that
+                // minted them — see `ForestTree::engine_idx`.
+                let engine = &engines[ft.engine_idx % engines.len()];
+                for node in &mut ft.tree.nodes {
                     if node.search_id != 0 {
                         engine.search_release(node.search_id);
+                        node.search_id = 0;
                     }
                 }
 
@@ -836,5 +893,100 @@ impl PuctForest {
     /// Total number of trees.
     pub fn len(&self) -> usize {
         self.trees.len()
+    }
+
+    /// Drop every tree, keeping the engines alive.
+    ///
+    /// This is the only way to reuse a forest across search batches, and
+    /// reuse is not an optimisation — it is required for the process to
+    /// survive.  `AgentStart` has no counterpart in libcg's ABI (there is
+    /// no `AgentEnd`), and `SearchEnd` only returns the arena to *that*
+    /// agent for reuse, so an `Engine` that is dropped strands everything
+    /// it ever allocated.  Building a fresh pool per search batch
+    /// therefore leaks the whole arena, once per batch.
+    ///
+    /// Releases any node state [`all_results`] did not already release —
+    /// the search loop can break early, and those ids belong to the
+    /// long-lived agents now, not to a pool about to be dropped.
+    pub fn reset(&mut self, engines: &[crate::engine::Engine]) -> usize {
+        let n = self.trees.len();
+        for ft in self.trees.iter_mut() {
+            let engine = &engines[ft.engine_idx % engines.len()];
+            for node in &mut ft.tree.nodes {
+                if node.search_id != 0 {
+                    engine.search_release(node.search_id);
+                    node.search_id = 0;
+                }
+            }
+        }
+        self.trees.clear();
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(n_options: usize) -> PuctNode {
+        PuctNode {
+            search_id: 1,
+            action: None,
+            n_options,
+            visits: 0.0,
+            total_value: 0.0,
+            priors: Vec::new(),
+            children: Vec::new(),
+            obs_json: String::new(),
+            player_role: 0,
+            is_terminal: false,
+            terminal_value: None,
+        }
+    }
+
+    fn tree_with_root(n_options: usize) -> PuctTree {
+        let mut t = PuctTree::new(node(n_options), 0);
+        t.selection_path = vec![0];
+        t
+    }
+
+    /// The panic the user hit: the featurizer caps an option list at O_MAX, so
+    /// a node with more engine options than that came back with fewer priors
+    /// than the tree had children, and `select_leaf` indexed past the end.
+    #[test]
+    fn test_fewer_priors_than_options_truncates_the_tree() {
+        let mut tree = tree_with_root(70);
+        let priors = vec![1.0 / 64.0; 64];
+        expand_leaf(&mut tree, 0, priors, 0.5, "{}".to_string()).unwrap();
+
+        assert_eq!(tree.nodes[0].children.len(), 64, "tree must match the priors");
+        assert_eq!(tree.nodes[0].priors.len(), 64);
+
+        // The traversal that used to panic.
+        let cfg = PuctConfig::default();
+        tree.selection_path.clear();
+        let leaf = select_leaf(&mut tree, &cfg).expect("selection must not fail");
+        assert!(leaf < tree.nodes.len());
+    }
+
+    /// Multi-select adds a STOP column with no child behind it, which made
+    /// priors one *longer* than children.
+    #[test]
+    fn test_more_priors_than_options_are_dropped() {
+        let mut tree = tree_with_root(3);
+        let priors = vec![0.25, 0.25, 0.25, 0.25]; // 3 options + STOP
+        expand_leaf(&mut tree, 0, priors, 0.0, "{}".to_string()).unwrap();
+
+        assert_eq!(tree.nodes[0].children.len(), 3);
+        assert_eq!(tree.nodes[0].priors.len(), 3, "the STOP prior has no child");
+    }
+
+    /// The ordinary case must be untouched.
+    #[test]
+    fn test_matching_lengths_are_preserved() {
+        let mut tree = tree_with_root(4);
+        expand_leaf(&mut tree, 0, vec![0.1, 0.2, 0.3, 0.4], 0.0, "{}".to_string()).unwrap();
+        assert_eq!(tree.nodes[0].children.len(), 4);
+        assert_eq!(tree.nodes[0].priors, vec![0.1, 0.2, 0.3, 0.4]);
     }
 }
