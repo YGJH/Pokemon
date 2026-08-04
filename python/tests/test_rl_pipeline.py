@@ -193,10 +193,16 @@ class TestCheckpointConfig:
         torch = pytest.importorskip("torch")
         from ptcg_il.model.policy import Policy
 
+        from ptcg_il.model.policy import current_feature_dims
+
         p = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
         # No V/A: cards are static features, so there is no vocab width to record.
-        assert p.config == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
-                            "n_opp_arch": 6, "n_all_cards": 0}
+        arch = {k: v for k, v in p.config.items() if k != "feat_dims"}
+        assert arch == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
+                        "n_opp_arch": 6, "n_all_cards": 0}
+        # ...plus the featurizer widths the weights were shaped by, so a
+        # featurizer edit cannot silently redefine the checkpoint.
+        assert p.config["feat_dims"] == current_feature_dims()
         del torch
 
     def test_config_roundtrips_through_policy_from_config(self):

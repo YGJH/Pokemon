@@ -274,3 +274,11 @@ def test_find_libcg_runs_without_dunder_file(bs, tmp_path, monkeypatch):
 
     (tmp_path / name).write_bytes(b"\x7fELF")
     assert ns["_find_libcg"]() == str(tmp_path / name)
+
+
+def test_featurizer_imports_are_rewritten_for_the_bundle(bs):
+    """model/*.py import dims from ptcg_il.featurizer; the bundle vendors it as
+    model/featurizer.py.  Without a rewrite rule the bundle ships a literal
+    `from ptcg_il.featurizer import ...`, which only fails after submission."""
+    src = "from ptcg_il.featurizer import F_CARD, F_ATK\n"
+    assert bs.rewrite_imports(src) == "from model.featurizer import F_CARD, F_ATK\n"

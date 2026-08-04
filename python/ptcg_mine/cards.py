@@ -28,8 +28,29 @@ ATKCOST_N = 5.0
 N_CARDTYPE = 7
 N_ENERGY = 12
 
-F_CARD = 94  # 52 base + 3 attacks × 14
-F_ATK = 14
+from ptcg_il.featurizer import F_ATK, F_CARD
+from ptcg_mine.keywords import K_EFFECT, ability_keyword_row, attack_keyword_row
+
+# ptcg_il.featurizer owns the dims but cannot import K_EFFECT (it is vendored
+# into the Kaggle bundle, where ptcg_mine does not exist).  Assert agreement
+# here instead: appending a keyword without bumping the featurizer would
+# otherwise emit a row of the old width, which every downstream shape check
+# accepts until the first forward pass.
+assert F_ATK == 14 + K_EFFECT, (
+    f"F_ATK={F_ATK} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
+    f"in ptcg_mine.keywords (expected {14 + K_EFFECT})"
+)
+assert F_CARD == 52 + K_EFFECT + 2 + 3 * F_ATK, (
+    f"F_CARD={F_CARD} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
+    f"(expected {52 + K_EFFECT + 2 + 3 * F_ATK})"
+)
+
+#: Offset of the first embedded attack block inside ``card_static_row``.
+CARD_ATTACK_BLOCK_START = 52 + K_EFFECT + 2   # == 83
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 _ENGINE_DIR = (
     Path(__file__).resolve().parent.parent
@@ -79,14 +100,19 @@ def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
     row[24:36] = _onehot(card.weakness, N_ENERGY)
     row[36:48] = _onehot(card.resistance, N_ENERGY)
     row[48:52] = [float(card.ex), float(card.megaEx), float(card.tera), float(card.aceSpec)]
-    # Attack features (52:94) — up to 3 attacks, each 14-dim, same layout as
-    # attack_static_row so the two views of an attack cannot drift apart.
+    # Ability keywords + counts (52:83)
+    row[52:52 + K_EFFECT] = ability_keyword_row(card)
+    skills = getattr(card, "skills", None) or []
     attack_ids = getattr(card, "attacks", []) or []
+    row[52 + K_EFFECT] = min(len(skills), 3) / 3.0
+    row[52 + K_EFFECT + 1] = min(len(attack_ids), 3) / 3.0
+    # Attack features (83:212) — up to 3 attacks, each F_ATK, same layout as
+    # attack_static_row so the two views of an attack cannot drift apart.
     for ai in range(min(len(attack_ids), 3)):
         atk = attacks_by_id.get(int(attack_ids[ai]))
         if atk is None:
             continue
-        offset = 52 + ai * F_ATK
+        offset = CARD_ATTACK_BLOCK_START + ai * F_ATK
         row[offset:offset + F_ATK] = attack_static_row(atk)
     return row
 
@@ -111,6 +137,11 @@ def attack_static_row(attack) -> np.ndarray:
         hist[int(e)] += 1.0
     row[1:13] = hist / ATKCOST_N
     row[13] = len(attack.energies) / ATKCOST_N
+    # Effect keywords from the attack's oracle text (14:43).  Living here rather
+    # than only in card_static_row is deliberate: opt_attack_feat is built from
+    # this row, so ATTACK options gain their effect text for free -- the decision
+    # where text matters most.
+    row[14:14 + K_EFFECT] = attack_keyword_row(attack)
     return row
 
 
@@ -175,5 +206,38 @@ def build_engine_card_features(card_data: list,
 
 
 def build_engine_attack_features(attack_data: list) -> dict[int, np.ndarray]:
-    """Build ``{attack_id: static_row_14}`` for ALL engine attacks."""
+    """Build ``{attack_id: static_row_43}`` for ALL engine attacks."""
     return {a.attackId: attack_static_row(a) for a in attack_data}
+
+
+def build_evolution_map(card_data: list) -> dict[int, list[int]]:
+    """``{card_id: [pre_evolution_card_ids]}`` resolved from ``evolvesFrom``.
+
+    ``CardData.evolvesFrom`` is a *name*, and names are not in the feature row,
+    so the hand-playability flag needs this side table.  Several distinct card
+    ids share a name (reprints), hence the list value — any of them in play
+    makes the evolution legal.
+
+    An unresolvable name is logged rather than dropped: silently returning an
+    empty list is indistinguishable downstream from "this card evolves from
+    nothing", which would teach the model the evolution is never available.
+    """
+    by_name: dict[str, list[int]] = {}
+    for c in card_data:
+        by_name.setdefault(c.name, []).append(int(c.cardId))
+
+    out: dict[int, list[int]] = {}
+    for c in card_data:
+        pre = getattr(c, "evolvesFrom", None)
+        if not pre:
+            out[int(c.cardId)] = []
+            continue
+        ids = by_name.get(pre)
+        if ids is None:
+            logger.warning(
+                "evolution_map: %s (id %d) evolves from %r, which matches no "
+                "card name in the engine tables", c.name, int(c.cardId), pre)
+            out[int(c.cardId)] = []
+        else:
+            out[int(c.cardId)] = sorted(ids)
+    return out

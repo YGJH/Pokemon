@@ -17,8 +17,7 @@ import torch.nn as nn
 
 from ptcg_il.model import MLP
 
-F_CARD = 94  # 52 base + 3 attacks × 14
-F_ATK = 14
+from ptcg_il.featurizer import F_ATK, F_CARD
 
 
 class CardFeaturizer(nn.Module):

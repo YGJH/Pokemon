@@ -20,6 +20,7 @@ from ptcg_mine.archetype import canon, cluster_decks, pick_fixed_deck, select_se
 from ptcg_mine.artifacts import write_archetypes_json, write_mining_report, write_vocab_json
 from ptcg_mine.cards import (build_engine_attack_features,
                               build_engine_card_features,
+                              build_evolution_map,
                               build_static_tables, load_engine)
 from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import (
@@ -420,6 +421,9 @@ def run(config: MineConfig, skip_download: bool, force: bool = False,
     np.save(out_dir / "engine_card_features.npy", engine_card_features)
     engine_attack_features = build_engine_attack_features(attacks)
     np.save(out_dir / "engine_attack_features.npy", engine_attack_features)
+
+    evolution_map = build_evolution_map(cards)
+    np.save(out_dir / "evolution_map.npy", evolution_map)
 
     summary = {
         "vocab_size": vocab["size"],

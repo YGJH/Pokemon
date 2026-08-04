@@ -19,6 +19,24 @@ from ptcg_il.model.value import ValueHead
 
 logger = logging.getLogger(__name__)
 
+#: Featurizer widths that determine input layer shapes.  These are module-level
+#: constants in ``ptcg_il.featurizer`` baked into ``nn.Linear`` shapes at
+#: construction (``cards.py`` ``MLP(F_CARD, D, D)``, ``embed.py``
+#: ``MLP(F_POKE, ...)``, ``pointer.py`` ``nn.Linear(D + F_OPT, D)``), so editing
+#: the featurizer silently redefines what a checkpoint's weights mean.  Recorded
+#: in ``Policy.config`` and checked by :func:`policy_from_config`, for the same
+#: reason ``ptcg_il.deck`` pins ``vocab_sha1``/``archetypes_sha1``.
+FEATURE_DIM_KEYS: tuple[str, ...] = (
+    "F_CARD", "F_ATK", "F_POKE", "F_HAND", "F_SUM", "F_GLOBAL", "F_OPT",
+)
+
+
+def current_feature_dims() -> dict[str, int]:
+    """Snapshot the live ``ptcg_il.featurizer`` widths."""
+    from ptcg_il import featurizer as _fz
+
+    return {k: int(getattr(_fz, k)) for k in FEATURE_DIM_KEYS}
+
 
 class Policy(nn.Module):
     """End-to-end imitation-learning policy: embed -> encode -> pointer + value.
@@ -79,6 +97,7 @@ class Policy(nn.Module):
             "ff": ff,
             "n_opp_arch": n_opp_arch,
             "n_all_cards": n_all_cards,
+            "feat_dims": current_feature_dims(),
         }
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
@@ -283,6 +302,27 @@ def policy_from_config(config: dict,
             f"checkpoint config is missing {missing}; it predates Policy.config "
             "and the policy must be built from artifact sizes instead"
         )
+
+    # A featurizer edit changes every input width at once, and the resulting
+    # load failure names layer shapes rather than the cause.  Checkpoints from
+    # before this record was added carry no feat_dims and are let through --
+    # they fail later on shape, as they always did.
+    recorded = config.get("feat_dims")
+    if recorded:
+        live = current_feature_dims()
+        bad = {k: (int(v), live[k]) for k, v in recorded.items()
+               if k in live and int(v) != live[k]}
+        if bad:
+            detail = ", ".join(
+                f"{k}: checkpoint {was}, current {now}" for k, (was, now) in sorted(bad.items())
+            )
+            raise ValueError(
+                f"checkpoint was trained with different featurizer widths ({detail}). "
+                "ptcg_il/featurizer.py changed since it was written, so its weights "
+                "no longer mean what the current features mean. Retrain, or check out "
+                "the featurizer generation that produced it."
+            )
+
     return Policy(
         D=int(config["D"]),
         heads=int(config["heads"]),

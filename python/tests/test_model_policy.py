@@ -3,6 +3,7 @@
 import torch
 import pytest
 
+from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM
 from ptcg_il.model.cards import F_ATK, F_CARD
 from ptcg_il.model.embed import L_STATE, P_MAX, H_MAX, SUM
 from ptcg_il.model.pointer import O_MAX
@@ -33,10 +34,14 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "discard_mask": torch.ones(B, SUM, D_MAX, dtype=torch.bool),
         "prize_card_feat": torch.zeros(B, SUM, PZ_MAX, F_CARD),
         # State — dense features
-        "poke_feat": torch.randn(B, P_MAX, 26),
-        "hand_feat": torch.randn(B, H_MAX, 2),
-        "sum_feat": torch.randn(B, SUM, 11),
-        "cls_feat": torch.randn(B, 93),
+        # Widths come from ptcg_il.featurizer, never literals: a featurizer edit
+        # otherwise leaves this fixture building batches the model cannot accept,
+        # and every test that imports it fails on a matmul shape rather than on
+        # the thing it was written to check.
+        "poke_feat": torch.randn(B, P_MAX, F_POKE),
+        "hand_feat": torch.randn(B, H_MAX, F_HAND),
+        "sum_feat": torch.randn(B, SUM, F_SUM),
+        "cls_feat": torch.randn(B, F_GLOBAL),
         "stadium_present": torch.ones(B, 1),
         # State — categorical
         "tok_type": torch.randint(0, 5, (B, L)),
@@ -49,7 +54,7 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "opt_tgt_idx": torch.randint(-1, L, (B, O)),
         "opt_card_feat": torch.randn(B, O, F_CARD),
         "opt_attack_feat": torch.randn(B, O, F_ATK),
-        "opt_scalar": torch.randn(B, O, 6),
+        "opt_scalar": torch.randn(B, O, F_OPT),
         "opt_mask": torch.ones(B, O, dtype=torch.bool),
         # Labels (padded with -1, matching featurizer)
         "action_idx": torch.full((B, O), -1, dtype=torch.long),

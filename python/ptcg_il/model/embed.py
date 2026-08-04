@@ -18,11 +18,7 @@ P_MAX = 12
 H_MAX = 30
 SUM = 2
 
-# Feature dims (A.1)
-F_POKE = 26
-F_HAND = 2
-F_SUM = 11
-F_GLOBAL = 93
+from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_POKE, F_SUM
 
 # Normalizer for discard sum-pooling (A.2)
 DECK_N = 60.0

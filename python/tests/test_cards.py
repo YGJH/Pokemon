@@ -35,7 +35,7 @@ def test_load_engine_returns_cards_and_attacks(engine):
 def test_card_static_row_shape(engine, attacks_by_id):
     cards, _ = engine
     row = card_static_row(cards[0], attacks_by_id)
-    assert row.shape == (94,)  # 52 base + 3 attacks × 14
+    assert row.shape == (212,)  # 52 base + 29 ability kw + 2 counts + 3 attacks × 43
     assert row.dtype == np.float32
 
 
@@ -51,14 +51,20 @@ def test_card_static_row_attack_slice_matches_attack_static_row(engine, attacks_
                 and int((c.attacks or [0])[0]) in attacks_by_id)
     row = card_static_row(card, attacks_by_id)
 
+    from ptcg_mine.cards import CARD_ATTACK_BLOCK_START, F_ATK
     for ai, aid in enumerate(card.attacks[:3]):
         expected = attack_static_row(attacks_by_id[int(aid)])
-        np.testing.assert_array_equal(row[52 + ai * 14:52 + (ai + 1) * 14], expected)
+        np.testing.assert_array_equal(
+            row[CARD_ATTACK_BLOCK_START + ai * F_ATK:
+                CARD_ATTACK_BLOCK_START + (ai + 1) * F_ATK],
+            expected)
 
     # Unused attack slots are zero-padded
     for ai in range(len(card.attacks[:3]), 3):
         np.testing.assert_array_equal(
-            row[52 + ai * 14:52 + (ai + 1) * 14], np.zeros(14, dtype=np.float32)
+            row[CARD_ATTACK_BLOCK_START + ai * F_ATK:
+                CARD_ATTACK_BLOCK_START + (ai + 1) * F_ATK],
+            np.zeros(F_ATK, dtype=np.float32)
         )
 
 
@@ -98,7 +104,7 @@ def test_card_static_row_known_card_basic_grass_energy(engine, attacks_by_id):
 def test_attack_static_row_shape(engine):
     _, attacks = engine
     row = attack_static_row(attacks[0])
-    assert row.shape == (14,)
+    assert row.shape == (43,)
     assert row.dtype == np.float32
 
 
@@ -181,8 +187,45 @@ def test_build_static_tables_shapes_and_pad_row(engine):
     expected_unknown = card_table[2:].mean(axis=0)
     np.testing.assert_allclose(card_table[1], expected_unknown, rtol=1e-5, atol=1e-6)
 
-    assert attack_table.shape[1] == 14
+    assert attack_table.shape[1] == 43
     assert attack_table.dtype == np.float32
-    np.testing.assert_array_equal(attack_table[0], np.zeros(14, dtype=np.float32))
+    np.testing.assert_array_equal(attack_table[0], np.zeros(43, dtype=np.float32))
     assert 0 not in attack_id_to_index.values()  # PAD row reserved, no attackId maps to it
     assert attack_table.shape[0] == len(attack_id_to_index) + 1
+
+
+def test_evolution_map_resolves_names_to_ids():
+    from ptcg_mine.cards import build_evolution_map
+
+    class _C:
+        def __init__(self, cid, name, evolves_from):
+            self.cardId, self.name, self.evolvesFrom = cid, name, evolves_from
+
+    cards = [_C(1, "Charmander", None), _C(2, "Charmeleon", "Charmander"),
+             _C(3, "Charmander", None)]     # reprint: same name, different id
+    m = build_evolution_map(cards)
+    assert sorted(m[2]) == [1, 3], "a reprint of the pre-evolution must also count"
+    assert m[1] == []
+
+
+def test_evolution_map_handles_unresolvable_names(caplog):
+    from ptcg_mine.cards import build_evolution_map
+
+    class _C:
+        def __init__(self, cid, name, evolves_from):
+            self.cardId, self.name, self.evolvesFrom = cid, name, evolves_from
+
+    m = build_evolution_map([_C(1, "Charmeleon", "Charmander")])
+    assert m[1] == []
+    assert "Charmander" in caplog.text
+
+
+def test_evolution_map_covers_the_real_engine():
+    from ptcg_mine.cards import build_evolution_map, load_engine
+
+    cards, _ = load_engine()
+    m = build_evolution_map(cards)
+    evolvers = [c for c in cards if getattr(c, "evolvesFrom", None)]
+    assert evolvers, "no evolution cards in the engine tables"
+    unresolved = [c.name for c in evolvers if not m.get(c.cardId)]
+    assert not unresolved, f"unresolved pre-evolution names: {unresolved[:10]}"

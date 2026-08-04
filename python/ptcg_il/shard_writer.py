@@ -258,6 +258,18 @@ def _scan_projections(paths: list[Path], counts: dict, jobs: int | None):
             counts["n_invalid"] = counts.get("n_invalid", 0) + 1
 
 
+#: Keys stored as float16.  These are ~90% of a shard's uncompressed bytes
+#: (1937.9 MB of 2158.85 MB at F_CARD=94, measured on data/shards/test-00000.npz).
+#: Every value in them is a one-hot, a small count, or a fixed-divisor ratio
+#: — two orders of margin from fp16 precision.  The read path calls .float()
+#: on every non-int, non-bool key already, so no read-side change is needed.
+_FP16_KEYS = frozenset({
+    "poke_card_feat", "hand_card_feat", "stadium_card_feat",
+    "context_card_feat", "effect_card_feat", "discard_card_feat",
+    "prize_card_feat", "opt_card_feat", "opt_attack_feat", "log_card_feat",
+})
+
+
 def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) -> Path:
     """Stack *buffer* samples and save as a compressed .npz shard."""
     shards_dir = out_dir / "shards"
@@ -271,7 +283,10 @@ def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) 
     stacked = {}
     for k in keys:
         arrays = [s[k] for s in buffer]
-        stacked[k] = np.stack(arrays, axis=0)
+        stacked_k = np.stack(arrays, axis=0)
+        if k in _FP16_KEYS:
+            stacked_k = stacked_k.astype(np.float16)
+        stacked[k] = stacked_k
     np.savez_compressed(path, **stacked)
     return path
 

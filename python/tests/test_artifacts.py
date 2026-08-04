@@ -3,6 +3,8 @@ write_mining_report."""
 
 import json
 
+from ptcg_il.featurizer import (F_ATK, F_CARD, F_GLOBAL, F_HAND, F_OPT, F_POKE,
+                                F_SUM)
 from ptcg_mine.archetype import Archetype
 from ptcg_mine.artifacts import write_archetypes_json, write_mining_report, write_vocab_json
 from ptcg_mine.config import MineConfig
@@ -44,13 +46,16 @@ def test_write_vocab_json_roundtrip(tmp_path):
     assert data["caps"]["o_max"] == config.o_max
     assert data["caps"]["d_max"] == config.d_max
 
-    assert data["F_CARD"] == 94  # 52 base + 3 attacks × 14
-    assert data["F_ATK"] == 14
-    assert data["F_POKE"] == 26
-    assert data["F_HAND"] == 2
-    assert data["F_SUM"] == 11
-    assert data["F_GLOBAL"] == 93
-    assert data["F_OPT"] == 6
+    # Against the featurizer, not literals: the artifact's job is to carry the
+    # widths the featurizer defines, so restating them here only guarantees the
+    # test goes stale the next time featurizer.py changes.
+    assert data["F_CARD"] == F_CARD
+    assert data["F_ATK"] == F_ATK
+    assert data["F_POKE"] == F_POKE
+    assert data["F_HAND"] == F_HAND
+    assert data["F_SUM"] == F_SUM
+    assert data["F_GLOBAL"] == F_GLOBAL
+    assert data["F_OPT"] == F_OPT
 
     assert data["w_lost"] == config.w_lost
 

@@ -1076,7 +1076,7 @@ class TestBuildShards:
         from ptcg_mine.config import MineConfig
 
         episodes, vocab, archetypes, self_ids, opp_ids, experts = self._setup_test_data(
-            tmp_path, n_episodes=6
+            tmp_path, n_episodes=40
         )
 
         def _write_artifacts(out_dir):
@@ -1117,15 +1117,27 @@ class TestBuildShards:
         # Same corpus on disk, with each step log inflated so the corpus is far
         # larger than its Phase-2 projection -- exactly the real-episode shape.
         #
-        # The padding has to be big enough to separate the two hypotheses.
-        # Parsing *one* episode costs ~3x its bytes (the decoded str plus the
-        # object graph), so at 6 episodes a perfectly streaming build already
-        # peaks at ~0.5x the corpus -- and the shard buffers, which scale with
-        # sample count rather than corpus size, push that over 1.0x on a small
-        # fixture.  At this padding one episode is ~4 MB against a ~23 MB
-        # corpus, so "one resident" and "all resident" are 0.6x vs >1.0x and
-        # the assertion below discriminates.  Measured peak/corpus for the
-        # streaming implementation: 1.02 at 120 pad, 0.61 at 480, 0.54 at 1920.
+        # The fixture has to be big enough to separate the two hypotheses, and
+        # the separating variable is *episode count*, not padding: retaining the
+        # corpus scales linearly with n, while a streaming build's peak is
+        # roughly flat (one parse's scratch, plus shard buffers that scale with
+        # sample count rather than corpus size).
+        #
+        # Parsing one episode costs ~12x its bytes at peak -- `load_episode`
+        # uses orjson, whose transient scratch is ~3x the stdlib's for the same
+        # retained object graph (measured on a real 6.32 MB episode: 24.3 MB
+        # retained either way, 106.4 MB peak vs 29.7 MB).  That constant swamps
+        # a small fixture: at the 6 episodes this test used to build, streaming
+        # peaked at 16.2x the largest episode against 19.5x for retaining
+        # everything -- only 1.20x apart, so no threshold could tell them apart
+        # and the assertion below would have passed either way.
+        #
+        # Measured peak/corpus (streaming vs retain-all) by episode count:
+        #   n=6   2.69 vs 3.25   n=12  1.45 vs 2.16   n=24  0.82 vs 1.62
+        #   n=40  0.57 vs 1.40   n=60  0.45 vs 1.30
+        # At n=40 one episode is ~3.9 MB against a ~155 MB corpus and the two
+        # hypotheses straddle 1.0x with room on both sides, which is a wider
+        # margin than this test ever had.
         raw_dir = tmp_path / "raw_stream"
         raw_dir.mkdir(parents=True)
         for eid, ep in episodes:

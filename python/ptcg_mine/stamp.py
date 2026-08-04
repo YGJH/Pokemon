@@ -65,6 +65,8 @@ _MINE_CODE = (
     "ptcg_mine/cards.py",
     "ptcg_mine/artifacts.py",
     "ptcg_mine/config.py",
+    "ptcg_mine/keywords.py",
+    "ptcg_mine/damage.py",
 )
 
 STAGES: dict[str, StageSpec] = {
@@ -94,6 +96,7 @@ STAGES: dict[str, StageSpec] = {
             "ptcg_mine/stats.py",
             "ptcg_mine/archetype.py",
             "ptcg_mine/config.py",
+            "ptcg_mine/keywords.py",
         ),
         outputs=("meta.parquet", "shards/"),
         # The engine feature tables belong here even though no file in `code`

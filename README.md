@@ -34,8 +34,8 @@ uv run python -m ptcg_il.cli build-shards --raw-dir raw --out-dir data
 
 # 3. Train a1
 uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints_a1 \
-    --archetype-self 1 --d-model 256 --layers 6 --heads 8 --ff 1024 \
-    --dropout 0.0 --batch-size 256 --total-steps 20000
+    --archetype-self 1 --d-model 256 --layers 14 --heads 8 --ff 1024 \
+    --dropout 0.2 --batch-size 256 --total-steps 2000000
 
 
 

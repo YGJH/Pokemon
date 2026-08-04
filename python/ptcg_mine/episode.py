@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
+import orjson
+
 
 def project_for_selection(ep: dict) -> dict:
     """Reduce an episode to the fields the selection stages actually read.
@@ -41,9 +43,28 @@ def project_for_selection(ep: dict) -> dict:
 
 
 def load_episode(path: str | Path) -> dict:
-    """Load an episode JSON file into a dict."""
-    with open(path, "r") as f:
-        return json.load(f)
+    """Load an episode JSON file into a dict.
+
+    `orjson` rather than the stdlib: this is the full parse (Phase 3's
+    `shard_writer` pass B), which is ~49% of `build-shards` and pure decoding.
+    Measured over 59 MB of real episodes with the page cache warm, 162 MB/s →
+    211 MB/s, i.e. **1.30×**.
+
+    Bytes, not text, on purpose — orjson decodes UTF-8 itself, so reading in
+    binary mode drops the separate `str` copy the text-mode read used to build.
+    It also *widens* the errors callers already handle: text mode raised
+    `UnicodeDecodeError` on a non-UTF-8 file, which the
+    ``except (json.JSONDecodeError, OSError)`` handlers in `shard_writer` and
+    `scan_episode` do not catch, whereas `orjson.JSONDecodeError` subclasses
+    `json.JSONDecodeError` and does.
+
+    Note this is the opposite call from `load_projection`, which stays on the
+    stdlib: orjson exposes no incremental/`raw_decode` entry point, so it cannot
+    drive `parse_projection`'s partial scan, and parsing the whole document with
+    it instead measures 0.64× — slower than the scanner it would replace.
+    """
+    with open(path, "rb") as f:
+        return orjson.loads(f.read())
 
 
 # ============================================================

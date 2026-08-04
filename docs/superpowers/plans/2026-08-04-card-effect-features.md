@@ -1753,7 +1753,7 @@ git commit -m "feat(il): option damage preview (F_OPT 6->8)"
 
 **Files:**
 - Modify: `python/ptcg_il/shard_writer.py` (`_write_shard`, line 262-276)
-- Test: `python/tests/test_shard_writer.py` (extend), `python/tests/test_dataset.py` (extend)
+- Test: `tests/test_shard_writer.py` (extend), `tests/test_dataset.py` (extend)
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -1769,12 +1769,17 @@ FP16_KEYS = {
 }
 
 
-def test_card_feature_keys_are_stored_fp16(tmp_path, sample_buffer):
-    """Card features are 89.8% of shard bytes (1938 MB of 2159 MB measured on
-    test-00000.npz).  fp32 there is what makes the F_CARD expansion unaffordable."""
+def test_card_feature_keys_are_stored_fp16():
+    """Card features are 89.8% of shard bytes.  fp32 there is what makes the
+    F_CARD expansion unaffordable."""
+    import tempfile
     from ptcg_il.shard_writer import _write_shard
-    path = _write_shard("train", 0, sample_buffer, tmp_path)
-    data = np.load(path)
+
+    ep = _make_synthetic_episode(1, decks={0: 1, 1: 30})
+    buffer = _build_shard_buffer(ep, "train", ...)  # see existing writer tests
+    with tempfile.TemporaryDirectory() as td:
+        path = _write_shard("train", 0, buffer, Path(td))
+        data = np.load(path)
     checked = 0
     for k in FP16_KEYS:
         if k not in data:
@@ -1784,19 +1789,45 @@ def test_card_feature_keys_are_stored_fp16(tmp_path, sample_buffer):
     assert checked == len(FP16_KEYS), f"only {checked} of {len(FP16_KEYS)} keys present"
 
 
-def test_non_card_floats_stay_fp32(tmp_path, sample_buffer):
+def test_non_card_floats_stay_fp32():
+    import tempfile
     from ptcg_il.shard_writer import _write_shard
-    data = np.load(_write_shard("train", 0, sample_buffer, tmp_path))
+
+    ep = _make_synthetic_episode(1, decks={0: 1, 1: 30})
+    buffer = _build_shard_buffer(ep, "train", ...)
+    with tempfile.TemporaryDirectory() as td:
+        data = np.load(_write_shard("train", 0, buffer, Path(td)))
     for k in ("cls_feat", "poke_feat", "opt_scalar", "value_target"):
-        assert data[k].dtype == np.float32, f"{k} must not be downcast"
+        if k in data:
+            assert data[k].dtype == np.float32, f"{k} must not be downcast"
 
 
-def test_dataset_upcasts_fp16_to_fp32(tmp_path, sample_buffer, meta_for):
+def test_dataset_upcasts_fp16_to_fp32():
+    """ShardDataset.__getitem__ already calls .float() on every float key."""
+    import tempfile
+    from pathlib import Path
+    from ptcg_il.shard_writer import _write_shard
     from ptcg_il.train.dataset import ShardDataset
-    _write_shard("train", 0, sample_buffer, tmp_path)
-    ds = ShardDataset(tmp_path, split="train")
-    sample = ds[0]
+
+    ep = _make_synthetic_episode(1, decks={0: 1, 1: 30})
+    buffer = _build_shard_buffer(ep, "train", ...)
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        _write_shard("train", 0, buffer, td)
+        (td / "meta.parquet").write_bytes(  # ShardDataset requires this
+            b"TODO: write minimal meta.parquet; see test_dataset.py's _build_synthetic_data"
+        )
+        ds = ShardDataset(td, split="train")
+        sample = ds[0]
     assert sample["opt_card_feat"].dtype == torch.float32
+```
+
+**The `_build_shard_buffer` helper.** The existing `tests/test_shard_writer.py`
+calls `_make_minimal_obs` + `featurize` to build a sample, then stacks them into
+a buffer for `_write_shard`. Read the existing `_make_minimal_obs` (line 35) and
+follow that pattern — a buffer is a `list[dict[str, np.ndarray]]` where each
+dict is one `featurize()` return. The `...` in the param above means replacing
+with the actual archetypes/vocab references those helpers need.
 
 
 def test_fp16_round_trip_preserves_distinct_card_rows():
@@ -1876,7 +1907,7 @@ that trains.
 
 **Files:**
 - Modify: `python/ptcg_mine/stamp.py:60-67` and `:89-96`
-- Test: `python/tests/test_stamp.py` (extend)
+- Test: `tests/test_stamp.py` (extend)
 
 - [ ] **Step 1: Write the failing test**
 

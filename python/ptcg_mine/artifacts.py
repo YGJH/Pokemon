@@ -9,13 +9,8 @@ from pathlib import Path
 
 from ptcg_mine.cards import ATKCOST_N, ATKDMG_N, HP_N, RETREAT_N
 
-F_CARD = 94  # 52 base + 3 attacks × 14
-F_ATK = 14
-F_POKE = 26
-F_HAND = 2
-F_SUM = 11
-F_GLOBAL = 93
-F_OPT = 6
+from ptcg_il.featurizer import (F_ATK, F_CARD, F_GLOBAL, F_HAND, F_OPT,
+                                 F_POKE, F_SUM)
 
 
 def write_vocab_json(path, vocab: dict, attack_id_to_index: dict, config) -> None:

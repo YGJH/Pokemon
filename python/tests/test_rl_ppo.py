@@ -503,7 +503,7 @@ class TestCriticDiagnostics:
         from ptcg_rl.critic import CLS_OPP_PRIZES, CLS_OUR_PRIZES, _progress
 
         n = 500
-        cls = torch.zeros(n, 93)
+        cls = torch.zeros(n, F_GLOBAL)
         # Prizes remaining fall from 1.0 to 0.0 as the game progresses.
         frac = torch.linspace(1.0, 0.0, n)
         cls[:, CLS_OUR_PRIZES] = frac

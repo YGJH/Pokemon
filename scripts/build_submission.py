@@ -40,6 +40,9 @@ REWRITE_RULES: list[tuple[str, str]] = [
     (r"from ptcg_il\.model import", r"from model import"),
     # ref_map (copied into model/ so modules import it as model.ref_map)
     (r"from ptcg_il\.ref_map import", r"from model.ref_map import"),
+    # featurizer (copied into model/ so modules import it as model.featurizer).
+    # model/{cards,embed,pointer}.py import the feature dims from it.
+    (r"from ptcg_il\.featurizer import", r"from model.featurizer import"),
 ]
 
 MODEL_FILES: list[str] = [

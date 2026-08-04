@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import pytest
 
+from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_POKE, F_SUM
 from ptcg_il.model.cards import F_CARD
 from ptcg_il.model.embed import TokenEmbedder, L_STATE, P_MAX, H_MAX, SUM
 
@@ -19,17 +20,19 @@ def _make_synthetic_batch(B: int = 2) -> dict[str, torch.Tensor]:
     """
     return {
         # CLS
-        "cls_feat": torch.randn(B, 93),
+        # Widths from ptcg_il.featurizer, never literals -- see the note in
+        # test_model_policy._make_synthetic_batch.
+        "cls_feat": torch.randn(B, F_GLOBAL),
         "context_card_feat": torch.randn(B, 1, F_CARD),
         "effect_card_feat": torch.randn(B, 1, F_CARD),
         # Pokemon
-        "poke_feat": torch.randn(B, P_MAX, 26),
+        "poke_feat": torch.randn(B, P_MAX, F_POKE),
         "poke_card_feat": torch.randn(B, P_MAX, F_CARD),
         # Hand
-        "hand_feat": torch.randn(B, H_MAX, 2),
+        "hand_feat": torch.randn(B, H_MAX, F_HAND),
         "hand_card_feat": torch.randn(B, H_MAX, F_CARD),
         # Summary
-        "sum_feat": torch.randn(B, SUM, 11),
+        "sum_feat": torch.randn(B, SUM, F_SUM),
         "discard_card_feat": torch.randn(B, SUM, D_MAX, F_CARD),
         "discard_mask": torch.ones(B, SUM, D_MAX, dtype=torch.bool),
         "prize_card_feat": torch.randn(B, SUM, PZ_MAX, F_CARD),
@@ -171,7 +174,7 @@ class TestTokenEmbedder:
 
         # Set PAD for all hand slots
         x["hand_card_feat"] = torch.zeros(2, H_MAX, F_CARD)
-        x["hand_feat"] = torch.zeros(2, H_MAX, 2)
+        x["hand_feat"] = torch.zeros(2, H_MAX, F_HAND)
 
         rows = embed(x)
         # Hand rows exist

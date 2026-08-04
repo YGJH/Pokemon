@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 import torch
 
+from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM
 from ptcg_il.train.dataset import (
     ALPHA_ARCH,
     ALPHA_CTX,
@@ -27,12 +28,14 @@ from ptcg_il.train.dataset import (
 
 # Minimal featurizer-like tensor shapes (subset of full Appendix A contract)
 _KEYS_FLOAT = {
-    "cls_feat": (93,),
-    "poke_feat": (12, 26),
-    "hand_feat": (30, 2),
-    "sum_feat": (2, 11),
+    # Widths from ptcg_il.featurizer, never literals -- see the note in
+    # test_model_policy._make_synthetic_batch.
+    "cls_feat": (F_GLOBAL,),
+    "poke_feat": (12, F_POKE),
+    "hand_feat": (30, F_HAND),
+    "sum_feat": (2, F_SUM),
     "stadium_present": (1,),
-    "opt_scalar": (64, 6),
+    "opt_scalar": (64, F_OPT),
     "value_target": (),
     "sample_weight": (),
 }

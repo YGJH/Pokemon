@@ -14,6 +14,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM
 from ptcg_il.model.cards import F_ATK, F_CARD
 from ptcg_il.model.policy import Policy
 from ptcg_il.train.checkpoint import (
@@ -66,7 +67,9 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
     # Capacities from A.1
     P_MAX, H_MAX, SUM, D_MAX, PZ_MAX = 12, 30, 2, 60, 6
     L_STATE, O_MAX = 46, 64
-    F_GLOBAL, F_POKE, F_HAND, F_SUM, F_OPT = 93, 26, 2, 11, 6
+    # Feature widths come from ptcg_il.featurizer (imported at module scope),
+    # never restated here -- local literals shadow the real constants and go
+    # stale silently the next time featurizer.py changes.
     L_LOG_MAX, LOG_FEAT_DIM = 32, 6
 
     return {

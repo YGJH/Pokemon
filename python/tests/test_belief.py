@@ -26,6 +26,7 @@ from ptcg_il.belief_labels import (
     opp_hand_timeline,
     opp_visible_counts,
 )
+from ptcg_il.featurizer import F_CARD
 from ptcg_il.model.belief import (
     LOG_FEAT_DIM,
     L_LOG_MAX,
@@ -205,7 +206,7 @@ def _heads(n_arch: int = 4, D: int = 8) -> BeliefHeads:
     cf = CardFeaturizer(D)
     heads = BeliefHeads(D, n_arch, N_ALL, card_emb=cf)
     # Minimal all_card_feat for the card matrix
-    heads.set_all_card_feat(torch.randn(N_ALL, 94))
+    heads.set_all_card_feat(torch.randn(N_ALL, F_CARD))
     return heads
 
 
