@@ -1116,14 +1116,29 @@ class TestBuildShards:
 
         # Same corpus on disk, with each step log inflated so the corpus is far
         # larger than its Phase-2 projection -- exactly the real-episode shape.
+        #
+        # The padding has to be big enough to separate the two hypotheses.
+        # Parsing *one* episode costs ~3x its bytes (the decoded str plus the
+        # object graph), so at 6 episodes a perfectly streaming build already
+        # peaks at ~0.5x the corpus -- and the shard buffers, which scale with
+        # sample count rather than corpus size, push that over 1.0x on a small
+        # fixture.  At this padding one episode is ~4 MB against a ~23 MB
+        # corpus, so "one resident" and "all resident" are 0.6x vs >1.0x and
+        # the assertion below discriminates.  Measured peak/corpus for the
+        # streaming implementation: 1.02 at 120 pad, 0.61 at 480, 0.54 at 1920.
         raw_dir = tmp_path / "raw_stream"
         raw_dir.mkdir(parents=True)
         for eid, ep in episodes:
             fat = dict(ep)
             padding = [{"junk": "y" * 4000} for _ in range(2)]
-            fat["steps"] = list(ep["steps"]) + [padding for _ in range(120)]
+            fat["steps"] = list(ep["steps"]) + [padding for _ in range(480)]
             (raw_dir / f"{eid}.json").write_text(json.dumps(fat))
         corpus_bytes = sum(p.stat().st_size for p in raw_dir.glob("*.json"))
+        largest = max(p.stat().st_size for p in raw_dir.glob("*.json"))
+        assert corpus_bytes > 4 * largest, (
+            "fixture too small to tell 'one episode resident' from 'corpus "
+            "resident'; raise the padding or the episode count"
+        )
 
         stream_out = tmp_path / "data_stream"
         _write_artifacts(stream_out)

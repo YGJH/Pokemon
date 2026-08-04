@@ -5,6 +5,8 @@ teacher-forced AR training for multi-select decisions.  ``select_multi``
 handles greedy AR inference.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +16,8 @@ from ptcg_il.model.embed import TokenEmbedder
 from ptcg_il.model.encoder import Encoder
 from ptcg_il.model.pointer import PointerHead
 from ptcg_il.model.value import ValueHead
+
+logger = logging.getLogger(__name__)
 
 
 class Policy(nn.Module):
@@ -165,7 +169,67 @@ class Policy(nn.Module):
         return logits, value, history_h.detach(), belief
 
 
-def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
+#: The belief archetype classifier's output layer.  Its width is
+#: ``len(archetypes.json["opp_ids"])``, which grows when a seeded mining run
+#: appends a new 𝒟_opp archetype (``ptcg_mine.archetype._append_only``).
+_ARCH_HEAD_PREFIX = "belief_heads.arch_head."
+
+
+def widen_belief_arch_head(policy: Policy, state_dict: dict) -> tuple[dict, int, int]:
+    """Copy an older, narrower archetype head into this policy's wider one.
+
+    ``𝒟_opp`` is append-only, so slot *i* means the same archetype it always
+    did and the old head's rows are a strict prefix of the new one's.  Copying
+    them keeps everything the old model learned about the archetypes it saw and
+    leaves the appended rows at their initialisation.
+
+    This is only sound *because* the ordering is append-only.  Against a
+    re-baselined ``archetypes.json`` the prefix rows describe different decks,
+    and a prefix copy would be worse than a fresh head — it would look trained.
+    Callers must therefore opt in, and only when the artifacts share a lineage
+    generation with the checkpoint.
+
+    Returns ``(patched_state_dict, old_width, new_width)``; the dict is
+    unchanged and the widths equal when there is nothing to widen.  Raises if
+    the head *shrank*, which means a re-cluster, not an append.
+    """
+    model_sd = policy.state_dict()
+    old_w = new_w = 0
+    patched = state_dict
+    for key, want in model_sd.items():
+        if not key.startswith(_ARCH_HEAD_PREFIX):
+            continue
+        have = state_dict.get(key)
+        if have is None or have.shape == want.shape:
+            continue
+        if have.shape[1:] != want.shape[1:]:
+            raise RuntimeError(
+                f"{key}: checkpoint shape {list(have.shape)} differs from "
+                f"{list(want.shape)} in a dimension that is not the archetype "
+                "count — this is not an appended 𝒟_opp slot."
+            )
+        if have.shape[0] > want.shape[0]:
+            raise RuntimeError(
+                f"{key}: checkpoint has {have.shape[0]} archetype slots but "
+                f"this policy has {want.shape[0]}. 𝒟_opp shrank, which means "
+                "the archetypes were re-clustered rather than appended to. The "
+                "old rows now describe different decks; retrain the belief "
+                "head instead of copying them."
+            )
+        if patched is state_dict:
+            patched = dict(state_dict)
+        grown = want.clone()
+        grown[: have.shape[0]] = have
+        patched[key] = grown
+        old_w, new_w = int(have.shape[0]), int(want.shape[0])
+    return patched, old_w, new_w
+
+
+def load_policy_state(
+    policy: Policy,
+    state_dict: dict,
+    allow_belief_widening: bool = False,
+) -> list[str]:
     """``policy.load_state_dict`` that tolerates a pre-belief checkpoint.
 
     Every checkpoint written before :class:`~ptcg_il.model.belief.BeliefHeads`
@@ -174,8 +238,25 @@ def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
     else still raises, because a silently half-loaded policy evaluates as a
     plausible-looking but randomly-initialised model.
 
+    With *allow_belief_widening*, a checkpoint whose archetype head is narrower
+    than this policy's is accepted and its rows copied into the leading slots —
+    see :func:`widen_belief_arch_head` for the condition that makes that sound.
+    It is off by default: a shape mismatch is the only signal that the 𝒟_opp
+    set moved, and swallowing it by default would let a re-baselined corpus load
+    a checkpoint whose belief slots mean different decks.
+
     Returns the list of belief keys that were left at their initial values.
     """
+    if allow_belief_widening:
+        state_dict, old_w, new_w = widen_belief_arch_head(policy, state_dict)
+        if new_w > old_w > 0:
+            logger.warning(
+                "belief archetype head widened %d → %d slots; rows 0..%d were "
+                "copied from the checkpoint and %d appended slot(s) start "
+                "untrained. This is only correct if archetypes.json was seeded, "
+                "not re-baselined.",
+                old_w, new_w, old_w - 1, new_w - old_w,
+            )
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
     belief_missing = [k for k in missing if k.startswith("belief_heads.")]
     other = [k for k in missing if not k.startswith("belief_heads.")]

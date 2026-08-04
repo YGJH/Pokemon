@@ -29,10 +29,12 @@ from ptcg_il.featurizer import featurize, normalize_vocab
 from ptcg_mine.archetype import Archetype, assign_archetype
 from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import (
+    OK,
     deck_of,
     load_episode,
     project_for_selection,
     rewards,
+    scan_projections,
     teams,
     validate_episode,
 )
@@ -190,8 +192,14 @@ def _iter_kept_games(source, keep: dict[str, list[tuple[int, bool]]]):
     *source* is a zero-arg callable returning a fresh ``(eid, ep)`` iterator,
     so this is the second pass over the corpus; *keep* is the decision map
     built from the cheap first pass.
+
+    *source* is expected to yield only episodes named in *keep* — the pass-B
+    source is path-filtered up front, because parsing an episode in order to
+    discard it here costs the same 6 MB decode as one that is used, and the
+    corpus keeps well under 10% of its episodes.  Anything else is still
+    skipped, so an unfiltered source stays correct (just slow).
     """
-    for eid, ep in source():
+    for eid, ep in source(keep):
         plans = keep.get(eid)
         if not plans:
             continue
@@ -199,22 +207,29 @@ def _iter_kept_games(source, keep: dict[str, list[tuple[int, bool]]]):
             yield eid, ep, p, won
 
 
-def _iter_episodes(raw_dir, counts: dict | None = None):
-    """Stream ``(episode_id, ep)`` for each valid episode under *raw_dir*.
+def _episode_paths(raw_dir) -> list[Path]:
+    """Sorted ``*.json`` paths under *raw_dir*. Sorted for run-to-run stability."""
+    return sorted(Path(raw_dir).rglob("*.json"))
+
+
+def _iter_episodes(raw_dir, counts: dict | None = None, paths=None):
+    """Stream ``(episode_id, ep)`` for each valid, fully-parsed episode.
 
     The generator holds exactly one parsed episode at a time (~14.5 MB), so a
     caller that does not retain them is memory-flat regardless of corpus size.
     ``_load_all_episodes`` retains everything and is therefore only safe for
     small/test corpora — the real pipeline goes through ``build_shards``, which
-    makes two streaming passes instead.
+    makes two passes instead.
 
-    *counts*, if given, is updated in place with ``n_loaded`` / ``n_invalid``.
+    *paths*, if given, replaces the ``rglob`` of *raw_dir*; pass B uses it to
+    open only the episodes it kept.  *counts*, if given, is updated in place
+    with ``n_loaded`` / ``n_invalid``.
     """
     def _bump(key):
         if counts is not None:
             counts[key] = counts.get(key, 0) + 1
 
-    for path in sorted(Path(raw_dir).rglob("*.json")):
+    for path in (_episode_paths(raw_dir) if paths is None else paths):
         try:
             ep = load_episode(path)
         except (json.JSONDecodeError, OSError):
@@ -227,6 +242,20 @@ def _iter_episodes(raw_dir, counts: dict | None = None):
         else:
             _bump("n_invalid")
         del ep
+
+
+def _scan_projections(paths: list[Path], counts: dict, jobs: int | None):
+    """Pass A: yield ``(episode_id, projection)`` for every valid episode.
+
+    Thin accounting wrapper over `episode.scan_projections`.  Phase 3 counts
+    every file it opened as "loaded", including ones that would not parse.
+    """
+    for eid, proj, status in scan_projections(paths, jobs):
+        counts["n_loaded"] = counts.get("n_loaded", 0) + 1
+        if status is OK:
+            yield eid, proj
+        else:
+            counts["n_invalid"] = counts.get("n_invalid", 0) + 1
 
 
 def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) -> Path:
@@ -267,6 +296,7 @@ def build_shards(
     opp_ids: list[int] | None = None,
     experts: set[str] | list[str] | None = None,
     samples_per_shard: int = SAMPLES_PER_SHARD,
+    jobs: int | None = None,
 ) -> dict:
     """Build shards and meta.parquet from the corpus.
 
@@ -299,6 +329,11 @@ def build_shards(
         recomputed from loaded episodes.
     samples_per_shard : int
         Max samples per shard file (default 50 000).
+    jobs : int | None
+        Worker processes for the pass-A head scan.  ``None`` uses
+        ``os.cpu_count()``; ``1`` runs it in-process.  Ignored when *episodes*
+        is supplied, since then there is nothing to read from disk.  Results are
+        order-preserving, so this never changes the output.
 
     Returns
     -------
@@ -332,20 +367,25 @@ def build_shards(
         if config is None:
             raise ValueError("build_shards: either config or episodes must be provided")
         counts: dict = {"n_loaded": 0, "n_invalid": 0}
-        ep_list = [(eid, project_for_selection(ep))
-                   for eid, ep in _iter_episodes(raw_dir, counts)]
+        all_paths = _episode_paths(raw_dir)
+        logger.info("Pass A: scanning %d episodes for selection", len(all_paths))
+        ep_list = list(_scan_projections(all_paths, counts, jobs))
         n_loaded = counts["n_loaded"]
         n_invalid = counts["n_invalid"]
 
-        def _episode_source():
-            return _iter_episodes(raw_dir)
+        # Pass B opens only the episodes pass A kept.  Filtering *paths* (rather
+        # than parsing and discarding) is the whole saving; keeping `all_paths`
+        # order means the shard row order is unchanged by this optimisation.
+        def _episode_source(_keep=None):
+            wanted = all_paths if _keep is None else [p for p in all_paths if p.stem in _keep]
+            return _iter_episodes(raw_dir, paths=wanted)
     else:
         ep_list = list(episodes)
         n_loaded = len(ep_list)
         n_invalid = 0
 
         # Bound as a default so the later `del ep_list` cannot break it.
-        def _episode_source(_eps=ep_list):
+        def _episode_source(_keep=None, _eps=ep_list):
             return iter(_eps)
 
     if not ep_list:

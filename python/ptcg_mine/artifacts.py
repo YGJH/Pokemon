@@ -53,13 +53,30 @@ def write_vocab_json(path, vocab: dict, attack_id_to_index: dict, config) -> Non
         json.dump(data, f, indent=2)
 
 
-def write_archetypes_json(path, self_ids: list[int], opp_ids: list[int], archetypes: list, fixed_deck: list[int]) -> None:
+def write_archetypes_json(
+    path,
+    self_ids: list[int],
+    opp_ids: list[int],
+    archetypes: list,
+    fixed_deck: list[int],
+    lineage: dict | None = None,
+) -> None:
     """Write archetype signatures (representative decklists), D_self/D_opp id
-    lists, and FIXED_DECK (60 ids)."""
+    lists, and FIXED_DECK (60 ids).
+
+    *lineage* records which id generation this file belongs to: whether it was
+    seeded from an earlier ``archetypes.json`` and which one.  It is written so
+    the question "can this checkpoint still be trusted against these artifacts"
+    is answerable from the artifact itself — the SHA pins in each checkpoint's
+    deck record tell you the file *changed*, but not whether the ids inside it
+    still mean the same decks, which is the thing that actually matters.
+    """
     data = {
         "self_ids": self_ids,
         "opp_ids": opp_ids,
         "fixed_deck": fixed_deck,
+        "lineage": lineage or {"seeded": False, "baseline_sha1": None,
+                               "generation": 0},
         "archetypes": [
             {
                 "id": arch.id,

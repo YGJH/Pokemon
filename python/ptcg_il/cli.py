@@ -40,20 +40,20 @@ logger = logging.getLogger(__name__)
 # ============================================================
 DEFAULTS = {
     # Model
-    "d_model": 256,
-    "layers": 4,
+    "d_model": 512,
+    "layers": 10,
     "heads": 8,
-    "ff": 1024,
+    "ff": 2048,
     "dropout": 0.1,
     # Training
     "batch_size": 2048,
-    "epochs": 10,
-    "peak_lr": 3e-4,
-    "warmup": 1000,
-    "min_lr": 3e-5,
+    "epochs": 1000,
+    "peak_lr": 8e-5,
+    "warmup": 100,
+    "min_lr": 1e-5,
     "weight_decay": 0.01,
-    "grad_clip": 1.0,
     "label_smoothing": 0.05,
+    "grad_clip": 1.0,
     "ema_decay": 0.999,
     "alpha_ctx": 0.5,
     "alpha_arch": 0.5,
@@ -61,15 +61,15 @@ DEFAULTS = {
     "w_lost": 0.6,
     # Cadence
     "log_every": 50,
-    "val_every": 1000,
+    "val_every": 100,
     "ckpt_every": 2000,
-    "live_every": 10000,
+    "live_every": 1000000,
     # Data
     "num_workers": 8,
     # Precision
     "mixed_precision": True,
     # Patience
-    "patience": 5,
+    "patience": 5000000,
     # Live eval
     "live_eval_games": 500,
     # W&B.  Runs land in the `poken` team by default; override with
@@ -114,6 +114,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Jaccard threshold for archetype clustering (default: 0.90)")
     bs_config.add_argument("--samples-per-shard", type=int, default=50000,
                          help="Max samples per .npz shard file (default: 50000)")
+    bs_parser.add_argument("--jobs", "-j", type=int, default=None,
+                         help="Worker processes for the pass-A episode scan "
+                              "(default: os.cpu_count(); 1 disables the pool). "
+                              "Order-preserving, so this cannot change the output.")
     bs_parser.add_argument("--force", action="store_true",
                          help="Rebuild even when the corpus, config, code and "
                               "vocab/archetypes are unchanged since the last "
@@ -271,6 +275,15 @@ def _build_parser() -> argparse.ArgumentParser:
     qa = train_parser.add_argument_group("QA gates (D.5)")
     qa.add_argument("--skip-qa", action="store_true",
                     help="Skip QA gates (not recommended)")
+    qa.add_argument("--allow-belief-widening", action="store_true",
+                    help="Accept a --resume checkpoint whose belief archetype "
+                         "head is narrower than the current artifacts require, "
+                         "copying its rows into the leading 𝒟_opp slots. Sound "
+                         "only when archetypes.json was SEEDED from the "
+                         "checkpoint's generation (lineage.seeded), because "
+                         "then slot i still means the archetype it did. After "
+                         "a --rebaseline the leading rows describe different "
+                         "decks and this makes an untrained head look trained.")
 
     # Baseline recording (pipeline stage 4c)
     base = train_parser.add_argument_group("IL baselines (RL_SPEC §10.2 cond. 3)")
@@ -444,7 +457,8 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
         logger.info("Phase 3: rebuilding shards — %s", reason)
 
     logger.info("Phase 3: building shards from %s → %s", config.raw_dir, config.out_dir)
-    summary = build_shards(config, samples_per_shard=args.samples_per_shard)
+    summary = build_shards(config, samples_per_shard=args.samples_per_shard,
+                           jobs=getattr(args, "jobs", None))
 
     logger.info("Shard build complete:")
     logger.info("  samples:    %d total (%s)", summary["total_samples"], summary["split_counts"])
@@ -545,6 +559,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         wandb_entity=args.wandb_entity,
         wandb_name=_wandb_run_name(args),
         resume_ckpt=args.resume,
+        allow_belief_widening=args.allow_belief_widening,
         run_val=True,
         patience=args.patience,
     )
@@ -593,7 +608,8 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
     from ptcg_il.train.checkpoint import load_checkpoint
     ckpt = load_checkpoint(args.resume, device)
     from ptcg_il.model.policy import load_policy_state
-    load_policy_state(policy, ckpt["model_state_dict"])
+    load_policy_state(policy, ckpt["model_state_dict"],
+                      allow_belief_widening=args.allow_belief_widening)
     policy.to(device)
     policy.eval()
 
@@ -728,7 +744,9 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
             from ptcg_il.train.checkpoint import load_checkpoint
             ckpt = load_checkpoint(args.resume, device="cpu")
             from ptcg_il.model.policy import load_policy_state
-            load_policy_state(frozen_policy, ckpt["model_state_dict"])
+            load_policy_state(
+                frozen_policy, ckpt["model_state_dict"],
+                allow_belief_widening=getattr(args, "allow_belief_widening", False))
             frozen_agent = make_agent_from_policy(
                 frozen_policy, artifacts["vocab"], artifacts["fixed_deck"], device="cpu"
             )

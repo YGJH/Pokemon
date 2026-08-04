@@ -101,7 +101,7 @@ def test_run_raises_insufficient_data_on_empty_corpus(tmp_path):
 
 
 def test_main_reports_insufficient_data_cleanly(monkeypatch, capsys, tmp_path):
-    def boom(config, skip_download, force=False):
+    def boom(config, skip_download, force=False, jobs=None):
         raise mine.InsufficientDataError("corpus too thin")
 
     monkeypatch.setattr(mine, "run", boom)
@@ -175,9 +175,9 @@ def _spy_phase2(monkeypatch):
     calls = []
     real = mine.load_raw_episodes
 
-    def spy(raw_dir):
+    def spy(raw_dir, jobs=None):
         calls.append(raw_dir)
-        return real(raw_dir)
+        return real(raw_dir, jobs)
 
     monkeypatch.setattr(mine, "load_raw_episodes", spy)
     return calls

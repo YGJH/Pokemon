@@ -30,6 +30,14 @@ class MineConfig:
     d_max: int = 60
     raw_dir: Path = Path("raw")
     out_dir: Path = Path("data")
+    # Seed clustering from a previous generation's archetypes.json so cluster
+    # ids and 𝒟_opp belief slots are append-only. None means "use
+    # out_dir/archetypes.json if it exists" — stable ids are the default
+    # because forgetting the flag silently renumbers every trained checkpoint's
+    # deck. `rebaseline=True` is the explicit opt-out that starts a fresh id
+    # generation and invalidates every existing checkpoint's deck record.
+    baseline_archetypes: Path | None = None
+    rebaseline: bool = False
     manifest_csv: Path = Path("archive/manifest.csv")
     dataset_prefix: str = "kaggle/pokemon-tcg-ai-battle-episodes-"
     # Order Phase 1 fetches the selected days in. Defaults to newest-first so a

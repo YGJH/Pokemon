@@ -74,7 +74,7 @@ def spy(monkeypatch):
 
     calls = []
 
-    def fake(config, samples_per_shard=50000):
+    def fake(config, samples_per_shard=50000, jobs=None):
         calls.append(samples_per_shard)
         return {"total_samples": 10, "n_shards": 1, "n_kept_games": 2,
                 "n_loaded": 3, "n_invalid": 0, "split_counts": {"train": 10},
@@ -146,7 +146,7 @@ def test_empty_build_is_not_stamped(corpus, monkeypatch):
 
     monkeypatch.setattr(
         shard_writer, "build_shards",
-        lambda config, samples_per_shard=50000: {
+        lambda config, samples_per_shard=50000, jobs=None: {
             "total_samples": 0, "n_shards": 0, "n_kept_games": 0, "n_loaded": 0,
             "n_invalid": 0, "split_counts": {}, "meta_path": "meta.parquet"},
     )

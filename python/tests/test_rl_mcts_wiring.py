@@ -1976,3 +1976,223 @@ def test_grad_clip_is_a_spike_guard_not_a_normaliser():
         "grad_clip must sit above the typical gradient norm, or it normalises "
         "every step instead of catching spikes"
     )
+
+
+# ── Adaptive KL anchor: the β controller and the top-ELO reference ───────
+#
+# A constant β cannot hold a trust region.  k3(d) = e^-d - 1 + d has
+# derivative 1 - e^-d, which saturates at 1, so the anchor's restoring pull is
+# capped at β while the CE/BC term is unbounded: once the policy term wins,
+# KL grows with nothing to stop it.  Measured on five real runs, IL outranked
+# every MCTS champion in four of them.
+
+
+def test_beta_controller_flags_carry_the_specced_defaults():
+    """κ matches RL_SPEC §9.3 (and ppo.py's R2 anchor) so the three stages
+    report KL on one scale."""
+    args = parse_args(_BASE_ARGV)
+    assert args.kappa == 0.02
+    assert args.beta_lr == 0.02
+    assert args.beta_min <= args.beta <= args.beta_max
+
+
+def test_the_cli_namespace_drives_ppo_update_beta_unchanged():
+    """The controller is ppo.update_beta, not a second copy of it.  It reads
+    κ/η_β/bounds off its cfg, so the MCTS Namespace must supply all four."""
+    from ptcg_rl.ppo import update_beta
+
+    args = parse_args(_BASE_ARGV)
+    over = update_beta(args.beta, args.kappa * 5.0, args)
+    under = update_beta(args.beta, args.kappa * 0.1, args)
+    assert over > args.beta, "β must rise while KL sits above κ"
+    assert under < args.beta, "β must fall back once KL is under κ"
+    assert update_beta(args.beta_max, args.kappa * 1e3, args) <= args.beta_max
+    assert update_beta(args.beta_min, 0.0, args) >= args.beta_min
+
+
+def test_beta_converges_on_kappa_rather_than_saturating():
+    """Dual ascent, not a ratchet: a KL that comes back under κ must give the
+    β it earned back, or the anchor freezes the policy at beta_max."""
+    from ptcg_rl.ppo import update_beta
+
+    args = parse_args(_BASE_ARGV)
+    beta = args.beta
+    for _ in range(200):                      # one iteration's worth of steps
+        beta = update_beta(beta, args.kappa * 4.0, args)
+    climbed = beta
+    assert climbed > args.beta * 5, climbed
+    for _ in range(200):
+        beta = update_beta(beta, args.kappa * 0.25, args)
+    assert beta < climbed, "β never comes back down"
+
+
+def test_train_step_takes_beta_as_an_argument_not_a_config_constant(train_cfg):
+    """β changes every step now, so it cannot be read off the frozen config."""
+    import torch
+    from ptcg_rl.mcts_train import train_step
+
+    policy = _tiny_policy(0)
+    frozen = _tiny_policy(1)
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+    batch = _tiny_batch()
+    device = torch.device("cpu")
+    cfg = type(train_cfg)(c_pi=0.0, c_value=0.0, beta=0.0, grad_clip=1e9)
+    opt = torch.optim.SGD(policy.parameters(), lr=0.0)
+
+    off = train_step(policy, opt, batch, cfg, device, frozen_il=frozen,
+                     beta=0.0)
+    on = train_step(policy, opt, batch, cfg, device, frozen_il=frozen,
+                    beta=4.0)
+    assert off["grad_norm"] == pytest.approx(0.0, abs=1e-9), (
+        "β=0 must switch the anchor off entirely")
+    assert on["grad_norm"] > 0.0, (
+        "the passed β was ignored — config.beta won instead")
+    assert on["beta"] == 4.0, "train_step must report the β it actually used"
+
+
+def test_train_step_scales_the_anchor_gradient_with_beta(train_cfg):
+    import torch
+    from ptcg_rl.mcts_train import train_step
+
+    frozen = _tiny_policy(1)
+    for p in frozen.parameters():
+        p.requires_grad_(False)
+    cfg = type(train_cfg)(c_pi=0.0, c_value=0.0, beta=0.0, grad_clip=1e9)
+    grads = []
+    for beta in (1.0, 2.0):
+        policy = _tiny_policy(0)          # same weights both times
+        opt = torch.optim.SGD(policy.parameters(), lr=0.0)
+        grads.append(train_step(policy, opt, _tiny_batch(), cfg,
+                                torch.device("cpu"), frozen_il=frozen,
+                                beta=beta)["grad_norm"])
+    # Both grads are 0 if β is ignored, and 0 == 2*0 — the proportionality
+    # check alone passes vacuously on exactly the bug it is guarding.
+    assert grads[0] > 0.0, "the anchor produced no gradient at all"
+    assert grads[1] == pytest.approx(2.0 * grads[0], rel=1e-4), grads
+
+
+def test_live_beta_not_the_flag_reaches_wandb():
+    """`"beta": args.beta` logged a flat line by construction — the whole
+    point of the controller is invisible if the series is the CLI default."""
+    import inspect
+    from ptcg_rl import mcts_train
+
+    src = inspect.getsource(mcts_train.main)
+    assert '"beta": args.beta' not in src, (
+        "the β series is still pinned to the CLI flag")
+    assert "update_beta" in src, "nothing in main ever moves β"
+
+
+# ── The anchor reference follows the ELO leaderboard ─────────────────────
+
+
+def _elo_with(ratings: dict) -> object:
+    from ptcg_rl.mcts_train import EloTracker
+    elo = EloTracker()
+    elo.ratings.update(ratings)
+    return elo
+
+
+def test_anchor_candidates_map_every_leaderboard_name_to_a_file(tmp_path):
+    from ptcg_rl.mcts_train import _anchor_candidates, elo_key
+
+    il = tmp_path / "ckpt-best.pt"
+    step = tmp_path / "ckpt-step-0002000.pt"
+    champ = tmp_path / "ckpt-mcts-champion-000200.pt"
+    for p in (il, step, champ):
+        p.write_bytes(b"x")
+
+    cands = _anchor_candidates(str(il), [("ckpt-step-0002000", str(step))],
+                               [champ])
+    assert cands["IL_baseline"] == str(il)
+    assert cands["ckpt-step-0002000"] == str(step)
+    assert cands[elo_key(champ)] == str(champ)
+
+
+def test_anchor_follows_the_top_elo_model():
+    from ptcg_rl.mcts_train import _resolve_anchor
+
+    elo = _elo_with({"IL_baseline": 1500.0, "ckpt-step-0002000": 1589.3,
+                     "ckpt-mcts-champion-001200": 1525.9})
+    name, path = _resolve_anchor(elo, {
+        "IL_baseline": "il.pt",
+        "ckpt-step-0002000": "step.pt",
+        "ckpt-mcts-champion-001200": "champ.pt",
+    })
+    assert (name, path) == ("ckpt-step-0002000", "step.pt")
+
+
+def test_anchor_switches_to_a_champion_once_it_overtakes_il():
+    """The reason for making the reference movable at all."""
+    from ptcg_rl.mcts_train import _resolve_anchor
+
+    cands = {"IL_baseline": "il.pt", "ckpt-mcts-champion-000800": "champ.pt"}
+    before = _resolve_anchor(_elo_with(
+        {"IL_baseline": 1580.0, "ckpt-mcts-champion-000800": 1520.0}), cands)
+    after = _resolve_anchor(_elo_with(
+        {"IL_baseline": 1580.0, "ckpt-mcts-champion-000800": 1611.0}), cands)
+    assert before[0] == "IL_baseline"
+    assert after[0] == "ckpt-mcts-champion-000800"
+
+
+def test_an_unrated_model_never_outranks_a_rated_one():
+    """A missing rating is a dict default, not an error — the bug that made
+    `_find_best_champion` return glob order.  It must not resurface here."""
+    from ptcg_rl.mcts_train import _resolve_anchor
+
+    name, _ = _resolve_anchor(_elo_with({"IL_baseline": 1400.0}),
+                              {"IL_baseline": "il.pt", "unrated": "u.pt"})
+    assert name == "IL_baseline"
+
+
+def test_anchor_ignores_a_leaderboard_name_with_no_checkpoint():
+    from ptcg_rl.mcts_train import _resolve_anchor
+
+    elo = _elo_with({"ghost": 9999.0, "IL_baseline": 1500.0})
+    assert _resolve_anchor(elo, {"IL_baseline": "il.pt"})[0] == "IL_baseline"
+
+
+def test_anchor_resolution_without_candidates_is_none_not_a_crash():
+    from ptcg_rl.mcts_train import _resolve_anchor
+
+    assert _resolve_anchor(_elo_with({"IL_baseline": 1500.0}), {}) is None
+
+
+def test_the_il_baseline_opponent_stays_the_il_checkpoint():
+    """The anchor moves; the *gate* must not.  Repointing `frozen_il` itself
+    would enlist a champion under the name IL_baseline and quietly turn the
+    regression check into a self-comparison."""
+    import inspect
+    from ptcg_rl import mcts_train
+
+    src = inspect.getsource(mcts_train.main)
+    assert '_enlist("IL_baseline", frozen_il, _deck_record_of(args.il_ckpt))' \
+        in src, "the IL_baseline opponent is no longer the --il-ckpt model"
+    assert "anchor_policy" in src, "the anchor has no variable of its own"
+
+
+def test_the_moving_anchor_is_what_the_training_step_anchors_to():
+    """Resolving an anchor and then training against the old one is the
+    codebase's recurring failure shape: a number gets logged while nothing is
+    restrained.  Mutating this line back to `frozen_il` passed every other
+    test in this section."""
+    import inspect
+    from ptcg_rl import mcts_train
+
+    src = inspect.getsource(mcts_train.main)
+    assert "frozen_il=anchor_policy" in src, (
+        "the training step is anchored to the fixed IL model again — the "
+        "top-ELO reference is resolved but unused")
+
+
+def test_the_anchor_is_re_resolved_after_every_eval():
+    """Resolved once at startup, the reference is frozen for the whole run and
+    can never follow a champion that overtakes IL."""
+    import inspect
+    from ptcg_rl import mcts_train
+
+    src = inspect.getsource(mcts_train.main)
+    assert src.count("_resolve_anchor_policy(") >= 3, (
+        "the anchor is resolved fewer times than definition + startup + "
+        "post-eval refresh — it cannot be following the leaderboard")

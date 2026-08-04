@@ -140,6 +140,51 @@ STAGE_PARAMS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
+def baseline_param(config) -> str:
+    """How a mine run chooses its archetype id generation.
+
+    Deliberately records the *intent*, not the resolved file.  Under the default
+    (``"auto"``) the baseline is the output directory's own previous
+    ``archetypes.json``, so a content hash would make the fingerprint
+    self-referential: every run would find a baseline the stamp has never
+    recorded and recompute, 15 minutes at a time, on an unchanged corpus.
+
+    Nor is one extra pass enough to settle it.  Seeding is *not* a no-op on an
+    unseeded file: it also removes a processing-order constraint, because all
+    baseline representatives exist from the first deck rather than appearing as
+    higher-frequency decks open them, so a deck can reach a better match that
+    was previously unreachable.  Measured over the 11.9k-episode corpus, 7 of
+    201 clusters shifted membership (~102 decklists; archetype 0 lost 21 of
+    4872).  Ids, representatives, ``self_ids``, ``opp_ids`` and ``fixed_deck``
+    were all preserved exactly — those are what everything downstream reads —
+    but the bytes changed, so a hash would recompute twice before converging.
+
+    Keying on intent instead means seeding takes effect exactly when Phase 2
+    runs anyway (the corpus changed) and costs nothing when it does not.
+    ``--rebaseline`` and an explicit ``--baseline-archetypes`` both change the
+    id space against an unchanged corpus, so both move this value.  The explicit
+    form carries the file's content hash, because pointing at a *different*
+    generation must recompute even though the flag reads the same.
+    """
+    if getattr(config, "rebaseline", False):
+        return "rebaseline"
+    path = getattr(config, "baseline_archetypes", None)
+    if path is None:
+        return "auto"
+    path = Path(path)
+    if not path.exists():
+        # ptcg_mine.mine.resolve_baseline raises on this; the stamp must not
+        # quietly decide it first.
+        return "missing"
+    return "file:" + _sha1_of_file(path)[:12]
+
+
+#: Params a stage needs that are computed rather than read off an attribute.
+#: They live here, not at the call site, so a caller building a stamp cannot
+#: record a different fingerprint from the one the run will check against.
+_DERIVED_PARAMS = {"mine": {"baseline": baseline_param}}
+
+
 def params_from_config(stage: str, config, **extra) -> dict[str, str]:
     """The param dict for `stage`, read off a MineConfig."""
     params = {
@@ -147,6 +192,8 @@ def params_from_config(stage: str, config, **extra) -> dict[str, str]:
         for key, attr in STAGE_PARAMS[stage]
         if hasattr(config, attr)
     }
+    for key, fn in _DERIVED_PARAMS.get(stage, {}).items():
+        params[key] = fn(config)
     params.update(extra)
     return {k: str(v) for k, v in params.items()}
 

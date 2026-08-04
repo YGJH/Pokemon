@@ -22,7 +22,16 @@ from ptcg_mine.cards import (build_engine_attack_features,
                               build_engine_card_features,
                               build_static_tables, load_engine)
 from ptcg_mine.config import MineConfig
-from ptcg_mine.episode import deck_of, load_episode, project_for_selection, validate_episode
+from ptcg_mine.episode import (
+    OK,
+    UNREADABLE,
+    deck_of,
+    load_episode,
+    project_for_selection,
+    scan_projections,
+    validate_episode,
+)
+from ptcg_mine.progress import ProgressReporter
 from ptcg_mine.stats import select_experts, team_leaderboard
 from ptcg_mine.vocab import build_vocab
 
@@ -57,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--h-max", type=int, default=d.h_max)
     p.add_argument("--o-max", type=int, default=d.o_max)
     p.add_argument("--d-max", type=int, default=d.d_max)
+    p.add_argument("--jobs", "-j", type=int, default=None,
+                   help="Worker processes for the Phase 2 episode scan "
+                        "(default: os.cpu_count(); 1 disables the pool). "
+                        "Order-preserving, so this cannot change the output.")
     p.add_argument("--raw-dir", default=str(d.raw_dir))
     p.add_argument("--out-dir", default=str(d.out_dir))
     p.add_argument("--manifest-csv", default=str(d.manifest_csv))
@@ -87,6 +100,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute Phase 2 even when the corpus, config and code are unchanged "
              "since the last successful run (default: reuse the existing artifacts).",
     )
+    p.add_argument(
+        "--baseline-archetypes",
+        default=None,
+        help="A previous archetypes.json to seed clustering from, so cluster ids "
+             "and 𝒟_opp belief slots are append-only. Defaults to "
+             "<out-dir>/archetypes.json when it exists — stable ids are the "
+             "default because losing them silently repoints every trained "
+             "checkpoint at a different deck.",
+    )
+    p.add_argument(
+        "--rebaseline",
+        action="store_true",
+        help="Ignore any baseline and renumber archetypes from scratch. This "
+             "INVALIDATES every existing checkpoint's deck record and every "
+             "𝒟_opp belief slot; --archetype-self N will mean a different deck. "
+             "Use it when the meta has moved far enough that frozen "
+             "representatives are worse than a clean re-cluster, and expect to "
+             "retrain.",
+    )
     return p
 
 
@@ -113,35 +145,143 @@ def config_from_args(args: argparse.Namespace) -> MineConfig:
         dataset_prefix=args.dataset_prefix,
         day_order=args.day_order,
         list_mode=args.list_mode,
+        baseline_archetypes=(
+            Path(args.baseline_archetypes) if args.baseline_archetypes else None
+        ),
+        rebaseline=args.rebaseline,
     )
 
 
-def load_raw_episodes(raw_dir) -> tuple[list[dict], int]:
+def _lineage(baseline_path, baseline, out_dir) -> dict:
+    """The ``lineage`` block for archetypes.json.
+
+    ``generation`` counts re-baselines, not runs: it increments only when ids
+    are reassigned from scratch, which is precisely when previously trained
+    checkpoints stop being valid.  A seeded run inherits the number, so every
+    artifact in one id generation shares it and a checkpoint can be matched to
+    the artifacts it is compatible with by a single integer.
+    """
+    import hashlib
+    import json as _json
+
+    if baseline is None or baseline_path is None:
+        prior = Path(out_dir) / "archetypes.json"
+        generation = 0
+        if prior.exists():
+            try:
+                old = _json.loads(prior.read_text()).get("lineage") or {}
+                generation = int(old.get("generation", 0)) + 1
+            except (ValueError, OSError):
+                generation = 1
+        return {"seeded": False, "baseline_sha1": None, "baseline_path": None,
+                "generation": generation, "n_baseline_archetypes": 0}
+
+    path = Path(baseline_path)
+    generation = 0
+    try:
+        generation = int(
+            (_json.loads(path.read_text()).get("lineage") or {}).get("generation", 0)
+        )
+    except (ValueError, OSError):
+        pass
+    return {
+        "seeded": True,
+        "baseline_sha1": hashlib.sha1(path.read_bytes()).hexdigest()[:12],
+        "baseline_path": str(path),
+        "generation": generation,
+        "n_baseline_archetypes": len(baseline),
+    }
+
+
+def resolve_baseline(
+    config: MineConfig,
+) -> tuple[list | None, list[int], list[int], Path | None]:
+    """The archetype generation this run continues, or ``None`` to start fresh.
+
+    Precedence: ``--rebaseline`` wins over everything, then an explicit
+    ``--baseline-archetypes``, then ``<out-dir>/archetypes.json`` if it is
+    there.  The implicit case is the important one — re-mining into a directory
+    that already has artifacts is the normal way this pipeline is run, and it is
+    exactly where losing the ids does the damage, so it must not depend on
+    anyone remembering a flag.
+
+    An explicitly named baseline that does not exist is an error, not a silent
+    fall-through to fresh ids: the caller asked to continue a generation.
+    """
+    from ptcg_mine.archetype import load_archetypes_json
+
+    if config.rebaseline:
+        return None, [], [], None
+
+    path = config.baseline_archetypes
+    if path is not None:
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"--baseline-archetypes {path} does not exist. Mining without "
+                "it would renumber every archetype and repoint every trained "
+                "checkpoint at a different deck; pass --rebaseline if that is "
+                "what you want."
+            )
+        archetypes, self_ids, opp_ids = load_archetypes_json(path)
+        if not archetypes:
+            raise ValueError(
+                f"--baseline-archetypes {path} holds no archetypes, so it "
+                "cannot continue an id generation. Point it at a real "
+                "archetypes.json, or pass --rebaseline."
+            )
+        return archetypes, self_ids, opp_ids, path
+
+    path = Path(config.out_dir) / "archetypes.json"
+    if not path.exists():
+        return None, [], [], None
+
+    archetypes, self_ids, opp_ids = load_archetypes_json(path)
+    if not archetypes:
+        # Nothing to preserve: an artifact with no clusters carries no ids, so
+        # starting fresh cannot renumber anything anyone depends on.  Said out
+        # loud because the *usual* reason this path runs is to keep ids stable.
+        print(f"  baseline: {path} holds no archetypes — assigning ids fresh")
+        return None, [], [], None
+    return archetypes, self_ids, opp_ids, path
+
+
+def load_raw_episodes(raw_dir, jobs: int | None = None) -> tuple[list[dict], int]:
     """Load every `*.json` episode under raw_dir (recursively), keeping only
     those that pass validate_episode. Returns (valid_episodes, n_loaded).
 
     Each retained episode is reduced to its selection projection (see
-    `project_for_selection`) before being appended, and the full parse is
-    dropped on the next iteration — so the corpus is streamed off disk one
-    episode at a time and never fully resident. Peak RSS over the real 2304-
-    episode corpus: 0.12 GB, against 33.5 GB before.
+    `project_for_selection`), and only as much of the document as that
+    projection needs is ever decoded — so the corpus is never fully resident.
+    Peak RSS over the real 2304-episode corpus: 0.12 GB, against 33.5 GB before.
+
+    The scan is fanned out over *jobs* processes (default ``os.cpu_count()``).
+    Results stay in path order whatever the worker count, which matters because
+    archetype cluster ids are assigned in corpus-frequency order downstream.
     """
     raw_dir = Path(raw_dir)
     episodes: list[dict] = []
     n_loaded = 0
-    for path in sorted(raw_dir.rglob("*.json")):
-        try:
-            ep = load_episode(path)
-        except (json.JSONDecodeError, OSError):
-            continue
-        n_loaded += 1
-        if validate_episode(ep):
-            episodes.append(project_for_selection(ep))
-        del ep
+    # The walk is materialised anyway (it is sorted), so the exact total is
+    # free -- unlike Phase 1, this bar never has to guess.
+    paths = sorted(raw_dir.rglob("*.json"))
+    with ProgressReporter(
+        "parsing episodes", len(paths), logger=logger, unit="episode"
+    ) as reporter:
+        for _eid, proj, status in scan_projections(paths, jobs):
+            # Advance per result, not per completed episode: a file that will
+            # not parse still took the time to read.
+            reporter.advance()
+            if status is UNREADABLE:
+                continue
+            n_loaded += 1
+            if status is OK:
+                episodes.append(proj)
     return episodes, n_loaded
 
 
-def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
+def run(config: MineConfig, skip_download: bool, force: bool = False,
+        jobs: int | None = None) -> dict:
     """Run Phases 0-2 for `config`; returns a summary dict. Side effects:
     writes vocab.json, archetypes.json, mining_report.md, and the .npy static
     tables into config.out_dir.
@@ -160,11 +300,24 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
         from kaggle.api.kaggle_api_extended import KaggleApi
 
         from ptcg_mine.download import download_corpus
+        from ptcg_mine.kaggle_adapter import PooledKaggleApi
 
         api = KaggleApi()
         api.authenticate()
-        download_corpus(config, api)
+        # Wrapped here, not inside download.py: that module never imports
+        # kaggle, so that its tests can inject fakes with no network in reach.
+        with PooledKaggleApi(api) as pooled:
+            download_corpus(config, pooled)
 
+    # The baseline decides the id space, so it belongs in the fingerprint: two
+    # runs over the same corpus with different baselines produce different
+    # archetypes.json, and without this the second reports itself cached and
+    # keeps the first one's ids.
+    #
+    # The implicit baseline is the previous run's own output, so upgrading an
+    # existing data-dir costs exactly one extra Phase 2: the first seeded run
+    # sees a fingerprint it has never recorded, and the artifacts it writes are
+    # identical to what it read, so every run after that is cached again.
     params = stamp.params_from_config("mine", config)
     if not force:
         fresh, reason = stamp.check(
@@ -177,7 +330,7 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
             return {**rec["summary"], "cached": True}
         logger.info("Phase 2: recomputing — %s", reason)
 
-    episodes, n_loaded = load_raw_episodes(config.raw_dir)
+    episodes, n_loaded = load_raw_episodes(config.raw_dir, jobs)
 
     # Check the corpus itself before blaming expert selection: an empty or
     # unparseable raw_dir is a Phase 1 problem, and saying so here saves the
@@ -208,9 +361,30 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
     for ep in episodes:
         for p in (0, 1):
             deck_freq[canon(deck_of(ep, p))] += 1
-    archetypes = cluster_decks(deck_freq, config.jaccard_thresh)
 
-    self_ids, opp_ids = select_self_opp(episodes, experts, archetypes, config.n_self, config.n_opp)
+    baseline, base_self, base_opp, baseline_path = resolve_baseline(config)
+    archetypes = cluster_decks(deck_freq, config.jaccard_thresh, baseline=baseline)
+
+    self_ids, opp_ids = select_self_opp(
+        episodes, experts, archetypes, config.n_self, config.n_opp,
+        baseline_self_ids=base_self, baseline_opp_ids=base_opp,
+    )
+    if baseline is not None:
+        n_new = len(archetypes) - len(baseline)
+        print(f"  baseline: {baseline_path} ({len(baseline)} archetypes, ids "
+              f"0..{max(a.id for a in baseline)}) → +{n_new} new cluster(s)")
+        if len(opp_ids) != len(base_opp):
+            # n_opp_arch just changed, so a policy built against the new
+            # artifacts no longer has the same belief-head width as one built
+            # against the old.  Loud, because --resume across this boundary is
+            # a shape mismatch and warm-starting needs the widening path.
+            print(f"  WARNING: 𝒟_opp grew {len(base_opp)} → {len(opp_ids)} slots. "
+                  "Old checkpoints keep their own width and still evaluate, but "
+                  "resuming one into the new artifacts needs "
+                  "--allow-belief-widening.")
+    else:
+        print("  baseline: none — archetype ids are being assigned from scratch")
+
     fixed_deck = pick_fixed_deck(episodes, experts, self_ids, archetypes)
 
     vocab = build_vocab(episodes, mode=config.vocab_mode, n_vocab=config.n_vocab)
@@ -234,7 +408,9 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     write_vocab_json(out_dir / "vocab.json", vocab, attack_id_to_index, config)
-    write_archetypes_json(out_dir / "archetypes.json", self_ids, opp_ids, archetypes, fixed_deck)
+    lineage = _lineage(baseline_path, baseline, out_dir)
+    write_archetypes_json(out_dir / "archetypes.json", self_ids, opp_ids,
+                          archetypes, fixed_deck, lineage=lineage)
     write_mining_report(
         out_dir / "mining_report.md", leaderboard, experts, archetypes, self_ids, opp_ids, vocab, counts
     )
@@ -264,6 +440,16 @@ def run(config: MineConfig, skip_download: bool, force: bool = False) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    import kagglehub
+
+    # Download latest version
+    import shutil
+    path = kagglehub.dataset_download("kaggle/pokemon-tcg-ai-battle-episodes-index")
+    shutil.rmtree(path)
+    path = kagglehub.dataset_download("kaggle/pokemon-tcg-ai-battle-episodes-index")
+
+    print("Path to dataset files:", path)
+    shutil.copy(Path(path)/'manifest.csv' , '/home/charles/Documents/Pokemon/python/archive/manifest.csv')
     import logging
     logging.basicConfig(
         level=logging.INFO,
@@ -275,7 +461,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = config_from_args(args)
     try:
-        summary = run(config, skip_download=args.skip_download, force=args.force)
+        summary = run(config, skip_download=args.skip_download, force=args.force,
+                      jobs=getattr(args, "jobs", None))
     except DownloadError as exc:
         print(f"[ptcg_mine] download failed: {exc}", file=sys.stderr)
         return 2

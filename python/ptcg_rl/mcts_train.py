@@ -162,8 +162,27 @@ def build_parser() -> argparse.ArgumentParser:
     tp.add_argument("--c-pi", type=float, default=1.0,
                     help="Policy (CE to π̃) loss weight")
     tp.add_argument("--beta", type=float, default=0.1,
-                    help="KL-anchor weight on k3(π_θ ‖ π_IL). 0 disables the "
-                         "anchor; the term is a real gradient, not a log line")
+                    help="*Initial* KL-anchor weight on k3(π_θ ‖ π_ref); the "
+                         "controller moves it from here to hold KL at --kappa. "
+                         "0 disables the anchor; the term is a real gradient, "
+                         "not a log line")
+    tp.add_argument("--kappa", type=float, default=0.02,
+                    help="Target KL in nats/decision that β is driven to. "
+                         "Matches RL_SPEC §9.3 and ppo.py's R2 anchor, so IL, "
+                         "PPO and MCTS report KL on one scale. 0 pins β at "
+                         "--beta (the old constant-β behaviour).")
+    tp.add_argument("--beta-lr", type=float, default=0.02,
+                    help="Dual-ascent rate η_β in "
+                         "β ← clip(β·exp((KL−κ)/κ·η_β)), applied once per "
+                         "training step. Gentler than PPO's 0.1 because that "
+                         "updates once per rollout buffer while this updates "
+                         "--train-steps-per-iter times per iteration — at 0.1 "
+                         "a 2×-over-κ KL reaches --beta-max inside one "
+                         "iteration.")
+    tp.add_argument("--beta-min", type=float, default=1e-4,
+                    help="Lower clamp on β")
+    tp.add_argument("--beta-max", type=float, default=10.0,
+                    help="Upper clamp on β")
     tp.add_argument("--grad-clip", type=float, default=30.0,
                     help="Global grad-norm clip.  Meant as a spike guard, not "
                          "a per-step normaliser: measured raw norms on a real "
@@ -1693,11 +1712,21 @@ def train_step(
     device: torch.device,
     frozen_il: Any = None,
     *,
+    beta: float | None = None,
     is_first_micro: bool = True,
     is_last_micro: bool = True,
     n_micro: int = 1,
 ) -> dict[str, float]:
     """One training step from a sampled batch.
+
+    *beta* is the live KL-anchor weight, moved every step by
+    :func:`ptcg_rl.ppo.update_beta` to hold the measured KL at ``--kappa``.  It
+    is an argument rather than a config read because a constant β cannot hold a
+    trust region at all: ``k3(d) = e**-d - 1 + d`` has derivative ``1 - e**-d``,
+    which saturates at 1, so the anchor's restoring pull is capped at β while
+    the CE/BC term is unbounded — once the policy term wins, KL grows with
+    nothing to stop it.  ``None`` falls back to ``config.beta`` for callers
+    that predate the controller.
 
     The three ``*_micro`` arguments exist for gradient accumulation and
     default to a plain single step.  When accumulating, only the first
@@ -1712,6 +1741,9 @@ def train_step(
 
     if not batch:
         return {"loss": 0.0}
+
+    if beta is None:
+        beta = float(getattr(config, "beta", 0.1))
 
     policy.train()  # GRU backward needs cuDNN training mode
 
@@ -1858,7 +1890,7 @@ def train_step(
     loss_v = loss_v / n_batch
     loss_kl = kl_sum / max(n_kl, 1)
     total_loss = config.c_pi * loss_pi + config.c_value * loss_v \
-                 + getattr(config, "beta", 0.1) * loss_kl
+                 + beta * loss_kl
 
     if is_first_micro:
         optimizer.zero_grad(set_to_none=True)
@@ -1893,6 +1925,10 @@ def train_step(
         # quantity actually added to the loss.
         "kl": kl_raw,
         "kl_k3": float(loss_kl.detach()),
+        # The β this step actually used, not the CLI flag — the controller
+        # moves it, and a series pinned to the flag is a flat line whatever
+        # the anchor is doing.
+        "beta": beta,
         "n_pi": n_pi,
         "search_target_frac": n_search_targets / max(len(batch), 1),
         "grad_norm": raw_grad,
@@ -1926,6 +1962,8 @@ def train_step_accum(
     device: torch.device,
     frozen_il: Any = None,
     grad_accum: int = 1,
+    *,
+    beta: float | None = None,
 ) -> dict[str, float]:
     """:func:`train_step` over *grad_accum* microbatches, one optimizer step.
 
@@ -1941,7 +1979,8 @@ def train_step_accum(
     one reason to leave this at 1 when memory allows.
     """
     if grad_accum <= 1 or len(batch) <= 1:
-        return train_step(policy, optimizer, batch, config, device, frozen_il)
+        return train_step(policy, optimizer, batch, config, device, frozen_il,
+                          beta=beta)
 
     n_micro = min(grad_accum, len(batch))
     # Contiguous near-equal chunks.  The batch is already a uniform random
@@ -1956,6 +1995,7 @@ def train_step_accum(
     for k, chunk in enumerate(chunks):
         stats = train_step(
             policy, optimizer, chunk, config, device, frozen_il,
+            beta=beta,
             is_first_micro=(k == 0),
             is_last_micro=(k == n_micro - 1),
             n_micro=n_micro,
@@ -2120,6 +2160,47 @@ def main(argv: list[str] | None = None) -> int:
     frozen_il = _load_frozen_anchor(args.il_ckpt, data_dir, device)
     logger.info("Frozen π_IL loaded for evaluation")
 
+    # ── KL anchor reference: the top-ELO model, refreshed at each eval ───
+    #
+    # Separate from `frozen_il`, which stays the --il-ckpt model because it is
+    # also the `IL_baseline` *opponent*: repointing it would enlist a champion
+    # under that name and turn the regression check into a self-comparison.
+    def _resolve_anchor_policy(
+        current_name: str | None, current_policy: Any,
+    ) -> tuple[str | None, Any]:
+        """Re-resolve the anchor, loading only when the winner changed."""
+        picked = _resolve_anchor(elo, _anchor_candidates(
+            args.il_ckpt, il_checkpoints, champion_ckpts))
+        if picked is None:
+            return current_name, current_policy
+        name, path = picked
+        if name == current_name:
+            return current_name, current_policy
+        # --il-ckpt is usually also one of the discovered IL checkpoints, so
+        # the same file can win under a second leaderboard name; reuse the
+        # already-resident copy rather than loading it twice.
+        is_il = str(Path(path).resolve()) == str(Path(args.il_ckpt).resolve())
+        try:
+            policy_ref = (frozen_il if is_il
+                          else _load_frozen_anchor(path, data_dir, device))
+        except Exception as e:  # noqa: BLE001 — keep the anchor we have
+            logger.warning(
+                "KL anchor stays %s — could not load %s: %s",
+                current_name, path, e)
+            return current_name, current_policy
+        if (current_policy is not None and current_policy is not frozen_il
+                and current_policy is not policy_ref):
+            current_policy.to("cpu")
+        logger.info("KL anchor → %s (ELO %.0f)", name,
+                    elo.ratings.get(name, elo.initial))
+        return name, policy_ref
+
+    anchor_name, anchor_policy = _resolve_anchor_policy(None, None)
+    if anchor_policy is None:
+        anchor_name, anchor_policy = "IL_baseline", frozen_il
+        logger.warning(
+            "No rated anchor candidate — falling back to --il-ckpt")
+
     # ── Seat-1 pilots ───────────────────────────────────────────────────
     # θ is a specialist on `fixed_deck`; seat 1 is dealt a *sampled* archetype.
     # With θ answering both seats it plays that deck with cards it has never
@@ -2208,7 +2289,12 @@ def main(argv: list[str] | None = None) -> int:
                 "explicit --resume" if args.resume
                 else f"auto-resume {best_ckpt.name}" if best_ckpt is not None
                 else f"warm-start {init_ckpt}")
-    logger.info("Frozen KL anchor : %s", args.il_ckpt)
+    logger.info("IL baseline (gate opponent) : %s", args.il_ckpt)
+    logger.info("KL anchor : %s (top ELO, re-resolved at each eval)",
+                anchor_name)
+    logger.info("KL control: β₀=%.4g → κ=%.4g nats  η_β=%.4g  β∈[%.4g, %.4g]",
+                args.beta, args.kappa, args.beta_lr,
+                args.beta_min, args.beta_max)
     logger.info("ELO leaderboard:")
     for line in elo.leaderboard().split("\n"):
         logger.info("  %s", line)
@@ -2222,7 +2308,13 @@ def main(argv: list[str] | None = None) -> int:
     optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr)
     rng = np.random.default_rng(args.seed)
 
+    # Live KL-anchor weight.  Not persisted across runs: a resume restarts it
+    # at --beta and the controller re-converges within roughly one iteration
+    # at the default η_β.
+    beta = float(args.beta)
+
     # ── Replay buffer ───────────────────────────────────────────────────
+    from ptcg_rl.ppo import update_beta
     from ptcg_rl.search import ReplayBuffer
     replay = ReplayBuffer(capacity=args.buffer_capacity)
 
@@ -2320,6 +2412,7 @@ def main(argv: list[str] | None = None) -> int:
             cum_ret_mean = 0.0
             cum_adv = 0.0
             cum_kl_k3 = 0.0
+            cum_beta = 0.0
             cum_search_tgt = 0.0
             cum_target_std = 0.0
             cum_soc = 0.0
@@ -2336,8 +2429,15 @@ def main(argv: list[str] | None = None) -> int:
                 batch = replay.sample(args.batch_size, rng)
                 stats = train_step_accum(
                     policy, optimizer, batch, args, device,
-                    frozen_il=frozen_il, grad_accum=args.grad_accum,
+                    frozen_il=anchor_policy, grad_accum=args.grad_accum,
+                    beta=beta,
                 )
+                # Dual ascent on the anchor, driven by the same non-negative
+                # k3 estimate ppo.py feeds it, so κ means the same thing in
+                # both stages.  A constant β caps the restoring pull while the
+                # policy term is unbounded; this is what stops KL running.
+                beta = update_beta(beta, stats.get("kl_k3", 0.0), args)
+                cum_beta += beta
                 cum_pi += stats["pi_ce"]
                 cum_v += stats["v_mse"]
                 cum_g += stats["grad_norm"]
@@ -2364,11 +2464,11 @@ def main(argv: list[str] | None = None) -> int:
                 if (step + 1) % 100 == 0:
                     logger.info(
                         "  step %d/%d  lr=%.1e  loss=%.4f  pi=%.4f  v=%.4f  "
-                        "kl=%.4f  ev=%.3f  |g|=%.2f→%.3f",
+                        "kl=%.4f  β=%.3g  ev=%.3f  |g|=%.2f→%.3f",
                         step + 1, args.train_steps_per_iter,
                         optimizer.param_groups[0]["lr"],
                         stats["loss"], stats["pi_ce"], stats["v_mse"],
-                        stats.get("kl", 0),
+                        stats.get("kl", 0), beta,
                         stats.get("ev", float("nan")),
                         stats["grad_norm"],
                         min(stats["grad_norm"], args.grad_clip),                     )
@@ -2387,10 +2487,12 @@ def main(argv: list[str] | None = None) -> int:
             cum_grad_norm = (cum_grad_norm * (n_train_steps - n_steps)
                              + avg_g * n_steps) / max(n_train_steps, 1)
             logger.info(
-                "TRAIN │ %d steps in %s │ pi_ce=%.4f  v_mse=%.4f  kl=%.4f  "
+                "TRAIN │ %d steps in %s │ pi_ce=%.4f  v_mse=%.4f  "
+                "kl=%.4f/κ%.3g β=%.3g  "
                 "ev=%.3f (tgt_std=%.3f)  grad=%.3f (clipped %.0f%%)  mcts~z=%s",
                 n_steps, fmt_dur(t_tr), avg_pi, avg_v,
-                avg_kl, avg_ev, avg_target_std, avg_g,
+                cum_kl_k3 / n_steps, args.kappa, beta,
+                avg_ev, avg_target_std, avg_g,
                 cum_clipped / n_steps * 100,
                 f"{cum_soc / n_soc:+.3f}" if n_soc else "n/a",
             )
@@ -2412,7 +2514,12 @@ def main(argv: list[str] | None = None) -> int:
                           "ret_mean": cum_ret_mean / n_steps,
                           "adv_abs_mean": cum_adv / n_steps,
                           "kl_k3": cum_kl_k3 / n_steps,
-                          "beta": args.beta,
+                          # The controller's live β, averaged over the
+                          # iteration, plus where it ended.  `args.beta` drew a
+                          # flat line whatever the anchor was doing.
+                          "beta": cum_beta / n_steps,
+                          "beta_end": beta,
+                          "kappa": args.kappa,
                           # Share of the batch whose critic target came from
                           # search rather than the game outcome.  0 with
                           # --mcts-distill on means the roots are being
@@ -2539,6 +2646,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 logger.info("ELO │ FAILED (%.0f < top30%% %.0f)", new_elo, threshold)
+
+            # Re-resolve the KL anchor against the ratings this eval just
+            # produced.  Here rather than at promotion time: a champion the
+            # gate rejected can still have moved the ratings of the models
+            # already in the pool.
+            anchor_name, anchor_policy = _resolve_anchor_policy(
+                anchor_name, anchor_policy)
         else:
             # Per-iteration summary when no eval
             _print_summary()
@@ -2809,6 +2923,55 @@ def _find_best_champion(
             best_elo = rating
             best_ckpt = ckpt
     return best_ckpt
+
+
+def _anchor_candidates(
+    il_ckpt: str,
+    il_checkpoints: list[tuple[str, str]],
+    champion_ckpts: list[Path],
+) -> dict[str, str]:
+    """ELO leaderboard name → checkpoint path, for every model on it.
+
+    The leaderboard is keyed by bare model names from three different sources
+    — ``IL_baseline`` for ``--il-ckpt``, the stems
+    :func:`_discover_il_checkpoints` registers, and :func:`elo_key` for each
+    champion file — and a rating alone cannot be loaded.  Only names that
+    resolve to a file that exists are returned, so a pruned champion drops out
+    of contention rather than resolving to a missing path.
+    """
+    candidates: dict[str, str] = {}
+    if il_ckpt and Path(il_ckpt).exists():
+        candidates["IL_baseline"] = il_ckpt
+    for name, path in il_checkpoints:
+        if Path(path).exists():
+            candidates[name] = path
+    for ckpt in champion_ckpts:
+        if ckpt.exists():
+            candidates[elo_key(ckpt)] = str(ckpt)
+    return candidates
+
+
+def _resolve_anchor(
+    elo: EloTracker, candidates: dict[str, str],
+) -> tuple[str, str] | None:
+    """The highest-rated model in *candidates*, as ``(name, path)``.
+
+    The KL anchor follows the leaderboard rather than staying pinned to
+    ``--il-ckpt``: on this corpus IL outranks every MCTS champion in four of
+    five runs, so today this usually resolves back to an IL checkpoint — but
+    once a champion genuinely overtakes it, the trust region moves with it
+    instead of holding θ near a model it has already beaten.
+
+    Unrated names sort below every rated one rather than defaulting to 0 and
+    tying with them; ``None`` when there is nothing loadable to anchor to.
+    Deliberately *not* ``elo.best()``: that ranks names, and a name with no
+    checkpoint behind it cannot be loaded.
+    """
+    rated = [(name, path) for name, path in candidates.items()
+             if name in elo.ratings]
+    if not rated:
+        return None
+    return max(rated, key=lambda np_: elo.ratings[np_[0]])
 
 
 def _cosine_lr(step: int, total: int, peak: float, floor: float, warmup: int) -> float:

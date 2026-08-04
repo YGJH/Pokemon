@@ -41,6 +41,10 @@ SKIP_RUST=""
 # 指紋快取的強制重跑開關（見檔頭）。預設空 = 只在指紋不符時才重算。
 FORCE_MINE=""
 FORCE_SHARDS=""
+# 空 = 沿用 $DATA_DIR/archetypes.json 的 archetype id（append-only，舊
+# checkpoint 仍然有效）。--rebaseline 會重新編號，等於作廢所有既有 checkpoint
+# 的 deck 記錄與 belief slot。
+REBASELINE=""
 # 各阶段完整输出一律写入 logs/ 下的日志档。终端预设只印**训练与 RL**（阶段 4、5）
 # 的即时输出：这两段动辄数小时，只有一行 "training..." 等于全程没有进度可看。
 # download/mine/build-shards 会刷上千行、对进度没帮助，所以仍旧只留摘要。
@@ -189,6 +193,8 @@ while [[ $# -gt 0 ]]; do
         --force-mine)
             FORCE_MINE="true"; shift
             ;;
+        --rebaseline)
+            REBASELINE="--rebaseline"; shift ;;
         --force-shards)
             FORCE_SHARDS="true"; shift
             ;;
@@ -335,6 +341,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --force-mine           強制重跑步驟 2"
             echo "  --force-shards         強制重跑步驟 3"
             echo "  --force                兩者都強制重跑"
+            echo ""
+            echo "  --rebaseline           重新編號 archetype id（預設沿用既有編號）。"
+            echo "                         會作廢所有既有 checkpoint 的 deck 記錄與"
+            echo "                         belief slot —— --archetype-self N 會變成別副牌。"
             echo ""
             echo "  --no-train             只做 mine + build-shards，不训练"
             echo "  --raw-dir DIR          raw 目录 (默认: python/raw)"
@@ -554,6 +564,7 @@ MINE_CMD="uv run python -m ptcg_mine.mine \
     --g-min $G_MIN \
     --jaccard-thresh $JACCARD_THRESH \
     ${N_SELF:+--n-self $N_SELF --n-opp $N_SELF} \
+    $REBASELINE \
     $SKIP_DOWNLOAD${FORCE_MINE:+ --force}"
 
 if [[ -z "$SKIP_DOWNLOAD" ]] && [[ "$VERBOSE" == "true" ]]; then

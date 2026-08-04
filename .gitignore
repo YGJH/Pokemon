@@ -11,7 +11,9 @@ python/logs/
 python/pokemon-tcg-ai-battle
 # Corpus-mining caches / artifacts
 raw/
+994rating/
 archive/
+*.json
 .serena/
 .claude/
 python/wandb/

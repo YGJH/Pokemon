@@ -480,6 +480,7 @@ def train(
     wandb_name: str | None = None,
     # Resume
     resume_ckpt: str | Path | None = None,
+    allow_belief_widening: bool = False,
     # Eval
     run_val: bool = True,
     # Early-stop (C.5/C.8)
@@ -563,7 +564,7 @@ def train(
         f"train(archetype_self={archetype_self})",
     )
     logger.info("Training %s", describe_deck(deck_meta))
-
+    logger.info('total_steps %s' , total_steps)
     # Build datasets
     train_ds = ShardDataset(
         data_dir, split="train", shuffle=True, seed=42, archetype_self=archetype_self
@@ -670,7 +671,10 @@ def train(
     if resume_ckpt is not None:
         from ptcg_il.train.checkpoint import load_checkpoint
         ckpt = load_checkpoint(resume_ckpt, device)
-        stale = load_policy_state(policy, ckpt["model_state_dict"])
+        stale = load_policy_state(
+            policy, ckpt["model_state_dict"],
+            allow_belief_widening=allow_belief_widening,
+        )
         if stale:
             logger.warning(
                 "Checkpoint predates the belief heads; %d belief parameters "
