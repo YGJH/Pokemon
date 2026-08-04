@@ -69,7 +69,7 @@ DEFAULTS = {
     # Precision
     "mixed_precision": True,
     # Patience
-    "patience": 5000000,
+    "patience": 5000,
     # Live eval
     "live_eval_games": 500,
     # W&B.  Runs land in the `poken` team by default; override with
