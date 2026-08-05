@@ -485,6 +485,8 @@ def train(
     run_val: bool = True,
     # Early-stop (C.5/C.8)
     patience: int = 5,
+    # Seed
+    seed: int = 42,
 ) -> Policy:
     """Full training loop (C.6).
 
@@ -551,6 +553,8 @@ def train(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    torch.manual_seed(seed)
+
     # Deck identity — stamped into every checkpoint and the decks.json sidecar
     # so a .pt always says which archetype deck it plays.
     # Built before the first batch, not at the first save: a run that cannot
@@ -567,7 +571,7 @@ def train(
     logger.info('total_steps %s' , total_steps)
     # Build datasets
     train_ds = ShardDataset(
-        data_dir, split="train", shuffle=True, seed=42, archetype_self=archetype_self
+        data_dir, split="train", shuffle=True, seed=seed, archetype_self=archetype_self
     )
     train_loader = DataLoader(
         train_ds,

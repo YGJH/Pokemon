@@ -35,6 +35,8 @@ REWRITE_RULES: list[tuple[str, str]] = [
     (r"from ptcg_il\.model\.value import", r"from model.value import"),
     (r"from ptcg_il\.model\.belief import", r"from model.belief import"),
     (r"from ptcg_il\.model\.policy import", r"from model.policy import"),
+    # ensemble.py imports (lives in ptcg_il/, bundled as model/ensemble.py)
+    (r"from ptcg_il\.ensemble import", r"from model.ensemble import"),
     # Blanket "from ptcg_il.model import X" rule (must come after submodule rules
     # so it doesn't prematurely match the submodule prefixes)
     (r"from ptcg_il\.model import", r"from model import"),
@@ -58,6 +60,7 @@ MODEL_FILES: list[str] = [
     "value.py",
     "belief.py",
     "policy.py",
+    "ensemble.py",
 ]
 
 # Additional Python files to bundle (from ptcg_il/ or ptcg_rl/)
@@ -450,9 +453,6 @@ _engine_card_features = np.load(
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
 
-_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
-_cfg = _ckpt.get("config", {})
-
 # All-card feature matrix.  The belief heads own it, and Policy builds them
 # unconditionally, so it is still required to construct the module and load the
 # packaged state dict — even though this build never runs a belief head.
@@ -466,6 +466,18 @@ _cfg = _ckpt.get("config", {})
 _max_cid = max(_engine_card_features.keys()) if _engine_card_features else 0
 _table_dim = int(np.asarray(next(iter(_engine_card_features.values()))).shape[-1]
                  ) if _engine_card_features else 0
+
+# Read F_CARD from the first available source: ensemble member 0, or model.pt.
+_ENSEMBLE_MANIFEST = os.path.join(DATA_DIR, "ensemble.json")
+if os.path.exists(_ENSEMBLE_MANIFEST):
+    _manifest = json.loads(open(_ENSEMBLE_MANIFEST).read())
+    _member0 = torch.load(os.path.join(DATA_DIR, _manifest["members"][0]),
+                          map_location=_device, weights_only=True)
+    _cfg = _member0.get("config", {})
+else:
+    _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+    _cfg = _ckpt.get("config", {})
+
 _card_feat_dim = int(_cfg.get("feat_dims", {}).get("F_CARD", _table_dim))
 if _engine_card_features and _card_feat_dim != _table_dim:
     raise SystemExit(
@@ -476,36 +488,43 @@ _all_card_feat = torch.zeros(_max_cid + 1, _card_feat_dim)
 for _cid, _feat in _engine_card_features.items():
     _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
-_model = Policy(
-    D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
-    layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
-    n_opp_arch=_cfg.get("n_opp_arch", 1),
-    n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
-    all_card_feat=_all_card_feat,
-)
-_missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
-if _missing:
-    _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
-    _other = [k for k in _missing if not k.startswith("belief_heads.")]
-    # Policy ties one CardEncoder into three places (`policy.py`:
-    # `self.pointer.card = self.embed.card`, same for the belief heads), and
-    # EMA's shadow de-duplicates shared parameters, so those aliases are absent
-    # from the packaged state dict while the tensors they name are loaded
-    # through `embed.card.*`.  Reporting them as missing cried wolf on every
-    # single run, which is how a real gap would have gone unnoticed.  Compare
-    # object identity rather than guessing at name prefixes.
-    # remove_duplicate=False is the whole point: the default de-duplicates
-    # shared parameters, so the alias names are absent and would be misread as
-    # genuinely missing — the exact false alarm this is here to stop.
-    _params = dict(_model.named_parameters(remove_duplicate=False))
-    _params.update(dict(_model.named_buffers(remove_duplicate=False)))
-    _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
-    _other = [k for k in _other
-              if k not in _params or id(_params[k]) not in _loaded_ids]
-    if _other:
-        print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
-_model.to(_device)
-_model.eval()
+# ── Ensemble detection ────────────────────────────────────────────────────
+if os.path.exists(_ENSEMBLE_MANIFEST):
+    from model.ensemble import EnsemblePolicy
+    _manifest = json.loads(open(_ENSEMBLE_MANIFEST).read())
+    _member_paths = [os.path.join(DATA_DIR, m) for m in _manifest["members"]]
+    _model = EnsemblePolicy.from_checkpoints(_member_paths, _all_card_feat, device=_device)
+else:
+    _model = Policy(
+        D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
+        layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
+        n_opp_arch=_cfg.get("n_opp_arch", 1),
+        n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
+        all_card_feat=_all_card_feat,
+    )
+    _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
+    if _missing:
+        _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
+        _other = [k for k in _missing if not k.startswith("belief_heads.")]
+        # Policy ties one CardEncoder into three places (`policy.py`:
+        # `self.pointer.card = self.embed.card`, same for the belief heads), and
+        # EMA's shadow de-duplicates shared parameters, so those aliases are absent
+        # from the packaged state dict while the tensors they name are loaded
+        # through `embed.card.*`.  Reporting them as missing cried wolf on every
+        # single run, which is how a real gap would have gone unnoticed.  Compare
+        # object identity rather than guessing at name prefixes.
+        # remove_duplicate=False is the whole point: the default de-duplicates
+        # shared parameters, so the alias names are absent and would be misread as
+        # genuinely missing — the exact false alarm this is here to stop.
+        _params = dict(_model.named_parameters(remove_duplicate=False))
+        _params.update(dict(_model.named_buffers(remove_duplicate=False)))
+        _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
+        _other = [k for k in _other
+                  if k not in _params or id(_params[k]) not in _loaded_ids]
+        if _other:
+            print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
+    _model.to(_device)
+    _model.eval()
 
 _fixed_deck = _read_deck_csv()
 
@@ -641,11 +660,14 @@ def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None
         fallback path that reads as working search.
     """
     model_src = src_dir / "python" / "ptcg_il" / "model"
+    top_level_src = src_dir / "python" / "ptcg_il"
     model_dst = dst_dir / "model"
     model_dst.mkdir(parents=True, exist_ok=True)
 
     for fname in MODEL_FILES:
         src = model_src / fname
+        if not src.exists():
+            src = top_level_src / fname  # fallback: ptcg_il/ensemble.py etc.
         if not src.exists():
             print(f"WARNING: {src} not found — skipping")
             continue
@@ -820,6 +842,40 @@ def check_artifact_pairing(deck_record: dict | None, data_dir: Path,
             f"Use --force to package anyway.")
     print(f"WARNING: {msg}\n"
           f"  Nothing this {build} build reads is affected — packaging anyway.")
+
+
+def _build_member_weights(ckpt_path: Path, dst_dir: Path, index: int,
+                         deck_record: dict | None = None) -> None:
+    """Extract EMA weights from one ensemble member checkpoint into model_{index}.pt."""
+    import torch
+
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+    ema = ckpt.get("ema_state_dict")
+    if ema is not None and "shadow" in ema:
+        model_state = ema["shadow"]
+        print(f"  Member {index}: using EMA shadow weights (decay={ema.get('decay', '?')})")
+    else:
+        model_state = ckpt.get("model_state_dict")
+        if model_state is None:
+            raise KeyError(f"Checkpoint {ckpt_path} missing state dict")
+        print(f"  Member {index}: EMA not found — falling back to raw model_state_dict")
+
+    cfg = ckpt.get("config") or {}
+    arch = {
+        "D": int(cfg.get("D", 256)),
+        "heads": int(cfg.get("heads", 8)),
+        "layers": int(cfg.get("layers", 4)),
+        "ff": int(cfg.get("ff", 1024)),
+        "n_opp_arch": int(cfg.get("n_opp_arch", _infer_n_opp_arch(model_state))),
+        "n_all_cards": int(cfg.get("n_all_cards", 0)),
+    }
+
+    out = {"model_state_dict": model_state, "config": arch}
+    if deck_record is not None:
+        out["deck"] = deck_record
+    torch.save(out, dst_dir / f"model_{index}.pt")
+    print(f"  Wrote model_{index}.pt ({len(model_state)} parameter tensors)")
 
 
 def build_model_weights(ckpt_path: Path, dst_dir: Path,
@@ -1080,7 +1136,8 @@ def main():
     import argparse
     p = argparse.ArgumentParser(description="Build Kaggle submission package")
     p.add_argument("--data-dir", required=True, help="Path to training data/ directory")
-    p.add_argument("--ckpt", required=True, help="Path to checkpoint .pt file")
+    p.add_argument("--ckpt", action="append", required=True,
+                   help="Path to checkpoint .pt file. Pass multiple times for ensemble.")
     p.add_argument("--out", default="submission.tar.gz", help="Output tar.gz path")
     p.add_argument("--force", action="store_true",
                    help="Package even when the checkpoint's pinned vocab/archetypes "
@@ -1095,7 +1152,15 @@ def main():
                         "decision, no tree search. Drops search_infer.py, "
                         "belief_posterior.py, archetypes.json and libptcg_search.so.")
     args = p.parse_args()
-    mcts = not args.no_mcts
+    ckpt_paths = args.ckpt  # list[str] (action="append")
+    is_ensemble = len(ckpt_paths) > 1
+    if is_ensemble:
+        if args.no_mcts:
+            print("Note: --no-mcts is redundant in ensemble mode (always greedy)")
+        mcts = False  # ensemble is greedy-only
+        print(f"Ensemble mode: {len(ckpt_paths)} checkpoints, implicit --no-mcts")
+    else:
+        mcts = not args.no_mcts
 
     work = Path(args.work_dir)
     if work.exists():
@@ -1110,31 +1175,88 @@ def main():
     write_init(work / "model")
     print("  OK")
 
-    # Resolve the deck BEFORE anything else — an unlabelled checkpoint or an
-    # explicit override that disagrees with the label should abort the build
-    # rather than produce a plausible-looking, silently-wrong bundle.
-    deck, deck_record = read_ckpt_deck(Path(args.ckpt))
-    if deck_record is not None:
-        arch = deck_record.get("archetype_self")
-        print(f"Checkpoint deck label: "
-              f"{'archetype ' + str(arch) if arch is not None else 'all-decks (generalist)'}"
-              f", {deck_record.get('n_distinct_cards')} distinct cards"
-              f", vocab={deck_record.get('vocab_sha1')}")
-    if args.deck_csv:
-        override = [int(x) for x in Path(args.deck_csv).read_text().split()]
-        if deck is not None and override != deck:
-            print("  WARNING: --deck-csv disagrees with the checkpoint's own deck "
-                  "label; using --deck-csv as instructed.")
-        deck = override
+    if is_ensemble:
+        # ── Ensemble: resolve deck from first member, verify all members share it ──
+        deck, deck_record = read_ckpt_deck(Path(ckpt_paths[0]))
+        if deck_record is not None:
+            arch = deck_record.get("archetype_self")
+            print(f"Ensemble deck label (member 0): "
+                  f"{'archetype ' + str(arch) if arch is not None else 'all-decks (generalist)'}"
+                  f", {deck_record.get('n_distinct_cards')} distinct cards"
+                  f", vocab={deck_record.get('vocab_sha1')}")
 
-    check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force,
-                           mcts=mcts)
+        for i, ckpt_p in enumerate(ckpt_paths[1:], start=1):
+            member_deck, member_record = read_ckpt_deck(Path(ckpt_p))
+            if member_record is None:
+                print(f"WARNING: Member {i} checkpoint has no deck label — "
+                      f"cannot verify deck match")
+                continue
+            if (deck_record is not None
+                    and member_record.get("deck") != deck_record.get("deck")):
+                raise SystemExit(
+                    f"ERROR: Member {i} decklist differs from member 0. "
+                    f"Ensembling models trained on different decks fails silently."
+                )
+            if (deck_record is not None
+                    and member_record.get("vocab_sha1") != deck_record.get("vocab_sha1")):
+                print(f"WARNING: Member {i} vocab_sha1 differs from member 0")
 
-    print("Building data files...")
-    build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd(),
-                     mcts=mcts)
-    build_model_weights(Path(args.ckpt), data_dir, deck_record=deck_record)
-    print("  OK")
+        if args.deck_csv:
+            override = [int(x) for x in Path(args.deck_csv).read_text().split()]
+            if deck is not None and override != deck:
+                print("  WARNING: --deck-csv disagrees with member 0's deck "
+                      "label; using --deck-csv as instructed.")
+            deck = override
+
+        check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force,
+                               mcts=False)
+
+        print("Building data files...")
+        build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd(),
+                         mcts=False)
+
+        # Write per-member weight files
+        for i, ckpt_p in enumerate(ckpt_paths):
+            member_deck, member_record = read_ckpt_deck(Path(ckpt_p))
+            _build_member_weights(Path(ckpt_p), data_dir, i, deck_record=member_record)
+
+        # Write ensemble.json manifest
+        manifest = {"members": [f"model_{i}.pt" for i in range(len(ckpt_paths))]}
+        (data_dir / "ensemble.json").write_text(json.dumps(manifest, indent=2))
+        print(f"  Wrote ensemble.json ({len(ckpt_paths)} members)")
+        print("  OK")
+
+        # Auto-suffix --out for ensemble
+        out_path = Path(args.out)
+        if args.out == "submission.tar.gz":
+            out_path = Path(f"submission-greedy-ens{len(ckpt_paths)}.tar.gz")
+            print(f"Ensemble default output: {out_path}")
+    else:
+        # ── Single checkpoint: original flow, byte-identical ──
+        ckpt_path = ckpt_paths[0]
+        deck, deck_record = read_ckpt_deck(Path(ckpt_path))
+        if deck_record is not None:
+            arch = deck_record.get("archetype_self")
+            print(f"Checkpoint deck label: "
+                  f"{'archetype ' + str(arch) if arch is not None else 'all-decks (generalist)'}"
+                  f", {deck_record.get('n_distinct_cards')} distinct cards"
+                  f", vocab={deck_record.get('vocab_sha1')}")
+        if args.deck_csv:
+            override = [int(x) for x in Path(args.deck_csv).read_text().split()]
+            if deck is not None and override != deck:
+                print("  WARNING: --deck-csv disagrees with the checkpoint's own deck "
+                      "label; using --deck-csv as instructed.")
+            deck = override
+
+        check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force,
+                               mcts=mcts)
+
+        print("Building data files...")
+        build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd(),
+                         mcts=mcts)
+        build_model_weights(Path(ckpt_path), data_dir, deck_record=deck_record)
+        print("  OK")
+        out_path = Path(args.out)
 
     print("Generating main.py...")
     build_main_py(work, mcts=mcts)
@@ -1145,9 +1267,9 @@ def main():
         raise SystemExit("Packaged model failed import verification — not packing.")
     print("  OK")
 
-    print(f"Packing {args.out}...")
-    pack_submission(work, Path(args.out))
-    print(f"  Done: {args.out} ({Path(args.out).stat().st_size / 1024 / 1024:.1f} MB)")
+    print(f"Packing {out_path}...")
+    pack_submission(work, out_path)
+    print(f"  Done: {out_path} ({out_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
 
 if __name__ == "__main__":

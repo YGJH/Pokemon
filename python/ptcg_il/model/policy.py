@@ -98,6 +98,7 @@ class Policy(nn.Module):
             "n_opp_arch": n_opp_arch,
             "n_all_cards": n_all_cards,
             "feat_dims": current_feature_dims(),
+            "seed": 42,  # placeholder; set by caller after construction
         }
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
@@ -279,6 +280,19 @@ def load_policy_state(
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
     belief_missing = [k for k in missing if k.startswith("belief_heads.")]
     other = [k for k in missing if not k.startswith("belief_heads.")]
+
+    # Policy ties one CardEncoder into three places (pointer.card, belief.card_emb,
+    # belief_heads all reference self.embed.card), and EMA shadows built via
+    # named_parameters() (remove_duplicate=True, the default) omit the alias
+    # names.  The tensors are already loaded through embed.card.* — compare object
+    # identity rather than guessing at name prefixes.
+    if other:
+        params = dict(policy.named_parameters(remove_duplicate=False))
+        params.update(dict(policy.named_buffers(remove_duplicate=False)))
+        loaded_ids = {id(params[k]) for k in state_dict if k in params}
+        other = [k for k in other
+                 if k not in params or id(params[k]) not in loaded_ids]
+
     if other or unexpected:
         raise RuntimeError(
             f"checkpoint does not match this Policy: missing={other}, "
@@ -445,6 +459,8 @@ def _select_multi_raw(
     minC: torch.Tensor,
     maxC: torch.Tensor,
     stop_column: torch.Tensor | None = None,
+    pointers: list[PointerHead] | None = None,
+    h_list: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Low-level greedy AR multi-select inference (Appendix B.7).
 
@@ -481,26 +497,63 @@ def _select_multi_raw(
     chosen_list: list[torch.Tensor] = []
     picked_mask = x["opt_mask"].clone()                         # [B, O_MAX]
 
-    # Multi-select GRU hidden state — fp32, GRU runs outside autocast
-    msgru_h = torch.zeros(B, D, device=device, dtype=torch.float32)
+    # Ensemble mode: pointers[i] paired with h_list[i].
+    is_ensemble = pointers is not None and h_list is not None
+    if is_ensemble:
+        if len(pointers) != len(h_list):
+            raise ValueError(
+                f"pointers and h_list must have same length, "
+                f"got {len(pointers)} and {len(h_list)}"
+            )
+        N = len(pointers)
+    else:
+        N = 1
+
+    # Multi-select GRU hidden state(s) — fp32, GRU runs outside autocast
+    if is_ensemble:
+        msgru_h_list = [torch.zeros(B, D, device=device, dtype=torch.float32) for _ in range(N)]
+    else:
+        msgru_h = torch.zeros(B, D, device=device, dtype=torch.float32)
 
     # Track which samples are still picking
     active = torch.ones(B, dtype=torch.bool, device=device)
 
     for t in range(batch_max):
-        logits, o = pointer(h, tok_mask, card_enc, x, msgru_h=msgru_h)
+        if is_ensemble:
+            # Each member computes logits independently
+            all_logits: list[torch.Tensor] = []
+            all_o: list[torch.Tensor] = []
+            for i in range(N):
+                li, oi = pointers[i](h_list[i], tok_mask, card_enc, x, msgru_h=msgru_h_list[i])
+                # Mask STOP column for samples that haven't reached minCount yet
+                if stop_column is not None:
+                    t_tensor = torch.tensor(t, device=device)
+                    stop_forbidden = active & (t_tensor < minC) & (stop_column >= 0)
+                    if stop_forbidden.any():
+                        fb_idx = torch.where(stop_forbidden)[0]
+                        li[fb_idx, stop_column[fb_idx].clamp(min=0)] = -1e9
+                # Mask already-picked options
+                li = li.masked_fill(~picked_mask, -1e9)
+                all_logits.append(li)
+                all_o.append(oi)
+            # Average probabilities → argmax
+            probs = torch.stack([F.softmax(li, dim=-1) for li in all_logits], dim=0).mean(dim=0)
+            j = probs.argmax(-1)                                   # [B]
+        else:
+            logits, o = pointer(h, tok_mask, card_enc, x, msgru_h=msgru_h)
 
-        # Mask STOP column for samples that haven't reached minCount yet
-        if stop_column is not None:
-            t_tensor = torch.tensor(t, device=device)
-            stop_forbidden = active & (t_tensor < minC) & (stop_column >= 0)
-            if stop_forbidden.any():
-                fb_idx = torch.where(stop_forbidden)[0]
-                logits[fb_idx, stop_column[fb_idx].clamp(min=0)] = -1e9
+            # Mask STOP column for samples that haven't reached minCount yet
+            if stop_column is not None:
+                t_tensor = torch.tensor(t, device=device)
+                stop_forbidden = active & (t_tensor < minC) & (stop_column >= 0)
+                if stop_forbidden.any():
+                    fb_idx = torch.where(stop_forbidden)[0]
+                    logits[fb_idx, stop_column[fb_idx].clamp(min=0)] = -1e9
 
-        # Mask already-picked options (but not STOP column)
-        logits = logits.masked_fill(~picked_mask, -1e9)
-        j = logits.argmax(-1)                                   # [B]
+            # Mask already-picked options (but not STOP column)
+            logits = logits.masked_fill(~picked_mask, -1e9)
+            j = logits.argmax(-1)                                   # [B]
+
         chosen_list.append(j)
 
         # Check for STOP selection
@@ -521,11 +574,18 @@ def _select_multi_raw(
             if is_regular.any():
                 reg_idx = active_idx[is_regular]
                 picked_mask[reg_idx, j[reg_idx]] = False
-            # Update GRU with chosen option repr (fp32, outside autocast)
+            # Update GRU(s) with chosen option repr (fp32, outside autocast)
             with torch.amp.autocast(device.type if device.type in ("cuda", "cpu") else "cpu", enabled=False):
-                msgru_h[active_idx] = pointer.msgru(
-                    o[active_idx, j[active_idx]].float(), msgru_h[active_idx],
-                )
+                if is_ensemble:
+                    for i in range(N):
+                        msgru_h_list[i][active_idx] = pointers[i].msgru(
+                            all_o[i][active_idx, j[active_idx]].float(),
+                            msgru_h_list[i][active_idx],
+                        )
+                else:
+                    msgru_h[active_idx] = pointer.msgru(
+                        o[active_idx, j[active_idx]].float(), msgru_h[active_idx],
+                    )
 
     chosen = torch.stack(chosen_list, dim=1)  # [B, batch_max]
     # Mask out picks beyond per-sample maxC with -1 padding
@@ -562,6 +622,10 @@ def select_multi(
         Chosen option indices (greedy), -1-padded beyond per-sample maxC.
         STOP picks are recorded as -2.
     """
+    # EnsemblePolicy defines its own select_multi; dispatch to it.
+    if hasattr(policy, 'select_multi'):
+        return policy.select_multi(x, history_h)
+
     h, _history_h = policy._encode(x, history_h)
     stop_col = x.get("stop_column")
     return _select_multi_raw(

@@ -199,7 +199,7 @@ class TestCheckpointConfig:
         # No V/A: cards are static features, so there is no vocab width to record.
         arch = {k: v for k, v in p.config.items() if k != "feat_dims"}
         assert arch == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
-                        "n_opp_arch": 6, "n_all_cards": 0}
+                        "n_opp_arch": 6, "n_all_cards": 0, "seed": 42}
         # ...plus the featurizer widths the weights were shaped by, so a
         # featurizer edit cannot silently redefine the checkpoint.
         assert p.config["feat_dims"] == current_feature_dims()

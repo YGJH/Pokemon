@@ -40,13 +40,13 @@ logger = logging.getLogger(__name__)
 # ============================================================
 DEFAULTS = {
     # Model
-    "d_model": 512,
-    "layers": 10,
+    "d_model": 256,
+    "layers": 6,
     "heads": 8,
-    "ff": 2048,
+    "ff": 1024,
     "dropout": 0.1,
     # Training
-    "batch_size": 2048,
+    "batch_size": 1024,
     "epochs": 1000,
     "peak_lr": 8e-5,
     "warmup": 100,
@@ -147,6 +147,9 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Directory for checkpoints and logs")
     paths.add_argument("--resume", type=str, default=None,
                        help="Resume from a checkpoint file")
+    paths.add_argument("--ckpt", action="append", default=None,
+                       help="Checkpoint path for eval. Pass multiple times for "
+                            "ensemble eval (--eval-only with 2+ checkpoints).")
     paths.add_argument("--eval-only", action="store_true",
                        help="Only run evaluation (offline + live), skip training")
     paths.add_argument("--live-eval", action="store_true",
@@ -171,6 +174,9 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Decision points per micro-batch")
     train_hp.add_argument("--grad-accum", type=int, default=1,
                           help="Gradient accumulation steps (effective batch = batch_size × grad_accum)")
+    train_hp.add_argument("--seed", type=int, default=42,
+                          help="Random seed for model init and batch order. "
+                               "Vary across ensemble members for decorrelation.")
     train_hp.add_argument("--archetype-self", type=int, default=None,
                           help="Train a per-deck specialist on this archetype id only "
                                "(see archetypes.json self_ids). The archetype decks are "
@@ -413,6 +419,7 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
         n_all_cards=n_all_cards,
         all_card_feat=all_card_feat,
     )
+    policy.config["seed"] = args.seed
     # Apply spec B.8 weight init (trunc_normal std=0.02 for Linear/Embedding weights)
     from ptcg_il.model import init_weights
     init_weights(policy)
@@ -514,13 +521,21 @@ def cmd_train(args: argparse.Namespace) -> int:
         args.ff,
         artifacts.get("n_opp_arch", 0),
     )
+    import torch as _torch
+    _torch.manual_seed(args.seed)
     policy = _build_policy(artifacts, args)
 
     # Eval-only mode
     if args.eval_only:
-        if args.resume is None:
-            logger.error("--eval-only requires --resume to specify a checkpoint")
+        if args.ckpt and len(args.ckpt) >= 2:
+            return _cmd_eval_only_ensemble(args.ckpt, artifacts, args)
+        if args.resume is None and not args.ckpt:
+            logger.error("--eval-only requires --resume or --ckpt to specify a checkpoint")
             return 1
+        # Single checkpoint: use --ckpt if provided, else --resume
+        ckpt_path = args.ckpt[0] if args.ckpt else args.resume
+        # Override args.resume so _cmd_eval_only reads the right path
+        args.resume = ckpt_path
         return _cmd_eval_only(policy, artifacts, args)
 
     os.environ["WANDB_MODE"] = _wandb_mode(args)
@@ -539,6 +554,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
         archetype_self=args.archetype_self,
+        seed=args.seed,
         peak_lr=args.peak_lr,
         min_lr=args.min_lr,
         warmup=args.warmup,
@@ -684,6 +700,169 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
         _run_live_eval(policy, artifacts, args)
 
     return 0
+
+
+def _cmd_eval_only_ensemble(
+    ckpt_paths: list[str], artifacts: dict, args: argparse.Namespace
+) -> int:
+    """Ensemble eval mode: evaluate each member and the ensemble.
+
+    On val split: eval each member + ensemble, print comparison table.
+    On test split: eval ensemble + best single member only.
+    """
+    import torch
+    from ptcg_il.ensemble import EnsemblePolicy
+    from ptcg_il.train.dataset import ShardDataset, collate_fn
+    from ptcg_il.train.eval import offline_eval
+    from torch.utils.data import DataLoader
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+
+    # Build EnsemblePolicy from checkpoints
+    logger.info("Building ensemble from %d checkpoints...", len(ckpt_paths))
+    ensemble = EnsemblePolicy.from_checkpoints(
+        ckpt_paths, all_card_feat=all_card_feat, device=str(device),
+    )
+    ensemble.to(device)
+    ensemble.eval()
+
+    split = getattr(args, "eval_split", "val")
+    belief = _belief_weights(args) is not None
+
+    # Build eval loader
+    eval_ds = ShardDataset(args.data_dir, split=split, shuffle=False,
+                           archetype_self=args.archetype_self)
+    eval_loader = DataLoader(
+        eval_ds, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"), drop_last=False,
+    )
+
+    # Evaluate each member
+    member_metrics = []
+    for i, member in enumerate(ensemble.members):
+        m = offline_eval(member, eval_loader, device, lambda_v=args.lambda_v,
+                         belief=belief)
+        member_metrics.append(m)
+        logger.info(
+            "Member %d: top1_macro=%.4f, top1_micro=%.4f, top1_nontrivial=%.4f, "
+            "value_corr=%.4f, value_std=%.4f",
+            i,
+            m.get("val/top1_macro", 0.0),
+            m.get("val/top1_micro", 0.0),
+            m.get("val/top1_nontrivial", 0.0),
+            m.get("val/value_corr", 0.0),
+            m.get("val/value_std", 0.0),
+        )
+
+    # Evaluate ensemble
+    ens_metrics = offline_eval(ensemble, eval_loader, device, lambda_v=args.lambda_v,
+                               belief=belief)
+    logger.info(
+        "Ensemble: top1_macro=%.4f, top1_micro=%.4f, top1_nontrivial=%.4f, "
+        "value_corr=%.4f, value_std=%.4f",
+        ens_metrics.get("val/top1_macro", 0.0),
+        ens_metrics.get("val/top1_micro", 0.0),
+        ens_metrics.get("val/top1_nontrivial", 0.0),
+        ens_metrics.get("val/value_corr", 0.0),
+        ens_metrics.get("val/value_std", 0.0),
+    )
+
+    # Print comparison table
+    header = (f"{'':>12} {'top1_macro':>12} {'top1_micro':>12} "
+              f"{'top1_nontr':>12} {'val_corr':>10} {'val_std':>10}")
+    print(f"\n{header}")
+    print("-" * 70)
+    for i, m in enumerate(member_metrics):
+        print(f"Member {i:>5}: {m.get('val/top1_macro', 0):12.4f} "
+              f"{m.get('val/top1_micro', 0):12.4f} "
+              f"{m.get('val/top1_nontrivial', 0):12.4f} "
+              f"{m.get('val/value_corr', 0):10.4f} "
+              f"{m.get('val/value_std', 0):10.4f}")
+    print(f"{'Ensemble':>12}: {ens_metrics.get('val/top1_macro', 0):12.4f} "
+          f"{ens_metrics.get('val/top1_micro', 0):12.4f} "
+          f"{ens_metrics.get('val/top1_nontrivial', 0):12.4f} "
+          f"{ens_metrics.get('val/value_corr', 0):10.4f} "
+          f"{ens_metrics.get('val/value_std', 0):10.4f}")
+
+    # Find best single member by val top1_nontrivial
+    best_idx = max(range(len(member_metrics)),
+                   key=lambda i: member_metrics[i].get("val/top1_nontrivial", 0.0))
+    best_top1 = member_metrics[best_idx].get("val/top1_nontrivial", 0.0)
+    ens_top1 = ens_metrics.get("val/top1_nontrivial", 0.0)
+    logger.info(
+        "Best single member: %d (top1_nontrivial=%.4f), ensemble lift: %+.4f",
+        best_idx, best_top1, ens_top1 - best_top1,
+    )
+
+    # Record baseline
+    if getattr(args, "record_baseline", False):
+        from ptcg_il.baselines import record_ensemble_baseline
+
+        record_ensemble_baseline(
+            args.data_dir, args.archetype_self, ckpt_paths,
+            ens_metrics,
+        )
+        logger.info("Recorded ensemble baseline (SHA-pinned to %d checkpoints)",
+                    len(ckpt_paths))
+
+    # Live eval: ensemble vs. best single member head-to-head
+    if args.live_eval:
+        _run_ensemble_live_eval(ensemble, best_idx, artifacts, args)
+
+    return 0
+
+
+def _run_ensemble_live_eval(
+    ensemble: Any, best_idx: int, artifacts: dict, args: argparse.Namespace
+) -> None:
+    """Live eval head-to-head: ensemble vs. best single member."""
+    from ptcg_il.live_eval import (
+        LiveEvaluator, make_agent_from_policy,
+    )
+
+    # Build agents
+    ensemble_agent = make_agent_from_policy(
+        ensemble, artifacts["vocab"], artifacts["fixed_deck"], device="cpu",
+    )
+    best_member = ensemble.members[best_idx]
+    best_single_agent = make_agent_from_policy(
+        best_member, artifacts["vocab"], artifacts["fixed_deck"], device="cpu",
+    )
+
+    # Run head-to-head
+    evaluator = LiveEvaluator(
+        ensemble, artifacts["vocab"], artifacts["fixed_deck"],
+        n_workers=args.live_eval_workers,
+    )
+    evaluator._agent_fn = ensemble_agent
+
+    h2h_results = evaluator.eval_vs_opponent(
+        best_single_agent, "best_single",
+        n_games=args.live_eval_games,
+    )
+    logger.info(
+        "Ensemble vs best single (member %d): win=%.1f%% [%.1f–%.1f%%], %d games",
+        best_idx,
+        h2h_results.win_rate_center * 100,
+        h2h_results.win_rate_lo * 100,
+        h2h_results.win_rate_hi * 100,
+        h2h_results.n_games,
+    )
+
+    # Ship rule: Wilson lower bound must be above 50%
+    if h2h_results.win_rate_lo > 0.50:
+        logger.info(
+            "Ensemble SHIPS: Wilson lower bound %.1f%% > 50%%",
+            h2h_results.win_rate_lo * 100,
+        )
+    else:
+        logger.warning(
+            "Ensemble does NOT ship: Wilson lower bound %.1f%% ≤ 50%%. "
+            "Train more members or tune config.",
+            h2h_results.win_rate_lo * 100,
+        )
 
 
 def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> None:

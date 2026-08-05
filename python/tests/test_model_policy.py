@@ -292,6 +292,39 @@ class TestSelectMulti:
                 if p >= 0:
                     assert p < 8, f"Sample {b}: pick {p} out of range"
 
+    def test_single_member_ensemble_equivalent_to_single_pointer(self):
+        """_select_multi_raw with pointers=[p.pointer], h_list=[h] produces
+        element-wise identical output to the single-pointer path."""
+        from ptcg_il.model.policy import _select_multi_raw
+
+        torch.manual_seed(42)
+        policy = Policy()
+        policy.eval()
+        x = _make_synthetic_batch(4, max_count=3)
+        x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
+        x["minCount"] = torch.full((4,), 1, dtype=torch.long)
+
+        h, _hist = policy._encode(x)
+        single = _select_multi_raw(
+            policy.pointer, h, x["tok_mask"], policy.embed.card, x,
+            minC=x["minCount"], maxC=x["maxCount"],
+            stop_column=x["stop_column"],
+        )
+
+        h2, _hist2 = policy._encode(x)
+        ensemble = _select_multi_raw(
+            policy.pointer, h2, x["tok_mask"], policy.embed.card, x,
+            minC=x["minCount"], maxC=x["maxCount"],
+            stop_column=x["stop_column"],
+            pointers=[policy.pointer],
+            h_list=[h2],
+        )
+
+        assert torch.equal(single, ensemble), (
+            f"1-member ensemble path differs from single-pointer path\n"
+            f"single:\n{single}\nensemble:\n{ensemble}"
+        )
+
 
 class TestValueHead:
     """ValueHead standalone tests."""

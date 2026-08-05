@@ -37,9 +37,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 BASELINES_FILENAME = "il_baselines.json"
 
@@ -168,3 +171,58 @@ def _key(archetype: int | str | None) -> str:
     if archetype is None or archetype == "":
         return "generalist"
     return str(archetype)
+
+
+def record_ensemble_baseline(
+    data_dir: str | Path,
+    archetype_self: int | None,
+    ckpt_paths: list[str],
+    ensemble_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    """Record ensemble eval scores, SHA-1-pinned to all member checkpoints.
+
+    The record key is ``"ens-N-a<id>"`` (or ``"ens-N-generalist"``) — both
+    member count and archetype, so two archetypes with the same ensemble size
+    do not overwrite each other.
+    Combinined SHA-1 ensures the gate detects when any member checkpoint changes.
+    """
+    data_dir = Path(data_dir)
+
+    # Combined SHA of all member checkpoints
+    combined_sha = _combined_sha1(ckpt_paths)
+
+    # Key includes both member count AND archetype — two different archetypes
+    # with the same ensemble size must not overwrite each other.
+    key = f"ens-{len(ckpt_paths)}-{_key(archetype_self)}"
+    record: dict[str, Any] = {
+        "type": "ensemble",
+        "member_count": len(ckpt_paths),
+        "member_paths": [str(Path(p).resolve()) for p in ckpt_paths],
+        "combined_sha1": combined_sha,
+    }
+    # Copy the recorded metrics
+    for rec_key, metric_key in _RECORDED_METRICS.items():
+        record[rec_key] = ensemble_metrics.get(metric_key, 0.0)
+    record["recorded_at"] = datetime.now(timezone.utc).isoformat()
+    if archetype_self is not None:
+        record["archetype_self"] = archetype_self
+
+    all_records = load_baselines(data_dir)
+    all_records[key] = record
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = baselines_path(data_dir)
+    with open(path, "w") as f:
+        json.dump(all_records, f, indent=2, sort_keys=True)
+        f.write("\n")
+    logger.info("Ensemble baseline recorded to %s", path)
+    return record
+
+
+def _combined_sha1(paths: list[str]) -> str:
+    """SHA-1 of the concatenated SHA-1s of all checkpoint files."""
+    h = hashlib.sha1()
+    for p in sorted(paths):
+        with open(p, "rb") as f:
+            h.update(hashlib.sha1(f.read()).digest())
+    return h.hexdigest()[:12]

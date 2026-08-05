@@ -27,14 +27,46 @@
 
 set -euo pipefail
 
+ENSEMBLE=0
+ENSEMBLE_PATHS=()
 NO_MCTS=0
 POSITIONAL=()
-for arg in "$@"; do
-    case "$arg" in
-        --no-mcts) NO_MCTS=1 ;;
-        *) POSITIONAL+=("$arg") ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-mcts) NO_MCTS=1; shift ;;
+        --ensemble)
+            ENSEMBLE=1
+            shift
+            # Collect all remaining args as ensemble paths
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                ENSEMBLE_PATHS+=("$1")
+                shift
+            done
+            ;;
+        *) POSITIONAL+=("$1"); shift ;;
     esac
 done
+
+# Expand globs in ensemble paths
+if [[ "$ENSEMBLE" == 1 ]]; then
+    EXPANDED_PATHS=()
+    for p in "${ENSEMBLE_PATHS[@]}"; do
+        for f in $p; do
+            if [[ -f "$f" ]]; then
+                EXPANDED_PATHS+=("$f")
+            fi
+        done
+    done
+    if [[ ${#EXPANDED_PATHS[@]} -eq 0 ]]; then
+        echo "ERROR: --ensemble specified but no files matched" >&2
+        exit 1
+    fi
+    ENSEMBLE_PATHS=("${EXPANDED_PATHS[@]}")
+    echo "Ensemble: ${#ENSEMBLE_PATHS[@]} members"
+    for p in "${ENSEMBLE_PATHS[@]}"; do
+        echo "  $p"
+    done
+fi
 
 ARCH="${POSITIONAL[0]:-a0}"
 EXPLICIT_CKPT="${POSITIONAL[1]:-}"
@@ -117,7 +149,16 @@ else
 fi
 # ─────────────────────────────────────────────────────────────────────────
 
-if [[ "$NO_MCTS" == 1 ]]; then
+if [[ "$ENSEMBLE" == 1 ]]; then
+    CKPT_ARGS=()
+    for p in "${ENSEMBLE_PATHS[@]}"; do
+        CKPT_ARGS+=(--ckpt "$p")
+    done
+    uv run python scripts/build_submission.py \
+        --data-dir python/data \
+        "${CKPT_ARGS[@]}" \
+        --out "submission-greedy-ens${#ENSEMBLE_PATHS[@]}.tar.gz"
+elif [[ "$NO_MCTS" == 1 ]]; then
     uv run python scripts/build_submission.py \
         --data-dir python/data \
         --ckpt "$CKPT" \
