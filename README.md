@@ -39,6 +39,15 @@ uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints_a1 \
 
 
 
+  新标志：--ensemble，后跟一个 glob 或路径列表。用法：
+  ./scripts/build_submit.sh a1 --ensemble "python/checkpoints_a1_s*/ckpt-best.pt"
+  这也接受显式路径：
+  ./scripts/build_submit.sh a1 --ensemble \
+      python/checkpoints_a1_s0/ckpt-best.pt \
+      python/checkpoints_a1_s1/ckpt-best.pt
+
+
+
 Design below. Sizes: your ckpt-best.pt is 119 MB (optimizer state included); packaging strips it to EMA weights — the current greedy bundle is 40 MB total, so 3 members lands around 90–100 MB. Worth confirming against the competition's bundle limit before N grows.
 
 ---

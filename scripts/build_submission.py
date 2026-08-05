@@ -43,6 +43,11 @@ REWRITE_RULES: list[tuple[str, str]] = [
     # featurizer (copied into model/ so modules import it as model.featurizer).
     # model/{cards,embed,pointer}.py import the feature dims from it.
     (r"from ptcg_il\.featurizer import", r"from model.featurizer import"),
+    # The module-object form of the same import.  `policy.current_feature_dims`
+    # reads the widths off the module rather than naming each one, and it runs
+    # at `Policy.__init__` — so missing this rule is not a latent bug, it is
+    # every packaged agent failing to construct.
+    (r"from ptcg_il import featurizer", r"from model import featurizer"),
 ]
 
 MODEL_FILES: list[str] = [
@@ -196,14 +201,30 @@ _engine_card_features = np.load(
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
 
-# All-card feature matrix for belief heads (sorted by card id)
+_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+_cfg = _ckpt.get("config", {})
+
+# All-card feature matrix for belief heads (sorted by card id).
+#
+# The width is F_CARD, which moved 94 -> 212 when the keyword features landed.
+# Take it from the checkpoint, like every other dim below: the tables are
+# rebuilt from the live engine at packaging time and the model was trained at
+# whatever F_CARD was then, so a literal here is the one value that cannot
+# track either.  Checkpoints older than the `feat_dims` pin carry no width, so
+# fall back to the table's own rows.
 _max_cid = max(_engine_card_features.keys()) if _engine_card_features else 0
-_all_card_feat = torch.zeros(_max_cid + 1, 94)
+_table_dim = int(np.asarray(next(iter(_engine_card_features.values()))).shape[-1]
+                 ) if _engine_card_features else 0
+_card_feat_dim = int(_cfg.get("feat_dims", {}).get("F_CARD", _table_dim))
+if _engine_card_features and _card_feat_dim != _table_dim:
+    raise SystemExit(
+        f"card feature width mismatch: model.pt was trained at F_CARD="
+        f"{_card_feat_dim}, engine_card_features.npy has {_table_dim}-wide rows. "
+        "Rebuild the submission against the checkpoint's own featurizer.")
+_all_card_feat = torch.zeros(_max_cid + 1, _card_feat_dim)
 for _cid, _feat in _engine_card_features.items():
     _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
-_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
-_cfg = _ckpt.get("config", {})
 _model = Policy(
     D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
     layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
@@ -429,16 +450,32 @@ _engine_card_features = np.load(
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
 
+_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+_cfg = _ckpt.get("config", {})
+
 # All-card feature matrix.  The belief heads own it, and Policy builds them
 # unconditionally, so it is still required to construct the module and load the
 # packaged state dict — even though this build never runs a belief head.
+#
+# The width is F_CARD, which moved 94 -> 212 when the keyword features landed.
+# Take it from the checkpoint, like every other dim below: the tables are
+# rebuilt from the live engine at packaging time and the model was trained at
+# whatever F_CARD was then, so a literal here is the one value that cannot
+# track either.  Checkpoints older than the `feat_dims` pin carry no width, so
+# fall back to the table's own rows.
 _max_cid = max(_engine_card_features.keys()) if _engine_card_features else 0
-_all_card_feat = torch.zeros(_max_cid + 1, 94)
+_table_dim = int(np.asarray(next(iter(_engine_card_features.values()))).shape[-1]
+                 ) if _engine_card_features else 0
+_card_feat_dim = int(_cfg.get("feat_dims", {}).get("F_CARD", _table_dim))
+if _engine_card_features and _card_feat_dim != _table_dim:
+    raise SystemExit(
+        f"card feature width mismatch: model.pt was trained at F_CARD="
+        f"{_card_feat_dim}, engine_card_features.npy has {_table_dim}-wide rows. "
+        "Rebuild the submission against the checkpoint's own featurizer.")
+_all_card_feat = torch.zeros(_max_cid + 1, _card_feat_dim)
 for _cid, _feat in _engine_card_features.items():
     _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
-_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
-_cfg = _ckpt.get("config", {})
 _model = Policy(
     D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
     layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),

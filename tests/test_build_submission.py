@@ -42,6 +42,42 @@ def _sha12(path):
     return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
 
 
+def _exec_width_fragment(bs, cfg, row_width, template="MAIN_PY_TEMPLATE_GREEDY"):
+    """Exec just the card-feature-table statements of *template*.
+
+    Pulls the top-level statements that build ``_all_card_feat`` out of the
+    real template — so the test reads the shipped source, not a paraphrase of
+    it — and runs them against a stub checkpoint config and feature table.
+    """
+    import ast
+
+    import numpy as np
+    import torch
+
+    src = getattr(bs, template)
+    tree = ast.parse(src)
+    wanted = ("_all_card_feat", "_max_cid", "_card_feat_dim", "_table_dim")
+    chunks = []
+    for node in tree.body:
+        seg = ast.get_source_segment(src, node) or ""
+        if any(w in seg for w in wanted) and "Policy(" not in seg and "torch.load" not in seg:
+            chunks.append(seg)
+    assert chunks, f"{template} no longer builds _all_card_feat at top level"
+
+    ns = {
+        "np": np,
+        "torch": torch,
+        "sys": sys,
+        "_cfg": cfg,
+        "_engine_card_features": {
+            7: np.zeros(row_width, dtype=np.float32),
+            11: np.ones(row_width, dtype=np.float32),
+        },
+    }
+    exec(compile("\n".join(chunks), "main.py", "exec"), ns)
+    return ns
+
+
 def _record(data_dir, **over):
     rec = {
         "archetype_self": 0,
@@ -276,9 +312,134 @@ def test_find_libcg_runs_without_dunder_file(bs, tmp_path, monkeypatch):
     assert ns["_find_libcg"]() == str(tmp_path / name)
 
 
+# ── Feature widths belong to the checkpoint, not to a literal ────────────
+#
+# `F_CARD` moved 94 → 212 when the ability/attack keyword features landed.
+# Every other architecture dim in the template is read from the checkpoint's
+# `config` (`D`, `heads`, `layers`, `ff`, `n_opp_arch`, `n_all_cards`), and the
+# packaged `.npy` tables are rebuilt from `ptcg_mine.cards` at packaging time,
+# so both ends moved on their own — a hardcoded width is the one thing that
+# cannot.  It fails at `verify_model_imports`, which is the good case; the same
+# literal being *too large* would broadcast a short row into a padded slot and
+# ship a silently wrong agent.
+
+
+@pytest.mark.parametrize("template", ["MAIN_PY_TEMPLATE", "MAIN_PY_TEMPLATE_GREEDY"])
+def test_card_feature_width_is_not_hardcoded(bs, template):
+    """`_all_card_feat = torch.zeros(_max_cid + 1, <width>)` must derive <width>."""
+    import ast
+
+    tree = ast.parse(getattr(bs, template))
+    allocs = [
+        n.value for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_all_card_feat" for t in n.targets)
+        and isinstance(n.value, ast.Call)
+    ]
+    assert allocs, f"{template} no longer allocates _all_card_feat via a call"
+    for call in allocs:
+        width = call.args[-1]
+        assert not isinstance(width, ast.Constant), (
+            f"{template} hardcodes the card feature width as {width.value!r} at "
+            f"line {width.lineno}; derive it from the checkpoint's "
+            f"config['feat_dims']['F_CARD'] like every other dim on those lines")
+
+
+def test_packaged_width_matches_the_trained_model(bs):
+    """The width the template derives is the one the checkpoint was trained at.
+
+    Guards the direction `verify_model_imports` cannot see: a table and a model
+    that disagree by *broadcastable* shapes load without raising.
+    """
+    from ptcg_il.featurizer import F_CARD
+
+    ns = _exec_width_fragment(bs, cfg={"feat_dims": {"F_CARD": F_CARD}}, row_width=F_CARD)
+    assert ns["_all_card_feat"].shape[1] == F_CARD
+
+
+def test_width_falls_back_to_the_table_for_unpinned_checkpoints(bs):
+    """Checkpoints predating the `feat_dims` pin carry no width; the table does."""
+    ns = _exec_width_fragment(bs, cfg={}, row_width=94)
+    assert ns["_all_card_feat"].shape[1] == 94
+
+
+@pytest.mark.parametrize("row_width", [94, 1])
+def test_table_disagreeing_with_the_checkpoint_is_fatal(bs, row_width):
+    """A table that disagrees with the checkpoint must abort, not broadcast.
+
+    ``row_width=94`` is the stale-table case, which torch would reject anyway
+    (opaquely).  ``row_width=1`` is why the check has to exist: assigning a
+    1-wide row into a 212-wide slot **broadcasts silently**, filling every
+    feature of every card with one value, and the agent then loads, imports,
+    plays every game to the end and loses.
+    """
+    with pytest.raises(SystemExit):
+        _exec_width_fragment(bs, cfg={"feat_dims": {"F_CARD": 212}}, row_width=row_width)
+
+
 def test_featurizer_imports_are_rewritten_for_the_bundle(bs):
     """model/*.py import dims from ptcg_il.featurizer; the bundle vendors it as
     model/featurizer.py.  Without a rewrite rule the bundle ships a literal
     `from ptcg_il.featurizer import ...`, which only fails after submission."""
     src = "from ptcg_il.featurizer import F_CARD, F_ATK\n"
     assert bs.rewrite_imports(src) == "from model.featurizer import F_CARD, F_ATK\n"
+
+
+def test_module_object_import_form_is_rewritten(bs):
+    """`from ptcg_il import featurizer as _fz` is the other way to spell it.
+
+    Every rule matches `from ptcg_il.<mod> import ...`; `policy.py`'s
+    `current_feature_dims` uses the module-object form, so the bundle shipped a
+    literal `from ptcg_il import featurizer` and died on `ModuleNotFoundError`.
+    """
+    src = "    from ptcg_il import featurizer as _fz\n"
+    assert bs.rewrite_imports(src) == "    from model import featurizer as _fz\n"
+
+
+#: Imports of `ptcg_il` that are allowed to survive into the bundle, because
+#: the code holding them is training-only and the greedy/MCTS agents never call
+#: it.  `multiselect_ce` is the teacher-forced training loss; inference goes
+#: through `select_multi`.  The import is lazy (function body, not module
+#: level), so it costs nothing until called — and if it ever is, it raises
+#: rather than answering wrong.  Anything added here needs the same argument.
+_DEAD_IN_BUNDLE = {"ptcg_il.train.loop"}
+
+
+def test_no_packaged_module_still_imports_ptcg_il(bs):
+    """Whole-bundle backstop: no rewrite rule may be *missing*.
+
+    Per-form rules only cover the forms someone remembered, and a form nobody
+    remembered is invisible until the bundle runs.  This parses every file the
+    packager rewrites and asserts no `ptcg_il` import survives — including ones
+    inside function bodies, which `verify_model_imports` cannot reach (the same
+    blind spot that let `_find_libcg`'s bare `__file__` ship).
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent
+    model_dir = src_dir / "python" / "ptcg_il" / "model"
+    checked, survivors = 0, []
+    for fname in bs.MODEL_FILES:
+        path = model_dir / fname
+        if not path.exists():
+            path = src_dir / "python" / "ptcg_il" / fname
+        if not path.exists():
+            continue
+        checked += 1
+        tree = ast.parse(bs.rewrite_imports(path.read_text()))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                mods = [node.module or ""]
+            elif isinstance(node, ast.Import):
+                mods = [a.name for a in node.names]
+            else:
+                continue
+            for mod in mods:
+                if mod.split(".")[0] == "ptcg_il" and mod not in _DEAD_IN_BUNDLE:
+                    survivors.append(f"{fname}:{node.lineno} imports {mod}")
+    assert checked, "examined no packaged modules; MODEL_FILES lookup is broken"
+    assert not survivors, (
+        "these imports survive into the bundle, which has no ptcg_il package:\n  "
+        + "\n  ".join(survivors)
+        + "\nAdd a REWRITE_RULES entry for the import form, or justify it in "
+          "_DEAD_IN_BUNDLE.")
