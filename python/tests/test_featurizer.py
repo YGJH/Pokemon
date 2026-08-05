@@ -38,6 +38,7 @@ from ptcg_il.featurizer import (
     SUM,
     TURN_N,
     featurize,
+    option_groups,
 )
 from ptcg_il.ref_map import build_ref_map, card_id_at
 
@@ -938,6 +939,7 @@ class TestEndToEnd:
         "opt_attack_feat",
         "opt_scalar",
         "opt_mask",
+        "opt_group",
         # Labels & bookkeeping
         "action_idx",
         "action_len",
@@ -1568,3 +1570,73 @@ class TestEngineTablesCarryCardIdentity:
         assert all(v == 0.0 for v in sums.values()), (
             f"expected an all-zero card block without the engine table: {sums}"
         )
+
+
+# ---------------------------------------------------------------------------
+# option_groups() tests
+# ---------------------------------------------------------------------------
+
+
+def _opt_arrays(n_valid: int):
+    """Blank option tensors with the first n_valid slots marked valid."""
+    return {
+        "opt_type": np.zeros(O_MAX, dtype=np.int64),
+        "opt_src_idx": np.full(O_MAX, -1, dtype=np.int64),
+        "opt_tgt_idx": np.full(O_MAX, -1, dtype=np.int64),
+        "opt_card_feat": np.zeros((O_MAX, F_CARD), dtype=np.float32),
+        "opt_attack_feat": np.zeros((O_MAX, F_ATK), dtype=np.float32),
+        "opt_scalar": np.zeros((O_MAX, F_OPT), dtype=np.float32),
+        "opt_mask": np.array([i < n_valid for i in range(O_MAX)]),
+    }
+
+
+def test_option_groups_merges_identical_options():
+    a = _opt_arrays(3)
+    a["opt_type"][:3] = 3
+    a["opt_card_feat"][:3, 7] = 1.0          # all three are the same card
+    g = option_groups(**a)
+    assert g[0] == g[1] == g[2]
+    assert (g[3:] == -1).all(), "masked slots must be -1"
+
+
+def test_option_groups_separates_on_each_field():
+    for field, setter in [
+        ("opt_type", lambda a: a["opt_type"].__setitem__(1, 5)),
+        ("opt_src_idx", lambda a: a["opt_src_idx"].__setitem__(1, 4)),
+        ("opt_tgt_idx", lambda a: a["opt_tgt_idx"].__setitem__(1, 4)),
+        ("opt_card_feat", lambda a: a["opt_card_feat"].__setitem__((1, 3), 1.0)),
+        ("opt_attack_feat", lambda a: a["opt_attack_feat"].__setitem__((1, 2), 1.0)),
+        ("opt_scalar", lambda a: a["opt_scalar"].__setitem__((1, 2), 0.25)),
+    ]:
+        a = _opt_arrays(2)
+        setter(a)
+        g = option_groups(**a)
+        assert g[0] != g[1], f"{field} must split the group"
+
+
+def test_option_groups_ignores_fp32_noise_below_fp16_resolution():
+    """Shards store card features as fp16, so the model cannot see a smaller
+    difference than fp16 resolution — grouping must not either."""
+    a = _opt_arrays(2)
+    a["opt_card_feat"][0, 0] = 1.0
+    a["opt_card_feat"][1, 0] = 1.0 + 1e-8
+    g = option_groups(**a)
+    assert g[0] == g[1]
+
+
+def test_option_groups_all_masked_returns_all_minus_one():
+    g = option_groups(**_opt_arrays(0))
+    assert (g == -1).all()
+
+
+def test_featurize_emits_opt_group():
+    ep = _load_episode()
+    vocab = _build_test_vocab(ep)
+    obs, action = _get_active_step(ep, 8, 0)   # the MAIN select used elsewhere in this file
+    out = featurize(obs, vocab, action)
+    assert out["opt_group"].dtype == np.int64
+    assert out["opt_group"].shape == (O_MAX,)
+    valid = out["opt_mask"]
+    assert (out["opt_group"][~valid] == -1).all()
+    assert (out["opt_group"][valid] >= 0).all()
+    assert valid.sum() > 0, "fixture produced no options — the assertions above are vacuous"

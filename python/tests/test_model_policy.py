@@ -56,6 +56,7 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "opt_attack_feat": torch.randn(B, O, F_ATK),
         "opt_scalar": torch.randn(B, O, F_OPT),
         "opt_mask": torch.ones(B, O, dtype=torch.bool),
+        "opt_group": torch.full((B, O), -1, dtype=torch.long),
         # Labels (padded with -1, matching featurizer)
         "action_idx": torch.full((B, O), -1, dtype=torch.long),
         "action_len": torch.full((B,), max_count, dtype=torch.long),
@@ -75,6 +76,7 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
 
     # First 8 options valid (leave room for STOP if needed)
     x["opt_mask"][:, 8:] = False
+    x["opt_group"][:, :8] = 0  # single group containing all valid options
     if max_count > 1:
         # Set up STOP column at position 7 (last valid option slot)
         x["stop_column"][:] = 7
@@ -407,3 +409,44 @@ class TestMultiSelectCEScale:
         assert (forced < free + 10.0).all(), (
             f"suppressing STOP inflated CE: {free.tolist()} -> {forced.tolist()}"
         )
+
+
+def test_multiselect_ce_marginalises_over_duplicate_options():
+    """A batch whose first two options are identical must cost less under
+    group-marginal CE than under plain CE, and the gap must be positive."""
+    policy = Policy(D=32, heads=4, layers=1, ff=64)
+    batch = _make_synthetic_batch(B=2, max_count=3)
+    # Set valid action targets: row 0 picks options 0 then 1; row 1 picks option 2
+    batch["action_idx"][0, 0] = 0
+    batch["action_idx"][0, 1] = 1
+    batch["action_idx"][0, 2] = 7  # STOP at first stop slot
+    batch["action_idx"][1, 0] = 2
+    batch["action_idx"][1, 1] = 7  # STOP
+    batch["stop_column"][:] = 7
+    batch["opt_type"][:, 7] = 17  # STOP type
+    batch["minCount"][:] = 1
+    plain = multiselect_ce(policy, batch, group_marginal=False)
+
+    # Options 0 and 1 are already in the same group (fixture sets group 0 for all valid)
+    # but option 2 is also in group 0. Split option 2 into its own group for the
+    # plain run, then merge 0+1 for the grouped run.
+    batch["opt_group"][:, 2] = 1
+    plain = multiselect_ce(policy, batch, group_marginal=False)
+
+    # Merge 0+1 back into same group
+    batch["opt_group"][:, 1] = batch["opt_group"][:, 0]
+    grouped = multiselect_ce(policy, batch, group_marginal=True)
+
+    assert torch.isfinite(grouped).all()
+    assert (grouped <= plain + 1e-5).all()
+    assert (grouped < plain).any(), "merging a group must reduce CE for at least one row"
+
+
+def test_multiselect_ce_unchanged_when_every_group_is_a_singleton():
+    policy = Policy(D=32, heads=4, layers=1, ff=64)
+    batch = _make_synthetic_batch(B=2, max_count=3)   # all-distinct opt_group after Task 2
+    assert torch.allclose(
+        multiselect_ce(policy, batch, group_marginal=True),
+        multiselect_ce(policy, batch, group_marginal=False),
+        atol=1e-5,
+    )

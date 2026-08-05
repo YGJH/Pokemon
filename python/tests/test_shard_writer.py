@@ -1178,3 +1178,8 @@ class TestBuildShards:
             f"peak {peak / 1e6:.1f} MB >= corpus {corpus_bytes / 1e6:.1f} MB — "
             "build_shards is still holding the corpus in memory"
         )
+
+
+def test_opt_group_is_not_stored_as_fp16():
+    from ptcg_il.shard_writer import _FP16_KEYS
+    assert "opt_group" not in _FP16_KEYS, "opt_group is an index array, not a feature"

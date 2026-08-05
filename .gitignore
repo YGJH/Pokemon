@@ -17,6 +17,7 @@ archive/
 .serena/
 .claude/
 python/wandb/
+wandb/
 checkpoints/
 python/checkpoints*/
 submission.tar.gz

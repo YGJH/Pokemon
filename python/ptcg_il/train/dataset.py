@@ -48,7 +48,8 @@ W_LOST: float = 0.6
 # Keys that should stay on CPU as int64 (indices, masks, types)
 _INT_KEYS = frozenset({
     "tok_type", "tok_owner", "tok_zone",
-    "opt_type", "opt_src_idx", "opt_tgt_idx", "sel_type", "sel_ctx",
+    "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_group",
+    "sel_type", "sel_ctx",
     "action_idx", "minCount", "maxCount", "action_len", "stop_column",
     "log_len",
 })
@@ -393,6 +394,13 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         # Backward compat: old shards lack stop_column
         if "stop_column" not in sample:
             sample["stop_column"] = torch.tensor(-1, dtype=torch.long)
+
+        # Backward compat: shards written before opt_group existed.  Every
+        # option becomes its own group, which makes group-marginal CE identical
+        # to plain CE rather than silently merging unrelated options.
+        if "opt_group" not in sample:
+            g = torch.arange(sample["opt_mask"].shape[0], dtype=torch.long)
+            sample["opt_group"] = torch.where(sample["opt_mask"], g, torch.full_like(g, -1))
 
         # Attach sample_weight and value_target from meta
         sample["sample_weight"] = torch.tensor(

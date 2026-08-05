@@ -100,6 +100,12 @@ def offline_eval(
     total_multi_perpick_total = 0
     total_multi_samples = 0
 
+    collision_correct_top1 = 0
+    collision_nontrivial_correct = 0
+    collision_rows = 0
+    collision_total_rows = 0
+    multi_exact_collision = 0
+
     # (weighted sum, row count) per belief term; only touched when belief=True.
     belief_acc: dict[str, list[float]] = {
         k: [0.0, 0.0] for k in ("arch", "deck", "hidden", "hand")
@@ -114,6 +120,8 @@ def offline_eval(
             if k in ("encoder_padding_mask",):
                 continue
             batch_gpu[k] = v.to(device, non_blocking=(device.type == "cuda"))
+
+        opt_group = batch_gpu.get("opt_group")
 
         with (
             torch.amp.autocast(device_type, dtype=torch.bfloat16)
@@ -172,6 +180,27 @@ def offline_eval(
                 c, t = per_sel_ctx.get(sc, (0, 0))
                 per_sel_ctx[sc] = (c + int(correct_arr[i]), t + 1)
 
+            # Collision-adjusted top-1: correct if prediction is in the target's group.
+            # Skip declined single-select rows (action_idx == -1) — gathering
+            # with a negative index trips a device-side assert (loop.py:354).
+            if opt_group is not None:
+                has_target = single_targets >= 0
+                if has_target.any():
+                    g_single = opt_group[single_mask][has_target]       # [N_tgt, O]
+                    tgt = single_targets[has_target]                     # [N_tgt]
+                    pred = top1_pred[has_target]                         # [N_tgt]
+                    tgt_g = g_single.gather(1, tgt.unsqueeze(1))        # [N_tgt, 1]
+                    pred_g = g_single.gather(1, pred.unsqueeze(1))      # [N_tgt, 1]
+                    adj = (pred_g == tgt_g).squeeze(1)                   # [N_tgt]
+                    collision_correct_top1 += int(adj.sum().item())
+                    collision_total_rows += int(has_target.sum().item())
+                    # A row "has a collision" when the target's own group has >1 member.
+                    group_sizes = (g_single == tgt_g).sum(dim=-1)       # [N_tgt]
+                    collision_rows += int((group_sizes > 1).sum().item())
+                    nt_tgt = nt[has_target]
+                    if nt_tgt.any():
+                        collision_nontrivial_correct += int(adj[nt_tgt].sum().item())
+
         # --- Multi-select accuracy ---
         if multi_mask.any():
             # Greedy decode
@@ -196,6 +225,11 @@ def offline_eval(
                 total_multi_perpick_total += n
                 if sorted(pred) == sorted(tgt):
                     total_multi_exact += 1
+                if opt_group is not None:
+                    g_row = opt_group[multi_mask][i]
+                    to_g = lambda idx: int(g_row[idx].item()) if idx >= 0 else idx
+                    if sorted(map(to_g, pred)) == sorted(map(to_g, tgt)):
+                        multi_exact_collision += 1
                 total_multi_samples += 1
 
         # --- Value metrics ---
@@ -284,6 +318,21 @@ def offline_eval(
     else:
         metrics["val/multiselect_exact_set"] = 0.0
         metrics["val/multiselect_perpick_top1"] = 0.0
+
+    # Collision-adjusted metrics
+    if collision_total_rows > 0:
+        metrics["val/top1_micro_collision_adj"] = (
+            collision_correct_top1 / collision_total_rows
+        )
+        metrics["val/collision_share"] = collision_rows / collision_total_rows
+    if nontrivial_samples > 0 and collision_total_rows > 0:
+        metrics["val/nontrivial_top1_collision_adj"] = (
+            collision_nontrivial_correct / nontrivial_samples
+        )
+    if total_multi_samples > 0:
+        metrics["val/multiselect_exact_set_collision_adj"] = (
+            multi_exact_collision / total_multi_samples
+        )
 
     # Value
     if total_value_mse_n > 0:

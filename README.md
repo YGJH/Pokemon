@@ -37,7 +37,8 @@ uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints_a1 \
     --archetype-self 1 --d-model 256 --layers 14 --heads 8 --ff 1024 \
     --dropout 0.2 --batch-size 256 --total-steps 2000000
 
-
+uv run python -m ptcg_mine.mine --skip-download
+    --raw-dir raw --out-dir data
 
   新标志：--ensemble，后跟一个 glob 或路径列表。用法：
   ./scripts/build_submit.sh a1 --ensemble "python/checkpoints_a1_s*/ckpt-best.pt"

@@ -125,6 +125,35 @@ def test_variable_length_all_same(tmp_path):
 # ============================================================
 
 
+def test_attachment_collision_uses_opt_group(tmp_path):
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    O = 64
+    # Sample 0: slots 0 and 1 identical (group 0), slot 2 distinct (group 1).
+    opt_group = np.full((1, O), -1, dtype=np.int64)
+    opt_group[0, :3] = [0, 0, 1]
+    opt_mask = np.zeros((1, O), dtype=bool)
+    opt_mask[0, :3] = True
+    opt_type = np.zeros((1, O), dtype=np.int64)
+    opt_type[0, :3] = 3
+    np.savez(shard_dir / "train-00000.npz",
+             opt_group=opt_group, opt_mask=opt_mask, opt_type=opt_type)
+
+    rep = check_attachment_collision(shard_dir, pd.DataFrame({"shard": ["train-00000.npz"]}))
+    assert rep["n_options_total"] == 3
+    assert rep["n_indistinguishable_options"] == 2
+    assert rep["indistinguishable_share"] == pytest.approx(2 / 3)
+    assert rep["collision_by_opt_type"] == {3: 2}
+
+
+def test_attachment_collision_raises_on_zero_options(tmp_path):
+    """An audit that examined nothing must not report a clean 0.0 share."""
+    shard_dir = tmp_path / "shards"
+    shard_dir.mkdir()
+    with pytest.raises(ValueError, match="no options"):
+        check_attachment_collision(shard_dir, pd.DataFrame({"shard": []}))
+
+
 def test_attachment_collision_no_collisions(tmp_path):
     """Synthetic shard with attachment options that all differ."""
     S, O = 2, 64
@@ -151,9 +180,14 @@ def test_attachment_collision_no_collisions(tmp_path):
 
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
+    # opt_group: sample 0 slots 0,1 differ (src 1 vs 7), sample 1 has one option.
+    opt_group_arr = np.full((S, O), -1, dtype=np.int64)
+    opt_group_arr[0, :2] = [0, 1]
+    opt_group_arr[1, :1] = [0]
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_feat=opt_card, opt_mask=opt_mask)
+                        opt_card_feat=opt_card, opt_mask=opt_mask,
+                        opt_group=opt_group_arr)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"] * S, "row": [0, 1]})
     result = check_attachment_collision(shard_dir, meta)
@@ -180,9 +214,13 @@ def test_attachment_collision_with_collisions(tmp_path):
 
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
+    # opt_group: both identical options get the same group.
+    opt_group_arr = np.full((S, O), -1, dtype=np.int64)
+    opt_group_arr[0, :2] = [0, 0]
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_feat=opt_card, opt_mask=opt_mask)
+                        opt_card_feat=opt_card, opt_mask=opt_mask,
+                        opt_group=opt_group_arr)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"], "row": [0]})
     result = check_attachment_collision(shard_dir, meta)
@@ -356,126 +394,56 @@ def test_balance_report():
 # ============================================================
 
 
-def test_reference_roundtrip_skips_without_obs_dir(tmp_path):
-    """Gate skips (returns None) when no obs_dir is provided."""
+def _roundtrip_shard(tmp_path, *, src_row, card_row_value, state_slot_value):
+    """One-sample shard whose only option points at a hand row."""
     shard_dir = tmp_path / "shards"
-    shard_dir.mkdir()
-    # Create empty shard
-    S, O = 1, 64
-    opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.zeros((S, O), dtype=np.int64)
-    opt_mask = np.zeros((S, O), dtype=bool)
-    np.savez_compressed(shard_dir / "train-00000.npz",
-                        opt_src_idx=opt_src, opt_card_id=opt_card, opt_mask=opt_mask)
-
-    passed, details = check_reference_roundtrip(shard_dir, obs_dir=None)
-    assert passed is None
-    assert details["skipped"] is True
-
-
-def test_reference_roundtrip_skips_without_shard_dir():
-    passed, details = check_reference_roundtrip(shard_dir=None, obs_dir=None)
-    assert passed is None
-    assert details["skipped"] is True
+    shard_dir.mkdir(exist_ok=True)
+    O, F = 64, 8
+    opt_mask = np.zeros((1, O), dtype=bool); opt_mask[0, 0] = True
+    opt_src = np.full((1, O), -1, dtype=np.int64); opt_src[0, 0] = src_row
+    opt_card = np.zeros((1, O, F), dtype=np.float16); opt_card[0, 0, 0] = card_row_value
+    hand = np.zeros((1, 30, F), dtype=np.float16); hand[0, src_row - 13, 0] = state_slot_value
+    np.savez(shard_dir / "train-00000.npz",
+             opt_mask=opt_mask, opt_src_idx=opt_src, opt_card_feat=opt_card,
+             hand_card_feat=hand,
+             poke_card_feat=np.zeros((1, 12, F), dtype=np.float16),
+             stadium_card_feat=np.zeros((1, 1, F), dtype=np.float16))
+    return shard_dir
 
 
-def test_reference_roundtrip_validates_correctly(tmp_path):
-    """Gate passes when opt_src_idx / opt_card_id resolve correctly."""
-    import json
-
-    # Create observation dicts
-    obs_dir = tmp_path / "observations"
-    obs_dir.mkdir()
-    obs = {
-        "yourIndex": 0,
-        "players": [
-            {
-                "hand": [{"cardId": 42}, {"cardId": 99}],
-                "bench": [{"cardId": 7}],
-                "active": {"cardId": 100},
-                "discard": [{"cardId": 55}, {"cardId": 66}],
-            },
-            {"hand": [], "bench": [], "active": None, "discard": []},
-        ],
-    }
-    with open(obs_dir / "train-00000_obs.jsonl", "w") as f:
-        json.dump(obs, f)
-        f.write("\n")
-
-    # Create shard with one sample: opt_src_idx pointing to valid positions
-    S, O = 1, 64
-    opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.full((S, O), -1, dtype=np.int64)
-    opt_mask = np.zeros((S, O), dtype=bool)
-
-    # idx 0 = hand[0] = cardId 42
-    opt_src[0, 0] = 0
-    opt_card[0, 0] = 42
-    opt_mask[0, 0] = True
-    # idx 1 = hand[1] = cardId 99
-    opt_src[0, 1] = 1
-    opt_card[0, 1] = 99
-    opt_mask[0, 1] = True
-    # idx 2 = bench[0] = cardId 7
-    opt_src[0, 2] = 2
-    opt_card[0, 2] = 7
-    opt_mask[0, 2] = True
-    # idx 3 = active = cardId 100
-    opt_src[0, 3] = 3
-    opt_card[0, 3] = 100
-    opt_mask[0, 3] = True
-
-    shard_dir = tmp_path / "shards"
-    shard_dir.mkdir()
-    np.savez_compressed(shard_dir / "train-00000.npz",
-                        opt_src_idx=opt_src, opt_card_id=opt_card, opt_mask=opt_mask)
-
-    passed, details = check_reference_roundtrip(shard_dir, obs_dir)
+def test_reference_roundtrip_passes_when_pointer_resolves(tmp_path):
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=1.0)
+    passed, details = check_reference_roundtrip(shard_dir)
     assert passed is True
-    assert details["checked"] == 1
-    assert details["errors"] == 0
+    assert details["n_compared"] == 1
+    assert details["n_mismatch"] == 0
 
 
-def test_reference_roundtrip_detects_mismatch(tmp_path):
-    """Gate fails when opt_card_id doesn't match the card at opt_src_idx."""
-    import json
-
-    obs_dir = tmp_path / "observations"
-    obs_dir.mkdir()
-    obs = {
-        "yourIndex": 0,
-        "players": [
-            {
-                "hand": [{"cardId": 42}],
-                "bench": [],
-                "active": None,
-                "discard": [],
-            },
-            {"hand": [], "bench": [], "active": None, "discard": []},
-        ],
-    }
-    with open(obs_dir / "train-00000_obs.jsonl", "w") as f:
-        json.dump(obs, f)
-        f.write("\n")
-
-    S, O = 1, 64
-    opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.full((S, O), -1, dtype=np.int64)
-    opt_mask = np.zeros((S, O), dtype=bool)
-
-    # src_idx 0 points to hand[0] = cardId 42, but opt_card_id says 999 — MISMATCH
-    opt_src[0, 0] = 0
-    opt_card[0, 0] = 999
-    opt_mask[0, 0] = True
-
-    shard_dir = tmp_path / "shards"
-    shard_dir.mkdir()
-    np.savez_compressed(shard_dir / "train-00000.npz",
-                        opt_src_idx=opt_src, opt_card_id=opt_card, opt_mask=opt_mask)
-
-    passed, details = check_reference_roundtrip(shard_dir, obs_dir)
+def test_reference_roundtrip_catches_off_by_one(tmp_path):
+    """The pointer names hand row 15 but the card there is a different card."""
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=0.5)
+    passed, details = check_reference_roundtrip(shard_dir)
     assert passed is False
-    assert details["errors"] == 1
+    assert details["n_mismatch"] == 1
+
+
+def test_reference_roundtrip_flags_impossible_source_rows(tmp_path):
+    """Row 0 is CLS and row 43-44 are summary tokens — no option may point there."""
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=1.0)
+    d = dict(np.load(shard_dir / "train-00000.npz"))
+    d["opt_src_idx"][0, 0] = 43
+    np.savez(shard_dir / "train-00000.npz", **d)
+    passed, details = check_reference_roundtrip(shard_dir)
+    assert passed is False
+    assert details["n_src_out_of_range"] == 1
+
+
+def test_reference_roundtrip_returns_none_when_nothing_compared(tmp_path):
+    """Zero comparisons is 'skipped', never 'passed'."""
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=0.0, state_slot_value=0.0)
+    passed, details = check_reference_roundtrip(shard_dir)
+    assert passed is None
+    assert details["n_compared"] == 0
 
 
 # ============================================================

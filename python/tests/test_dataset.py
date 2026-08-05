@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM
+from ptcg_il.model.pointer import O_MAX
 from ptcg_il.train.dataset import (
     ALPHA_ARCH,
     ALPHA_CTX,
@@ -56,6 +57,7 @@ _KEYS_INT = {
     "opt_tgt_idx": (64,),
     "opt_card_id": (64,),
     "opt_attack_idx": (64,),
+    "opt_group": (64,),
     "sel_type": (),
     "sel_ctx": (),
     "action_idx": (64,),
@@ -108,6 +110,7 @@ def _make_synthetic_sample(
     sample["action_idx"][1:] = -1
     sample["action_len"] = np.array(1, dtype=np.int64)
     sample["opt_mask"][:max_count] = True
+    sample["opt_group"][:max_count] = 0  # single group containing all valid options
     sample["tok_mask"][:30] = True  # first 30 tokens active
 
     return sample
@@ -118,6 +121,7 @@ def _build_synthetic_data(
     n_val: int = 20,
     samples_per_shard: int = 60,
     seed: int = 42,
+    drop_keys: tuple[str, ...] = (),
 ) -> Path:
     """Create a temporary data/ dir with shards/ and meta.parquet.
 
@@ -174,6 +178,8 @@ def _build_synthetic_data(
                 keys = sorted(samples[0].keys())
                 for k in keys:
                     stacked[k] = np.stack([s[k] for s in samples], axis=0)
+                for k in drop_keys:
+                    stacked.pop(k, None)
                 np.savez_compressed(shards_dir / shard_name, **stacked)
 
     # Write meta
@@ -241,6 +247,31 @@ class TestComputeSampleWeights:
         })
         weights = compute_sample_weights(meta)
         assert np.allclose(weights, 1.0, atol=1e-5)
+
+
+# ============================================================
+# Tests — opt_group plumbing
+# ============================================================
+
+
+class TestOptGroup:
+    def test_dataset_yields_opt_group_as_int64(self):
+        data_dir = _build_synthetic_data(n_train=8, n_val=4)
+        ds = ShardDataset(data_dir, split="train")
+        sample = ds[0]
+        assert sample["opt_group"].dtype == torch.int64
+        assert sample["opt_group"].shape == (O_MAX,)
+
+    def test_dataset_backfills_opt_group_for_legacy_shards(self):
+        """A shard written before opt_group existed must load, with every option in
+        its own group so group-marginal CE degenerates to plain CE."""
+        data_dir = _build_synthetic_data(n_train=8, n_val=4, drop_keys=("opt_group",))
+        ds = ShardDataset(data_dir, split="train")
+        sample = ds[0]
+        valid = sample["opt_mask"]
+        g = sample["opt_group"]
+        assert g[valid].unique().numel() == int(valid.sum()), "legacy fallback must be all-distinct"
+        assert (g[~valid] == -1).all()
 
 
 # ============================================================

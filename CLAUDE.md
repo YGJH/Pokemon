@@ -213,3 +213,4 @@ way (the STOP-step term in the joint log-prob, and a NaN gradient from
 ## Working style
 
 - Don't explain too much at the end of a task, unless necessary.
+- Do not run git commands (commit, push, branch, etc.) unless explicitly asked.

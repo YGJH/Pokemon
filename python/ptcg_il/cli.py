@@ -202,6 +202,12 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Max global gradient norm")
     train_hp.add_argument("--label-smoothing", type=float, default=DEFAULTS["label_smoothing"],
                           help="Label smoothing for CE")
+    train_hp.add_argument(
+        "--no-group-marginal-ce", dest="group_marginal", action="store_false",
+        default=True,
+        help="Score each option label on its own instead of marginalising over "
+             "byte-identical options (the pre-2026-08 behaviour).",
+    )
 
     # Loss / weighting
     loss = train_parser.add_argument_group("Loss & weighting (C.3, C.10)")
@@ -560,6 +566,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         warmup=args.warmup,
         grad_clip=args.grad_clip,
         label_smoothing=args.label_smoothing,
+        group_marginal=args.group_marginal,
         ema_decay=args.ema_decay,
         lambda_v=args.lambda_v,
         belief_weights=_belief_weights(args),

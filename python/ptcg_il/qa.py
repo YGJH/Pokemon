@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import collections
 import logging
 from rich.logging import RichHandler
 from collections import defaultdict
@@ -133,12 +134,25 @@ def run_qa_checks(
         results["variable_length_share"] = 0.0
 
     # --- Attachment-collision audit (D.5.4) ---
+    _ac_defaults: dict[str, Any] = {
+        "n_collision_options": 0,
+        "collision_share": 0.0,
+        "n_attachment_options": 0,
+        "attachment_samples_checked": 0,
+        "n_options_total": 0,
+        "n_indistinguishable_options": 0,
+        "indistinguishable_share": 0.0,
+        "collision_by_opt_type": {},
+    }
     if shard_dir.exists() and not meta.empty:
-        ac_report = check_attachment_collision(shard_dir, meta, max_samples=max_samples)
+        try:
+            ac_report = check_attachment_collision(shard_dir, meta, max_samples=max_samples)
+        except ValueError:
+            logger.warning("Attachment-collision audit skipped: no options examined.")
+            ac_report = _ac_defaults
         results.update(ac_report)
     else:
-        results["n_collision_options"] = 0
-        results["collision_share"] = 0.0
+        results.update(_ac_defaults)
 
     # --- Label sanity (D.5.5) ---
     if shard_dir.exists():
@@ -157,12 +171,7 @@ def run_qa_checks(
         results["lost_count"] = 0
 
     # --- Reference round-trip (D.5.x) ---
-    obs_path: Path | None = None
-    if shard_dir is not None:
-        candidate = Path(shard_dir).parent / "observations"
-        if candidate.is_dir():
-            obs_path = candidate
-    rt_pass, rt_details = check_reference_roundtrip(shard_dir, obs_path, max_samples=max_samples)
+    rt_pass, rt_details = check_reference_roundtrip(shard_dir, max_samples=max_samples)
     results["reference_roundtrip_pass"] = rt_pass
     results["reference_roundtrip_details"] = rt_details
 
@@ -189,202 +198,117 @@ def run_qa_checks(
 
 def check_reference_roundtrip(
     shard_dir: str | Path | None = None,
-    obs_dir: str | Path | None = None,
     max_samples: int | None = None,
 ) -> tuple[bool | None, dict[str, Any]]:
-    """Verify opt_src_idx / opt_card_id resolve to the card the option text implies.
+    """Verify ``opt_src_idx`` names the state row holding the option's own card.
 
-    For a random sample of options, we decode opt_src_idx against the ref_map
-    derived from the observation and confirm that the card at that index has
-    the same cardId as opt_card_id.  This guards against off-by-one errors in
-    the featurizer's pointer encoding.
+    The featurizer writes an option's source as a state-token row (A.1) and its
+    card features by dereferencing the same location.  Those are two separate
+    code paths — ``ref_map.build_ref_map`` for the row, the state-token builders
+    for the row's contents — so comparing them catches an off-by-one in either.
 
-    Parameters
-    ----------
-    shard_dir : Path or None
-        Directory with shard npz files (to read opt_src_idx / opt_card_id).
-    obs_dir : Path or None
-        Directory with raw observation dicts corresponding to shard samples.
-        If None, the gate cannot run and returns ``(None, skipped_details)``.
-    max_samples : int or None
-        Max number of samples to check.
+    This reads only the shard.  The previous implementation wanted raw
+    observations in ``data/observations/``, which nothing has ever written, and
+    resolved them with a helper whose index space did not match ``opt_src_idx``
+    at all; it could not have passed or failed meaningfully.
 
-    Returns
-    -------
-    (passed, details)
-        passed is True/False if the gate ran, None if skipped.
+    Options whose card row is PAD (all-zero) are skipped: ``card_id_at``
+    deliberately leaves deck slots and face-down prizes at PAD, and RETREAT and
+    ATTACK point at row 1 without ever setting a card.  Empty state slots are
+    PAD for the same reason and are skipped too.
+
+    Returns ``(passed, details)``; ``passed`` is None when nothing was compared.
     """
-    details: dict[str, Any] = {"checked": 0, "errors": 0, "skipped": False}
-    if shard_dir is None or obs_dir is None:
-        details["skipped"] = True
-        details["note"] = (
-            "Reference round-trip check skipped: raw observation data not available. "
-            "This gate requires the original game-state observations to verify that "
-            "opt_src_idx/opt_card_id resolve correctly.  Place observation dicts in "
-            "data/observations/ to enable this gate."
-        )
-        logger.info("Reference round-trip QA gate: %s", details["note"])
+    details: dict[str, Any] = {
+        "n_compared": 0, "n_mismatch": 0,
+        "n_src_out_of_range": 0, "n_skipped_pad": 0,
+    }
+    if shard_dir is None:
+        details["skipped"] = "no shard_dir"
         return None, details
 
-    shard_dir = Path(shard_dir)
-    obs_dir = Path(obs_dir)
-    import json
+    n_compared = n_mismatch = n_oob = n_pad = 0
+    examples: list[dict] = []
 
-    shard_files = sorted(shard_dir.glob("*.npz"))
-    samples_checked = 0
-    errors = 0
-    missing_obs = 0
-
-    for sf in shard_files:
+    for sf in sorted(Path(shard_dir).glob("*.npz")):
         try:
-            data = np.load(sf, mmap_mode="r", allow_pickle=False)
+            data = np.load(sf, allow_pickle=False)
         except OSError:
             continue
-        if "opt_src_idx" not in data or "opt_mask" not in data:
-            continue
-        if "opt_card_id" not in data:
-            # Shards written after the card-feature refactor carry
-            # `opt_card_feat` rows, not vocab ids.  Skipping silently here
-            # would report a pass over zero samples, so say so instead: this
-            # check still needs migrating to compare feature rows.
-            return False, {
-                "skipped": "shards carry opt_card_feat, not opt_card_id; "
-                           "check_reference_roundtrip needs migrating to "
-                           "compare card features",
-                "samples_checked": 0,
-                "shard": sf.name,
-            }
-
-        opt_src = data["opt_src_idx"]     # [S, O_MAX]
-        opt_card = data["opt_card_id"]     # [S, O_MAX]
-        opt_mask = data["opt_mask"]        # [S, O_MAX]
-
-        # Look for corresponding observation file
-        obs_file = obs_dir / f"{sf.stem}_obs.jsonl"
-        if not obs_file.exists():
-            missing_obs += 1
+        needed = ("opt_src_idx", "opt_card_feat", "opt_mask",
+                  "poke_card_feat", "hand_card_feat", "stadium_card_feat")
+        if any(k not in data for k in needed):
             continue
 
-        # Read observations for this shard
-        observations: list[dict] = []
-        try:
-            with open(obs_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        observations.append(json.loads(line))
-        except (json.JSONDecodeError, OSError):
-            missing_obs += 1
-            continue
+        opt_src = data["opt_src_idx"]
+        opt_card = data["opt_card_feat"]
+        opt_mask = data["opt_mask"]
+        poke = data["poke_card_feat"]
+        hand = data["hand_card_feat"]
+        stadium = data["stadium_card_feat"]
 
         for s in range(opt_src.shape[0]):
-            if s >= len(observations):
-                break
-            obs_dict = observations[s]
-            n_opts = int(opt_mask[s].sum())
-            if n_opts == 0:
-                continue
-
-            # Build a simple ref_map from the observation to resolve src_idx → cardId
-            ref_cards = _build_simple_ref_from_obs(obs_dict)
-            if ref_cards is None:
-                continue
-
-            for o in range(n_opts):
-                src_idx = int(opt_src[s, o])
-                card_id = int(opt_card[s, o])
-
-                # -1 src_idx means no source (e.g., text-only option)
-                if src_idx < 0:
+            for o in np.flatnonzero(opt_mask[s]):
+                row = int(opt_src[s, o])
+                if row < 0:
+                    continue
+                if 1 <= row <= 12:
+                    state_row = poke[s, row - 1]
+                elif 13 <= row <= 42:
+                    state_row = hand[s, row - 13]
+                elif row == 45:
+                    state_row = stadium[s, 0]
+                else:
+                    n_oob += 1
                     continue
 
-                if src_idx in ref_cards:
-                    expected_cid = ref_cards[src_idx]
-                    if expected_cid != card_id:
-                        errors += 1
-                # If src_idx not in ref_cards, it's a different entity type
-                # (e.g., energy, tool) — skip without counting as error
+                card_row = opt_card[s, o]
+                if not card_row.any() or not state_row.any():
+                    n_pad += 1
+                    continue
 
-            samples_checked += 1
-            if max_samples is not None and samples_checked >= max_samples:
+                n_compared += 1
+                if not np.array_equal(card_row, state_row):
+                    n_mismatch += 1
+                    if len(examples) < 5:
+                        examples.append(
+                            {"shard": sf.name, "sample": int(s), "option": int(o), "src_row": row}
+                        )
+
+            if max_samples is not None and (s + 1) >= max_samples:
                 break
-
-        if max_samples is not None and samples_checked >= max_samples:
+        if max_samples is not None:
             break
 
-    details["checked"] = samples_checked
-    details["errors"] = errors
-    details["missing_obs"] = missing_obs
+    details.update(
+        n_compared=n_compared, n_mismatch=n_mismatch,
+        n_src_out_of_range=n_oob, n_skipped_pad=n_pad, examples=examples,
+    )
 
-    if missing_obs > 0:
-        details["note"] = (
-            f"{missing_obs} observation file(s) missing; round-trip check is partial."
+    if n_oob > 0:
+        logger.error(
+            "REFERENCE ROUND-TRIP: %d option(s) point at a non-card state row "
+            "(CLS/summary/out of range) — the pointer encoding is wrong.", n_oob,
         )
+        return False, details
 
-    if samples_checked == 0:
-        details["skipped"] = True
-        details["note"] = (
-            "Reference round-trip check skipped: no matching observation files found "
-            "for the shard data.  Place observation dicts in data/observations/ as "
-            "shardname_obs.jsonl to enable this gate."
+    if n_compared == 0:
+        details["skipped"] = (
+            "no comparable options — every option was PAD or sourceless, so the "
+            "gate examined nothing and must not report a pass."
         )
-        logger.info("Reference round-trip QA gate: %s", details["note"])
+        logger.info("Reference round-trip QA gate: %s", details["skipped"])
         return None, details
 
-    ok = errors == 0
-    if not ok:
+    if n_mismatch > 0:
         logger.error(
-            "REFERENCE ROUND-TRIP FAIL: %d errors in %d samples — opt_src_idx/opt_card_id "
-            "mismatch detected.  The featurizer's pointer encoding may be incorrect.",
-            errors,
-            samples_checked,
+            "REFERENCE ROUND-TRIP FAIL: %d/%d options carry card features that do "
+            "not match the state row opt_src_idx names.  Examples: %s",
+            n_mismatch, n_compared, examples,
         )
+        return False, details
 
-    return ok, details
-
-
-def _build_simple_ref_from_obs(obs_dict: dict) -> dict[int, int] | None:
-    """Build a minimal ref_map from an observation dict: src_idx → cardId.
-
-    This is a simplified version of the full featurizer's ref_map logic
-    (see ref_map.py).  We index the player's hand, bench, active, etc.
-    to resolve source indices.
-
-    Returns None if the observation structure is unrecognized.
-    """
-    try:
-        your_index = obs_dict["yourIndex"]
-        players = obs_dict["players"]
-        ref: dict[int, int] = {}
-        idx = 0
-
-        # Hand
-        for card in players[your_index].get("hand", []) or []:
-            if isinstance(card, dict) and "cardId" in card:
-                ref[idx] = int(card["cardId"])
-                idx += 1
-
-        # Bench
-        for card in players[your_index].get("bench", []) or []:
-            if isinstance(card, dict) and "cardId" in card:
-                ref[idx] = int(card["cardId"])
-                idx += 1
-
-        # Active
-        active = players[your_index].get("active")
-        if active is not None and isinstance(active, dict) and "cardId" in active:
-            ref[idx] = int(active["cardId"])
-            idx += 1
-
-        # Discard
-        for card in players[your_index].get("discard", []) or []:
-            if isinstance(card, dict) and "cardId" in card:
-                ref[idx] = int(card["cardId"])
-                idx += 1
-
-        return ref if ref else None
-    except (KeyError, IndexError, TypeError):
-        return None
+    return True, details
 
 
 def check_coverage(
@@ -526,63 +450,129 @@ def check_attachment_collision(
     n_total_attachment_options = 0
     samples_checked = 0
 
+    # Group-based pass counters (across ALL option types, not just attachments).
+    n_options_seen = 0
+    n_indistinguishable = 0
+    group_checked = 0
+    by_opt_type: dict[int, int] = {}
+
     shard_files = sorted(shard_dir.glob("*.npz"))
     for sf in shard_files:
         try:
             data = np.load(sf, mmap_mode="r", allow_pickle=False)
         except OSError:
             continue
-        if "opt_type" not in data or "opt_card_feat" not in data:
+
+        # Need at least opt_mask and opt_type for either pass.
+        if "opt_type" not in data or "opt_mask" not in data:
             continue
+        has_legacy = "opt_card_feat" in data and "opt_src_idx" in data
+        has_group = "opt_group" in data
+        if not has_legacy and not has_group:
+            continue
+
         opt_type = data["opt_type"]       # [S, O_MAX]
-        opt_src = data["opt_src_idx"]     # [S, O_MAX]
-        opt_card = data["opt_card_feat"]  # [S, O_MAX, F_CARD]
         opt_mask = data["opt_mask"]       # [S, O_MAX]
 
-        # Attachment OptionTypes: CARD(3), TOOL_CARD(4), ENERGY_CARD(5), ENERGY(6)
-        att_mask = np.isin(opt_type, [3, 4, 5, 6]) & opt_mask
+        # --- Legacy pass: (src, card_feat) key, attachment types only ---
+        if has_legacy and (max_samples is None or samples_checked < max_samples):
+            opt_src = data["opt_src_idx"]     # [S, O_MAX]
+            opt_card = data["opt_card_feat"]  # [S, O_MAX, F_CARD]
 
-        for s in range(opt_type.shape[0]):
-            row_mask = att_mask[s]
-            if not row_mask.any():
-                continue
-            # Build (src_idx, card-features) pairs for this sample's attachment
-            # options.  Feature rows are float arrays, so key them by bytes.
-            pairs = list(zip(
-                opt_src[s][row_mask].tolist(),
-                [np.ascontiguousarray(row).tobytes()
-                 for row in opt_card[s][row_mask]],
-            ))
-            # Count how many unique pairs vs total
-            n_total_attachment_options += len(pairs)
-            unique_pairs = set(pairs)
-            n_collision += len(pairs) - len(unique_pairs)
+            # Attachment OptionTypes: CARD(3), TOOL_CARD(4), ENERGY_CARD(5), ENERGY(6)
+            att_mask = np.isin(opt_type, [3, 4, 5, 6]) & opt_mask
 
-            samples_checked += 1
-            if max_samples is not None and samples_checked >= max_samples:
-                break
+            for s in range(opt_type.shape[0]):
+                row_mask = att_mask[s]
+                if not row_mask.any():
+                    continue
+                # Build (src_idx, card-features) pairs for this sample's attachment
+                # options.  Feature rows are float arrays, so key them by bytes.
+                pairs = list(zip(
+                    opt_src[s][row_mask].tolist(),
+                    [np.ascontiguousarray(row).tobytes()
+                     for row in opt_card[s][row_mask]],
+                ))
+                # Count how many unique pairs vs total
+                n_total_attachment_options += len(pairs)
+                unique_pairs = set(pairs)
+                n_collision += len(pairs) - len(unique_pairs)
 
-        if max_samples is not None and samples_checked >= max_samples:
+                samples_checked += 1
+                if max_samples is not None and samples_checked >= max_samples:
+                    break
+
+        # --- Group-based pass: true indistinguishability across ALL option types ---
+        # True indistinguishability: two options are the same input to the
+        # pointer only if *every* tensor it reads agrees.  The legacy
+        # (src, card_feat) key above ignores opt_type/opt_tgt_idx/opt_scalar
+        # and so overstates the share by ~4x (47.8% vs 10.0% on train-00000).
+        if has_group and (max_samples is None or group_checked < max_samples):
+            groups = data["opt_group"]
+            for s in range(groups.shape[0]):
+                row_valid = opt_mask[s]
+                if not row_valid.any():
+                    continue
+                gs = groups[s][row_valid]
+                ts = opt_type[s][row_valid]
+                counts = collections.Counter(gs.tolist())
+                for g_id, t in zip(gs.tolist(), ts.tolist()):
+                    n_options_seen += 1
+                    if counts[g_id] > 1:
+                        n_indistinguishable += 1
+                        by_opt_type[int(t)] = by_opt_type.get(int(t), 0) + 1
+                group_checked += 1
+                if max_samples is not None and group_checked >= max_samples:
+                    break
+
+        # Stop only when both passes are done (or no budget was set).
+        if max_samples is not None and samples_checked >= max_samples and group_checked >= max_samples:
             break
+
+    if n_options_seen == 0:
+        raise ValueError(
+            "check_attachment_collision group pass examined no options — "
+            "shards lack opt_group (rebuild with updated featurizer) or have "
+            "no valid options, so a 0.0 indistinguishable share would be a lie."
+        )
 
     share = n_collision / max(n_total_attachment_options, 1)
 
     if share > 0.0:
         logger.warning(
-            "ATTACHMENT COLLISION: %d/%d attachment options (%.2f%%) "
-            "share both opt_src_idx AND their card features — truly indistinguishable "
-            "to the pointer head. Consider promoting attachments to tokens (A.7).",
+            "ATTACHMENT COLLISION (loose upper bound): %d/%d attachment options "
+            "(%.2f%%) share opt_src_idx + card features, but this ignores "
+            "opt_type/opt_tgt_idx/opt_scalar and overcounts by ~4× vs the "
+            "true opt_group number below. Consider promoting attachments to "
+            "tokens (A.7).",
             n_collision,
             n_total_attachment_options,
             share * 100,
         )
 
-    return {
+    report: dict[str, Any] = {
         "n_collision_options": n_collision,
         "collision_share": round(share, 6),
         "n_attachment_options": n_total_attachment_options,
         "attachment_samples_checked": samples_checked,
+        "n_options_total": n_options_seen,
+        "n_indistinguishable_options": n_indistinguishable,
+        "indistinguishable_share": n_indistinguishable / max(n_options_seen, 1),
+        "collision_by_opt_type": by_opt_type,
     }
+
+    if report["indistinguishable_share"] > 0.0:
+        logger.warning(
+            "TRUE OPTION INDISTINGUISHABILITY (opt_group): %d/%d options (%.2f%%) "
+            "are indistinguishable from another valid option. "
+            "collision_by_opt_type: %s",
+            n_indistinguishable,
+            n_options_seen,
+            report["indistinguishable_share"] * 100,
+            by_opt_type,
+        )
+
+    return report
 
 
 def check_label_sanity(

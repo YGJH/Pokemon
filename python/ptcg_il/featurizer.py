@@ -944,6 +944,58 @@ def _build_option_tokens(
     )
 
 
+def option_groups(
+    opt_type: np.ndarray,
+    opt_src_idx: np.ndarray,
+    opt_tgt_idx: np.ndarray,
+    opt_card_feat: np.ndarray,
+    opt_attack_feat: np.ndarray,
+    opt_scalar: np.ndarray,
+    opt_mask: np.ndarray,
+) -> np.ndarray:
+    """Equivalence classes over option slots: same id == identical model input.
+
+    The pointer head reads exactly ``opt_type``, the gathered rows named by
+    ``opt_src_idx``/``opt_tgt_idx``, ``opt_card_feat``, ``opt_attack_feat`` and
+    ``opt_scalar`` (``model/pointer.py:117-130``).  Two options agreeing on all
+    of them produce the same logit by construction, so a label that names one
+    of them and not the other asks for a distinction the network cannot make.
+    Measured on ``train-00000``: 10.0% of options and 15.6% of samples contain
+    such a pair, and 13.9% of samples have a label that splits one.
+
+    Card and attack features are compared **at fp16**, because that is the
+    precision shards store them at (``shard_writer._FP16_KEYS``) and therefore
+    the precision the model actually reads.  Grouping at fp32 would call two
+    options distinct that are byte-identical by the time they reach training.
+
+    Returns ``int64[O_MAX]``: ``0..G-1`` in first-appearance order for valid
+    slots, ``-1`` for masked slots (so a padded slot never matches anything).
+    """
+    groups = np.full(O_MAX, -1, dtype=np.int64)
+    valid = np.flatnonzero(opt_mask)
+    if valid.size == 0:
+        return groups
+
+    ints = np.stack(
+        [opt_type[valid], opt_src_idx[valid], opt_tgt_idx[valid]], axis=1
+    ).astype(np.int64)
+    feats = np.concatenate(
+        [
+            opt_card_feat[valid].astype(np.float16),
+            opt_attack_feat[valid].astype(np.float16),
+        ],
+        axis=1,
+    )
+    scal = opt_scalar[valid].astype(np.float32)
+
+    lookup: dict[tuple[bytes, bytes, bytes], int] = {}
+    for pos, slot in enumerate(valid):
+        key = (ints[pos].tobytes(), feats[pos].tobytes(), scal[pos].tobytes())
+        gid = lookup.setdefault(key, len(lookup))
+        groups[slot] = gid
+    return groups
+
+
 def _build_label(
     action: list[int],
     select: dict,
@@ -1211,6 +1263,12 @@ def featurize(
     # about therefore gets its real features, in-vocab or not.
     _cfeat = lambda ids: _ids_to_feat(ids, engine_card_features, F_CARD, None)
     _afeat = lambda ids: _ids_to_feat(ids, engine_attack_features, F_ATK, None)
+    opt_card_feat = _cfeat(opt_card_id)
+    opt_attack_feat = _afeat(opt_attack_idx)
+    opt_group = option_groups(
+        opt_type, opt_src_idx, opt_tgt_idx,
+        opt_card_feat, opt_attack_feat, opt_scalar, opt_mask,
+    )
     result = {
         # State — card features (float32, not int64 ids)
         "poke_card_feat": poke_card_feat,
@@ -1236,10 +1294,11 @@ def featurize(
         "opt_type": opt_type,
         "opt_src_idx": opt_src_idx,
         "opt_tgt_idx": opt_tgt_idx,
-        "opt_card_feat": _cfeat(opt_card_id),
-        "opt_attack_feat": _afeat(opt_attack_idx),
+        "opt_card_feat": opt_card_feat,
+        "opt_attack_feat": opt_attack_feat,
         "opt_scalar": opt_scalar,
         "opt_mask": opt_mask,
+        "opt_group": opt_group,
         # Labels & bookkeeping
         "action_idx": action_idx,
         "action_len": action_len,

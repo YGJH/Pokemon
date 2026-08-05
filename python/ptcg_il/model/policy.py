@@ -352,6 +352,7 @@ def multiselect_ce(
     policy: Policy,
     x: dict[str, torch.Tensor],
     label_smoothing: float = 0.05,
+    group_marginal: bool = True,
 ) -> torch.Tensor:
     """Teacher-forced cross-entropy for multi-select decisions (Appendix B.7).
 
@@ -397,7 +398,10 @@ def multiselect_ce(
     total_ce = torch.zeros(B, device=device)
 
     # Lazy import to avoid circular dependency with train.loop
-    from ptcg_il.train.loop import masked_label_smoothed_ce
+    from ptcg_il.train.loop import masked_label_smoothed_ce, target_group_mask
+
+    opt_group = x.get("opt_group")
+    use_groups = group_marginal and opt_group is not None
 
     for t in range(batch_max):
         logits, o = policy.pointer(
@@ -429,10 +433,17 @@ def multiselect_ce(
 
         if valid.any():
             valid_idx = torch.where(valid)[0]
+            tgt = target[valid_idx].clamp(min=0)
+            # Intersect with step_mask, not opt_mask: a group member already
+            # picked this step is no longer an alternative to the target.
+            tg = (
+                target_group_mask(opt_group[valid_idx], tgt, step_mask[valid_idx])
+                if use_groups else None
+            )
             ce = masked_label_smoothed_ce(
-                logits[valid_idx], target[valid_idx].clamp(min=0),
-                step_mask[valid_idx],
+                logits[valid_idx], tgt, step_mask[valid_idx],
                 label_smoothing=label_smoothing,
+                target_group=tg,
             )
             total_ce[valid_idx] = total_ce[valid_idx] + ce
 

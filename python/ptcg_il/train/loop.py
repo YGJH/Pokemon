@@ -79,6 +79,7 @@ def masked_label_smoothed_ce(
     targets: torch.Tensor,
     mask: torch.Tensor,
     label_smoothing: float = 0.05,
+    target_group: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy with label smoothing that respects an option mask.
 
@@ -96,6 +97,14 @@ def masked_label_smoothed_ce(
     mask : bool Tensor[B, O]
         ``True`` = valid option.
     label_smoothing : float
+    target_group : bool Tensor[B, O] or None
+        When given, the NLL is taken over the *summed* probability of the
+        target's equivalence class instead of the target alone.  Options in a
+        class are byte-identical inputs to the pointer head, so a plain CE asks
+        the model to rank one above the others using information it does not
+        have; on this corpus that is 13.9% of samples.  Each row must have at
+        least one True (the target itself) or the logsumexp underflows to -inf.
+        None reproduces the ungrouped behaviour exactly.
 
     Returns
     -------
@@ -107,7 +116,12 @@ def masked_label_smoothed_ce(
     log_probs = F.log_softmax(logits_inf, dim=-1)  # [B, O]; -inf at padded slots
 
     # NLL
-    nll = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)  # [B]
+    if target_group is None:
+        nll = -log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+    else:
+        nll = -torch.logsumexp(
+            log_probs.masked_fill(~target_group, float("-inf")), dim=-1
+        )
 
     if label_smoothing > 0:
         n_valid = mask.sum(dim=-1).float().clamp(min=1)  # [B]
@@ -120,6 +134,20 @@ def masked_label_smoothed_ce(
         ce = nll
 
     return ce
+
+
+def target_group_mask(
+    opt_group: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """[B, O] bool marking options indistinguishable from each row's target.
+
+    ``opt_group`` is -1 on padded slots, so those never join a group.  The
+    target's own slot is always included because it is valid by construction.
+    """
+    g = opt_group.gather(1, targets.unsqueeze(1))          # [B, 1]
+    return (opt_group == g) & mask & (opt_group >= 0)
 
 
 def create_optimizer(
@@ -281,6 +309,7 @@ def _compute_loss(
     label_smoothing: float = LABEL_SMOOTH,
     use_amp: bool = True,
     belief_weights: dict[str, float] | None = None,
+    group_marginal: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
     """Forward pass + loss only (no backward, no optimizer step).
 
@@ -325,24 +354,33 @@ def _compute_loss(
         has_target = batch["action_idx"][:, 0] >= 0
         single_ok = single & has_target
 
+        opt_group = batch.get("opt_group")
+        use_groups = group_marginal and opt_group is not None
+
         if single.all() and bool(has_target.all()):
+            tgt = batch["action_idx"][:, 0]
             ce = masked_label_smoothed_ce(
-                logits,
-                batch["action_idx"][:, 0],
-                batch["opt_mask"],
+                logits, tgt, batch["opt_mask"],
                 label_smoothing=label_smoothing,
+                target_group=(
+                    target_group_mask(opt_group, tgt, batch["opt_mask"])
+                    if use_groups else None
+                ),
             )
         else:
             ce = logits.new_zeros(logits.shape[0])
             if single_ok.any():
                 s_idx = torch.where(single_ok)[0]
+                tgt = batch["action_idx"][s_idx, 0]
                 ce = ce.index_put(
                     (s_idx,),
                     masked_label_smoothed_ce(
-                        logits[s_idx],
-                        batch["action_idx"][s_idx, 0],
-                        batch["opt_mask"][s_idx],
+                        logits[s_idx], tgt, batch["opt_mask"][s_idx],
                         label_smoothing=label_smoothing,
+                        target_group=(
+                            target_group_mask(opt_group[s_idx], tgt, batch["opt_mask"][s_idx])
+                            if use_groups else None
+                        ),
                     ),
                 )
             m_idx = torch.where(~single)[0]
@@ -357,7 +395,11 @@ def _compute_loss(
                 }
                 ce = ce.index_put(
                     (m_idx,),
-                    multiselect_ce(policy, sub, label_smoothing=label_smoothing),
+                    multiselect_ce(
+                        policy, sub,
+                        label_smoothing=label_smoothing,
+                        group_marginal=group_marginal,
+                    ),
                 )
 
         loss = (batch["sample_weight"] * ce).mean()
@@ -389,6 +431,7 @@ def train_step(
     label_smoothing: float = LABEL_SMOOTH,
     grad_clip: float = GRAD_CLIP,
     belief_weights: dict[str, float] | None = None,
+    group_marginal: bool = True,
 ) -> dict[str, float]:
     """Run one optimizer step on *batch* (C.6).
 
@@ -419,6 +462,7 @@ def train_step(
         policy, batch, lambda_v=lambda_v,
         label_smoothing=label_smoothing, use_amp=use_amp,
         belief_weights=belief_weights,
+        group_marginal=group_marginal,
     )
 
     # Backward
@@ -460,6 +504,7 @@ def train(
     ema_decay: float = EMA_DECAY,
     lambda_v: float = LAMBDA_V,
     belief_weights: dict[str, float] | None = None,
+    group_marginal: bool = True,
     weight_decay: float = WEIGHT_DECAY,
     betas: tuple[float, float] = BETAS,
     total_steps: int | None = None,
@@ -703,6 +748,7 @@ def train(
                 "warmup": warmup,
                 "grad_clip": grad_clip,
                 "label_smoothing": label_smoothing,
+                "group_marginal_ce": group_marginal,
                 "ema_decay": ema_decay,
                 "lambda_v": lambda_v,
                 "weight_decay": weight_decay,
@@ -751,6 +797,7 @@ def train(
             label_smoothing=label_smoothing,
             use_amp=use_amp,
             belief_weights=belief_weights,
+            group_marginal=group_marginal,
         )
 
         # Scale loss for gradient accumulation

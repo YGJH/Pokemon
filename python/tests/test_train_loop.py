@@ -101,6 +101,7 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
         "opt_attack_feat": np.zeros((O_MAX, F_ATK), dtype=np.float32),
         "opt_scalar": np.zeros((O_MAX, F_OPT), dtype=np.float32),
         "opt_mask": np.zeros(O_MAX, dtype=bool),
+        "opt_group": np.full(O_MAX, -1, dtype=np.int64),
         # Labels
         "action_idx": np.full(O_MAX, -1, dtype=np.int64),
         "action_len": np.array(1, dtype=np.int64),
@@ -144,6 +145,7 @@ def _configure_sample(
 
     # Options
     s["opt_mask"][:n_options] = True
+    s["opt_group"][:n_options] = 0  # single group containing all valid options
     for i in range(n_options):
         s["opt_type"][i] = 7  # PLAY
         s["opt_src_idx"][i] = 13 + i  # hand slot
@@ -624,3 +626,99 @@ class TestWandbLogger:
     def test_finish_noop(self):
         logger = WandbLogger(mode="disabled")
         logger.finish()
+
+
+# ============================================================
+# Group-marginal CE tests (Task 6)
+# ============================================================
+
+import torch.nn.functional as F
+from ptcg_il.train.loop import masked_label_smoothed_ce, target_group_mask, train as loop_train
+
+
+def test_group_marginal_ce_credits_the_whole_group():
+    """Two identical options splitting the mass must cost log(2) less than one."""
+    logits = torch.tensor([[0.0, 0.0, -20.0]])
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    targets = torch.tensor([0])
+    plain = masked_label_smoothed_ce(logits, targets, mask, label_smoothing=0.0)
+    group = masked_label_smoothed_ce(
+        logits, targets, mask, label_smoothing=0.0,
+        target_group=torch.tensor([[True, True, False]]),
+    )
+    assert torch.allclose(plain - group, torch.tensor([np.log(2.0)], dtype=torch.float32), atol=1e-5)
+
+
+def test_group_marginal_ce_matches_plain_ce_for_singleton_groups():
+    logits = torch.randn(4, 6)
+    mask = torch.ones(4, 6, dtype=torch.bool)
+    targets = torch.tensor([0, 1, 2, 3])
+    singleton = F.one_hot(targets, 6).bool()
+    assert torch.allclose(
+        masked_label_smoothed_ce(logits, targets, mask, target_group=singleton),
+        masked_label_smoothed_ce(logits, targets, mask),
+        atol=1e-6,
+    )
+
+
+def test_group_marginal_ce_gradient_is_finite_with_masked_options():
+    logits = torch.randn(2, 8, requires_grad=True)
+    mask = torch.tensor([[True] * 4 + [False] * 4, [True] * 3 + [False] * 5])
+    targets = torch.tensor([0, 1])
+    tg = torch.zeros(2, 8, dtype=torch.bool); tg[0, :2] = True; tg[1, 1] = True
+    masked_label_smoothed_ce(logits, targets, mask, target_group=tg).sum().backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_target_group_mask_excludes_padding_and_other_groups():
+    opt_group = torch.tensor([[0, 0, 1, -1]])
+    mask = torch.tensor([[True, True, True, False]])
+    tg = target_group_mask(opt_group, torch.tensor([0]), mask)
+    assert tg.tolist() == [[True, True, False, False]]
+
+
+# ============================================================
+# --no-group-marginal-ce flag test (Task 8)
+# ============================================================
+
+
+def test_offline_eval_reports_collision_adjusted_top1():
+    data_dir = _build_tiny_data(num_samples=32)
+    # Merge options 0 and 1 into one group in the val shard so at least one
+    # target sits in a group of size 2 — otherwise collision_share is 0 and
+    # every assertion below passes vacuously.
+    for name in ("train-00000.npz", "val-00000.npz"):
+        d = dict(np.load(data_dir / "shards" / name))
+        d["opt_group"][:, 1] = d["opt_group"][:, 0]
+        np.savez_compressed(data_dir / "shards" / name, **d)
+
+    ds = ShardDataset(data_dir, split="val")
+    loader = DataLoader(ds, batch_size=4, collate_fn=collate_fn)
+    m = offline_eval(_tiny_policy(), loader, torch.device("cpu"), max_batches=2)
+
+    assert "val/top1_micro_collision_adj" in m
+    assert m["val/collision_share"] > 0.0, "fixture has no collisions; test is vacuous"
+    assert m["val/top1_micro_collision_adj"] >= m["val/top1_micro"], (
+        "crediting a group can only ever help"
+    )
+
+
+def test_train_forwards_group_marginal_flag(tmp_path):
+    """train() must forward group_marginal=False to _compute_loss."""
+    import json
+    data_dir = _build_tiny_data(num_samples=8)
+    # train() needs archetypes.json with fixed_deck for build_deck_metadata
+    arch_path = data_dir / "archetypes.json"
+    arch_path.write_text(json.dumps({
+        "archetypes": [
+            {"id": 0, "representative": [7]*60, "members": 10, "decklist": [7]*60},
+        ],
+        "fixed_deck": [7]*60,
+        "lineage": {"seeded": False, "generation": 0},
+    }))
+    policy = _tiny_policy()
+    loop_train(
+        policy, data_dir=data_dir, save_dir=tmp_path / "ckpt",
+        batch_size=4, total_steps=1, val_every=10_000, run_val=False,
+        group_marginal=False, archetype_self=0,
+    )
