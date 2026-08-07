@@ -738,16 +738,27 @@ class TestBuildShards:
         shards_dir = out_dir / "shards"
         for shard_file in sorted(shards_dir.glob("*.npz")):
             data = np.load(shard_file)
-            # Check essential keys are present
+            # Check essential keys are present.  Card features are *not* among
+            # them: they are a gather from a frozen static table, so the shard
+            # stores the ids and ShardDataset rebuilds the features on read.
             essential_keys = {
-                "poke_card_feat", "hand_card_feat", "opt_card_feat",
-                "log_card_feat", "cls_feat", "opt_type",
+                "poke_card_id", "hand_card_id", "opt_card_id",
+                "log_feat", "cls_feat", "opt_type",
                 "opt_src_idx", "action_idx", "action_len", "sel_type", "sel_ctx",
                 "value_target", "tok_mask", "opt_mask",
             }
             file_keys = set(data.keys())
             missing = essential_keys - file_keys
             assert not missing, f"Shard {shard_file.name} missing keys: {missing}"
+
+            # The regression this format change fixes: materialised card
+            # features made a 50k-sample shard 6.2 GB decompressed, and the
+            # train split's mmap cache 47 GB against 30 GB of RAM.
+            stored_feats = {k for k in file_keys if k.endswith("_card_feat")}
+            assert not stored_feats, (
+                f"Shard {shard_file.name} stores materialised card features: "
+                f"{stored_feats}"
+            )
 
             # All arrays should have batch dim = number of samples in shard
             n_samples = data["action_len"].shape[0]

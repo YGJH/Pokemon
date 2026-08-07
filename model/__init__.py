@@ -20,5 +20,5 @@ def MLP(
     )
 
 
-from model.cards import CardEncoder, AttackEncoder  # noqa: E402
+from model.cards import CardFeaturizer, AttackFeaturizer  # noqa: E402
 from model.policy import Policy, select_multi  # noqa: E402

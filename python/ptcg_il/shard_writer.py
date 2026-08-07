@@ -25,7 +25,7 @@ from ptcg_il.belief_labels import (
     hand_after,
     opp_hand_timeline,
 )
-from ptcg_il.featurizer import featurize, normalize_vocab
+from ptcg_il.featurizer import CARD_FEAT_SOURCES, featurize, normalize_vocab
 from ptcg_mine.archetype import Archetype, assign_archetype
 from ptcg_mine.config import MineConfig
 from ptcg_mine.episode import (
@@ -258,16 +258,29 @@ def _scan_projections(paths: list[Path], counts: dict, jobs: int | None):
             counts["n_invalid"] = counts.get("n_invalid", 0) + 1
 
 
-#: Keys stored as float16.  These are ~90% of a shard's uncompressed bytes
-#: (1937.9 MB of 2158.85 MB at F_CARD=94, measured on data/shards/test-00000.npz).
-#: Every value in them is a one-hot, a small count, or a fixed-divisor ratio
-#: — two orders of margin from fp16 precision.  The read path calls .float()
-#: on every non-int, non-bool key already, so no read-side change is needed.
-_FP16_KEYS = frozenset({
-    "poke_card_feat", "hand_card_feat", "stadium_card_feat",
-    "context_card_feat", "effect_card_feat", "discard_card_feat",
-    "prize_card_feat", "opt_card_feat", "opt_attack_feat", "log_card_feat",
-})
+#: Keys stored as float16 — currently none.
+#:
+#: The ``*_card_feat`` keys used to live here and were ~90% of a shard's
+#: uncompressed bytes; they are no longer stored at all (see _DERIVED_KEYS), so
+#: there is nothing left that halving would meaningfully shrink.  ``opt_scalar``
+#: is the largest remaining float tensor and deliberately stays fp32:
+#: ``option_groups`` compares it at fp32 to decide ``opt_group``, and storing it
+#: at a different precision than the grouping saw would split or merge options
+#: the label then disagrees with.
+#:
+#: Index arrays must never be added here — see _INT32_KEYS for those.
+_FP16_KEYS: frozenset[str] = frozenset()
+
+#: Feature tensors the writer drops: each is a gather from a frozen static
+#: table, reproduced by ``ShardDataset`` from an id that costs ~200x less to
+#: store.  Dropping them here rather than in ``_write_shard`` also keeps them
+#: out of the shard buffer, which holds ``samples_per_shard`` samples in RAM —
+#: at 50k samples these keys alone were ~5.8 GB of the writer's own footprint.
+_DERIVED_KEYS = frozenset(CARD_FEAT_SOURCES) | {"log_card_feat"}
+
+#: Card/attack ids are small non-negative integers; int64 doubles them for no
+#: reason.  int32 is still 6 orders of margin over the largest engine id.
+_INT32_KEYS = frozenset(id_key for id_key, _ in CARD_FEAT_SOURCES.values())
 
 
 def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) -> Path:
@@ -286,6 +299,8 @@ def _write_shard(split: str, shard_idx: int, buffer: list[dict], out_dir: Path) 
         stacked_k = np.stack(arrays, axis=0)
         if k in _FP16_KEYS:
             stacked_k = stacked_k.astype(np.float16)
+        elif k in _INT32_KEYS:
+            stacked_k = stacked_k.astype(np.int32)
         stacked[k] = stacked_k
     np.savez_compressed(path, **stacked)
     return path
@@ -563,6 +578,13 @@ def build_shards(
             # sample_weight is NOT written into shards (spec D.4);
             # it is derived from meta.parquet columns at training time (C.3).
             sample.pop("sample_weight", None)
+
+            # Nor are the *_card_feat tensors: ShardDataset re-gathers them
+            # from the ids that stay behind.  featurize still computes them —
+            # option_groups needs opt_card_feat/opt_attack_feat to decide
+            # opt_group, which *is* stored.
+            for key in _DERIVED_KEYS:
+                sample.pop(key, None)
 
             buf = buffers[split]
             row_in_shard = len(buf) % samples_per_shard

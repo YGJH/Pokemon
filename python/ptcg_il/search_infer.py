@@ -466,7 +466,7 @@ def _greedy_action(
 ) -> dict:
     """Fallback: greedy single/multi-select without MCTS."""
     from model.featurizer import featurize
-    from model.policy import select_multi
+    from model.policy import decode_single_select, select_multi
 
     feats = featurize(obs_dict, vocab,
                       engine_card_features=_engine_card_features,
@@ -477,11 +477,21 @@ def _greedy_action(
     with _no_grad():
         if max_count == 1:
             logits, _value, _hist = policy(batch)
-            logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-            indices = [int(logits.argmax(dim=-1)[0].item())]
+            # STOP means decline; its column sits past the real options, so
+            # returning it would be engine error 5 rather than "take nothing".
+            indices = decode_single_select(
+                logits, batch["opt_mask"], batch.get("stop_column"),
+            )
         else:
             chosen = select_multi(policy, batch)
-            indices = [int(p) for p in chosen[0].tolist() if p >= 0]
+            # Truncate at the first STOP rather than filtering it out — picks
+            # after it come from a stale mask and a stale msgru.
+            indices = []
+            for p in chosen[0].tolist():
+                if p == -2:
+                    break
+                if p >= 0:
+                    indices.append(int(p))
             indices = indices[:max_count]
 
     return {"indices": indices, "visit_counts": [], "root_value": None}

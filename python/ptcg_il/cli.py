@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULTS = {
     # Model
     "d_model": 256,
-    "layers": 6,
+    "layers": 4,
     "heads": 8,
     "ff": 1024,
     "dropout": 0.1,

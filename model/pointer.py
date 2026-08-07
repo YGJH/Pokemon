@@ -10,11 +10,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model import MLP
-from model.cards import AttackEncoder, CardEncoder
+from model.cards import AttackFeaturizer, CardFeaturizer
 
 L_STATE = 46
 O_MAX = 64
-F_OPT = 6
+from model.featurizer import F_OPT
 
 
 class PointerHead(nn.Module):
@@ -35,17 +35,11 @@ class PointerHead(nn.Module):
         Prebuilt table for AttackEncoder.
     """
 
-    def __init__(
-        self,
-        A: int,
-        D: int = 256,
-        heads: int = 8,
-        attack_static_table: torch.Tensor | None = None,
-    ):
+    def __init__(self, D: int = 256, heads: int = 8):
         super().__init__()
         self.opt_type_emb = nn.Embedding(18, D)  # OptionType 0..16 + STOP=17
-        self.card: CardEncoder | None = None      # bound externally by Policy
-        self.attack = AttackEncoder(A, D, attack_static_table)
+        self.card: CardFeaturizer | None = None   # bound externally by Policy
+        self.attack = AttackFeaturizer(D)
         self.null_token = nn.Parameter(torch.zeros(D))
         self.msgru = nn.GRUCell(D, D)             # multi-select memory
         self.opt_in = nn.Linear(D + F_OPT, D)
@@ -53,6 +47,9 @@ class PointerHead(nn.Module):
         self.ln_q = nn.LayerNorm(D)
         self.ln_o = nn.LayerNorm(D)
         self.ffn = MLP(D, 4 * D, D)
+        # Normalises the residual stream on the way *out*, before scoring.  See
+        # the note in ``forward`` -- without it the logit scale is unbounded.
+        self.ln_out = nn.LayerNorm(D)
         self.score = nn.Linear(D, 1)
 
     def gather(self, h_aug: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -79,7 +76,7 @@ class PointerHead(nn.Module):
         self,
         h: torch.Tensor,
         tok_mask: torch.Tensor,
-        card_enc: CardEncoder,
+        card_enc: CardFeaturizer,
         x: dict[str, torch.Tensor],
         msgru_h: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -91,12 +88,12 @@ class PointerHead(nn.Module):
             Encoded state tokens from Encoder.
         tok_mask : bool Tensor[B, L]
             True = real state token.
-        card_enc : CardEncoder
-            Shared card encoder (for opt_card_id embedding).
+        card_enc : CardFeaturizer
+            Shared card featurizer (for opt_card_feat embedding).
         x : dict
             Option tensors: opt_type [B,O], opt_src_idx [B,O], opt_tgt_idx [B,O],
-            opt_card_id [B,O], opt_attack_idx [B,O], opt_scalar [B,O,F_OPT],
-            opt_mask bool [B,O].
+            opt_card_feat [B,O,F_CARD], opt_attack_feat [B,O,F_ATK],
+            opt_scalar [B,O,F_OPT], opt_mask bool [B,O].
         msgru_h : Tensor[B, D] or None
             Multi-select GRU hidden state.  When None (single-select),
             no extra context is added.
@@ -121,8 +118,8 @@ class PointerHead(nn.Module):
             self.opt_type_emb(x["opt_type"])
             + src
             + tgt
-            + card_enc(x["opt_card_id"])
-            + self.attack(x["opt_attack_idx"])
+            + card_enc(x["opt_card_feat"])
+            + self.attack(x["opt_attack_feat"])
         )  # [B, O, D]
 
         if msgru_h is not None:
@@ -137,7 +134,17 @@ class PointerHead(nn.Module):
         o = self.ln_o(q + a)
         o = o + self.ffn(o)                                               # [B, O, D]
 
-        # Score
+        # Score.  ``o`` is a residual sum, so its scale is whatever ``ffn`` has
+        # drifted to -- and ``score`` is a bare Linear, so the logits inherit
+        # that drift directly.  Left unnormalised this diverges: over 80k steps
+        # on archetype 0, ``ffn.3.weight`` grew 21.9 -> 243.5 and ``score.weight``
+        # 0.27 -> 10.1, the softmax saturated, and val top-1 fell 0.698 -> 0.601
+        # while training CE read in the thousands.  Grad clipping does not help
+        # -- it bounds the update norm, not the direction, and the growth is
+        # monotone from step 20k.  The encoder solved the same problem with a
+        # final ``nn.LayerNorm`` (see encoder.py); its weight norm moved 1.00x
+        # over the same run.  This is that norm, for the pointer.
+        o = self.ln_out(o)                                                # [B, O, D]
         logits = self.score(o).squeeze(-1)                                # [B, O]
         logits = logits.masked_fill(~x["opt_mask"], -1e9)
 

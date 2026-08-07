@@ -73,7 +73,11 @@ uv run python -m ptcg_il.cli train --eval-only --data-dir data \
 # add --live-eval for head-to-head vs the best single member (ship rule: Wilson LB > 50%)
 
 4. Package:
-./scripts/build_submit.sh --ensemble "checkpoints_a1_s*/ckpt-best.pt"
+./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s*/ckpt-best.pt"
+
+./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s[0-6]/ckpt-best.pt"
+
+
 Ensemble mode is implicitly --no-mcts (greedy only) and produces submission-greedy-ens3.tar.gz with model_0.pt…model_2.pt + ensemble.json.
 
 Two constraints worth knowing: all members must share the same decklist (a mismatch raises — different vocab/archetype SHAs only warn), and different architectures per member are allowed since the encode path is per-member.

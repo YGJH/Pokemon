@@ -2,6 +2,18 @@
 
 ``nn.TransformerEncoder`` with pre-norm (norm_first=True), GELU, batch_first.
 Token count is small (~46) so no packing tricks.
+
+A pre-norm stack normalizes *into* each sublayer but never on the way out, so
+the residual stream leaves the last layer un-normalized and its scale grows
+with depth.  Measured on ``checkpoints_a0/ckpt-best.pt`` over 256 real samples,
+per-element RMS runs 0.13 (embedder) → 0.43 → 0.77 → 1.22 → 1.49 across the
+four layers, against the 1.0 a final norm would give.  The consumers care to
+different degrees: the CLS row is re-derived by ``Policy.history_gru`` and
+arrives tanh-bounded either way, but ``PointerHead`` cross-attends into these
+rows as unnormalized keys/values and adds gathered rows straight into its
+additive base, so their scale sets attention sharpness.  1.49 is mild at four
+layers -- this is hygiene, not a repair -- but it costs one LayerNorm and stops
+the drift from compounding if ``layers`` is ever raised.
 """
 
 import torch
@@ -44,7 +56,9 @@ class Encoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.enc = nn.TransformerEncoder(layer, num_layers=layers)
+        self.enc = nn.TransformerEncoder(
+            layer, num_layers=layers, norm=nn.LayerNorm(D),
+        )
 
     def forward(
         self, rows: torch.Tensor, tok_mask: torch.Tensor

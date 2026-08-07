@@ -38,6 +38,14 @@ P_MAX = 12
 H_MAX = 30
 D_MAX = 60
 PZ_MAX = 6
+#: Attached-card capacities per Pokémon slot.  Both are taken from the divisors
+#: the featurizer already applies to the corresponding counts, rather than
+#: invented: ``poke_feat[17]`` normalises ``len(tools)`` by 2.0 and
+#: ``poke_feat[16]`` normalises ``len(energyCards)`` by ``ENERGY_N``.  Measured
+#: maxima over 50 906 Pokémon-observations are 1 and 5, so both caps have
+#: headroom; overflow truncates, exactly as ``bench`` already does at 5.
+T_MAX = 2
+E_MAX = 12
 SUM = 2
 STAD = 1
 CLS = 1
@@ -343,19 +351,44 @@ def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
     return min(dmg / tgt_hp, 2.0)
 
 
+def _attached_ids(cards, capacity: int) -> np.ndarray:
+    """Engine card ids of an attached-card list, PAD-padded to *capacity*.
+
+    ``tools`` and ``energyCards`` are both ``[Card]`` on a Pokémon, and the
+    featurizer used to keep only their lengths (``poke_feat[17]`` /
+    ``poke_feat[16]``).  A count cannot distinguish a defensive Tool from an
+    offensive one, nor a Special Energy from a basic of the same type — the
+    energy *type* histogram covers the latter only for basics.
+    """
+    out = np.full(capacity, PAD_CARD, dtype=np.int64)
+    for i, card in enumerate(cards or []):
+        if i >= capacity:
+            break
+        if isinstance(card, dict):
+            out[i] = _raw_card(card.get("id"))
+    return out
+
+
 def _build_poke_tokens(
     state: dict, your_index: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build poke_card_id[P_MAX] int64 and poke_feat[P_MAX, F_POKE] float32.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the per-Pokémon-slot tensors.
+
+    Returns ``(poke_card_id[P_MAX], poke_feat[P_MAX, F_POKE],
+    poke_tool_ids[P_MAX, T_MAX], poke_energy_ids[P_MAX, E_MAX])``.
 
     ``poke_card_id`` holds raw **engine** card ids (0 = empty slot); ``featurize``
-    turns them into ``poke_card_feat``.  They are not vocab indices.
+    turns them into ``poke_card_feat``.  They are not vocab indices.  The two
+    attachment arrays work the same way and become ``poke_tool_feat`` /
+    ``poke_energy_feat``.
 
     Slot layout (A.1): 0=my_active, 1..5=my_bench[0..4],
     6=opp_active, 7..11=opp_bench[0..4].
     """
     poke_card_id = np.full(P_MAX, PAD_CARD, dtype=np.int64)
     poke_feat = np.zeros((P_MAX, F_POKE), dtype=np.float32)
+    poke_tool_ids = np.full((P_MAX, T_MAX), PAD_CARD, dtype=np.int64)
+    poke_energy_ids = np.full((P_MAX, E_MAX), PAD_CARD, dtype=np.int64)
 
     for pi, player_idx in enumerate([your_index, 1 - your_index]):
         player = state["players"][player_idx]
@@ -368,6 +401,8 @@ def _build_poke_tokens(
             poke = active_list[0]
             row = base_row
             poke_card_id[row] = _raw_card(poke["id"])
+            poke_tool_ids[row] = _attached_ids(poke.get("tools"), T_MAX)
+            poke_energy_ids[row] = _attached_ids(poke.get("energyCards"), E_MAX)
             f = poke_feat[row]
             f[0] = _clip_norm(poke["hp"], HP_N)
             f[1] = _clip_norm(poke["maxHp"], HP_N)
@@ -393,6 +428,8 @@ def _build_poke_tokens(
                 break
             row = base_row + 1 + i
             poke_card_id[row] = _raw_card(poke["id"])
+            poke_tool_ids[row] = _attached_ids(poke.get("tools"), T_MAX)
+            poke_energy_ids[row] = _attached_ids(poke.get("energyCards"), E_MAX)
             f = poke_feat[row]
             f[0] = _clip_norm(poke["hp"], HP_N)
             f[1] = _clip_norm(poke["maxHp"], HP_N)
@@ -406,7 +443,7 @@ def _build_poke_tokens(
             f[20] = 0.0  # is_active = False on bench
             # Condition flags zero on bench (A.5)
 
-    return poke_card_id, poke_feat
+    return poke_card_id, poke_feat, poke_tool_ids, poke_energy_ids
 
 
 def _build_hand_tokens(
@@ -741,11 +778,19 @@ def _build_option_tokens(
     options = select["option"]
     n_total = len(options)
     max_count = int(select.get("maxCount", 1))
+    min_count = int(select.get("minCount", 1))
     is_multi = max_count > 1
+    # A STOP column is what makes "take nothing" expressible.  Multi-select has
+    # always had one; `minCount == 0` needs one just as much even when
+    # `maxCount == 1`, because declining is legal there too -- 11.9% of
+    # single-selects on this corpus, 86% of them deck searches.  Without it the
+    # engine's own "you may" is unrepresentable: the argmax has to name a real
+    # option, and an expert who declined contributes no target at all.
+    wants_stop = is_multi or min_count == 0
 
     # ---- choose which option indices to keep (old → new) ----
-    # For multi-select, reserve one slot for the STOP column
-    max_regular = (O_MAX - 1) if is_multi else O_MAX
+    # Reserve one slot for the STOP column whenever there will be one
+    max_regular = (O_MAX - 1) if wants_stop else O_MAX
 
     if n_total <= max_regular:
         indices_to_keep = list(range(n_total))
@@ -805,12 +850,22 @@ def _build_option_tokens(
 
             Options almost never carry `cardId` (measured 0.01% of the corpus),
             so card identity has to come from the state.  Leaves the entry at
-            PAD when `card_id_at` reports the card is hidden -- deck slots and
-            face-down prizes must stay PAD or we leak.
+            PAD when `card_id_at` reports the card is hidden -- face-down prizes
+            must stay PAD or we leak.
+
+            Deck slots are the one zone the *select* can resolve where the state
+            cannot: during a search the engine hands the acting player their own
+            deck in `select["deck"]` and the options index into it.  Without
+            that payload every option in a search is byte-identical
+            (`type=3, src=-1, tgt=-1, card=PAD, scalar=0`), so `option_groups`
+            merges them all into one class, the group-marginal NLL is exactly
+            `-log(1) = 0`, and 11% of the corpus produces no gradient at all
+            while the agent picks a card it cannot see.
             """
             if state is None or area is None or idx is None:
                 return
-            raw = card_id_at(state, area, player_idx, idx)
+            raw = card_id_at(state, area, player_idx, idx,
+                             select_deck=select.get("deck"))
             if raw is not None:
                 opt_card_id[new_j] = _raw_card(raw)
 
@@ -923,9 +978,9 @@ def _build_option_tokens(
             if cid is not None:
                 opt_card_id[new_j] = _raw_card(cid)
 
-    # ---- STOP column for multi-select ----
+    # ---- STOP column (multi-select, or any select that may be declined) ----
     stop_column = -1
-    if is_multi and n_opts < O_MAX:
+    if wants_stop and n_opts < O_MAX:
         stop_column = n_opts
         opt_type[n_opts] = STOP_OPT_TYPE
         opt_mask[n_opts] = True
@@ -963,10 +1018,14 @@ def option_groups(
     Measured on ``train-00000``: 10.0% of options and 15.6% of samples contain
     such a pair, and 13.9% of samples have a label that splits one.
 
-    Card and attack features are compared **at fp16**, because that is the
-    precision shards store them at (``shard_writer._FP16_KEYS``) and therefore
-    the precision the model actually reads.  Grouping at fp32 would call two
-    options distinct that are byte-identical by the time they reach training.
+    Card and attack features are compared **at fp32**, because that is the
+    precision the model reads: shards store the ids (``CARD_FEAT_SOURCES``) and
+    ``ShardDataset`` re-gathers from the fp32 static table.  They used to be
+    stored materialised at fp16, and grouping had to match that -- comparing at
+    fp32 then would have called two options distinct that were byte-identical
+    by the time they reached training.  Now the reverse holds: comparing at
+    fp16 would merge two options the network *can* tell apart, and a
+    group-marginal CE would stop asking it to.
 
     Returns ``int64[O_MAX]``: ``0..G-1`` in first-appearance order for valid
     slots, ``-1`` for masked slots (so a padded slot never matches anything).
@@ -981,8 +1040,8 @@ def option_groups(
     ).astype(np.int64)
     feats = np.concatenate(
         [
-            opt_card_feat[valid].astype(np.float16),
-            opt_attack_feat[valid].astype(np.float16),
+            opt_card_feat[valid].astype(np.float32),
+            opt_attack_feat[valid].astype(np.float32),
         ],
         axis=1,
     )
@@ -1011,9 +1070,16 @@ def _build_label(
     For multi-select with a STOP column, the STOP target is appended
     after the last expert pick, so the model learns to stop after the
     correct number of selections.
+
+    Single-select is different: it is *one* step, so STOP is the label only when
+    the expert declined outright and is never appended after a pick.  Appending
+    it would make ``action_len == 2`` for a decision that admits one pick, which
+    every ``maxCount == 1`` consumer (``train/loop.py``, ``train/eval.py``,
+    ``meta.parquet``) reads as a multi-select.
     """
     action_idx = np.full(O_MAX, -1, dtype=np.int64)
     max_count = select["maxCount"]
+    is_multi = int(max_count) > 1
 
     n_picks = min(len(action), max_count)
     write_pos = 0
@@ -1028,8 +1094,9 @@ def _build_label(
         action_idx[write_pos] = new_idx
         write_pos += 1
 
-    # Append STOP target for multi-select (after last expert pick)
-    if stop_column >= 0 and write_pos < O_MAX:
+    # Append STOP: after the last pick for multi-select, or *as* the label for a
+    # single-select the expert declined (write_pos == 0 means no pick was made).
+    if stop_column >= 0 and write_pos < O_MAX and (is_multi or write_pos == 0):
         action_idx[write_pos] = stop_column
         write_pos += 1
 
@@ -1144,6 +1211,66 @@ def _ids_to_feat(ids: np.ndarray, engine_features: dict | None,
     return result
 
 
+#: Shard storage contract: ``feat_key -> (id_key, table)``.
+#:
+#: Every one of these is a gather from a frozen static table -- 1.1 MB for
+#: cards, 0.3 MB for attacks -- so storing the *result* per row is pure
+#: redundancy.  It is also the dominant cost: materialised, these keys are 93%
+#: of a shard's decompressed bytes (5.8 GB of 6.2 GB for 50k samples), which
+#: put the train split's mmap cache at 47 GB against 30 GB of RAM.  ``.npz``
+#: hides this on disk because the arrays are ~0.5% nonzero and compress ~240x.
+#:
+#: So the writer stores the id and the reader re-gathers, exactly as the
+#: ``bel_*`` labels are stored sparsely and densified on the way into a batch.
+#: ``log_card_feat`` is absent by design -- ``log_feat[:, 2]`` already carries
+#: its ids, so it needs no key of its own.
+CARD_FEAT_SOURCES: dict[str, tuple[str, str]] = {
+    "poke_card_feat": ("poke_card_id", "card"),
+    "poke_tool_feat": ("poke_tool_ids", "card"),
+    "poke_energy_feat": ("poke_energy_ids", "card"),
+    "hand_card_feat": ("hand_card_id", "card"),
+    "stadium_card_feat": ("stadium_card_id", "card"),
+    "context_card_feat": ("context_card_id", "card"),
+    "effect_card_feat": ("effect_card_id", "card"),
+    "discard_card_feat": ("discard_ids", "card"),
+    "prize_card_feat": ("prize_ids", "card"),
+    "opt_card_feat": ("opt_card_id", "card"),
+    "opt_attack_feat": ("opt_attack_idx", "attack"),
+}
+
+#: ``log_card_feat`` is rebuilt from this column of ``log_feat`` instead.
+LOG_CARD_ID_COLUMN = 2
+
+
+def build_static_table(engine_features: dict | None, feat_dim: int) -> np.ndarray:
+    """Dense ``float32[max_id + 1, feat_dim]`` view of a sparse feature dict.
+
+    Row *i* holds the features of engine id *i*, or zeros when the engine has
+    none -- which is what makes the gather below a drop-in for the
+    ``engine_features.get(id) is None`` branch of ``_ids_to_feat``.
+    """
+    n = (max(engine_features) + 1) if engine_features else 1
+    table = np.zeros((max(n, 1), feat_dim), dtype=np.float32)
+    for cid, feat in (engine_features or {}).items():
+        table[int(cid)] = feat
+    return table
+
+
+def gather_static_feats(ids: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """Vectorised ``_ids_to_feat(ids, ..., index_to_id=None)``.
+
+    Returns ``float32[*ids.shape, feat_dim]``.  PAD (0), negative ids, and ids
+    past the end of *table* all gather zeros, matching the loop's skip
+    conditions -- an out-of-range id must not wrap around to another card's
+    features, which is why the clamp is paired with an explicit re-zero.
+    """
+    ids = np.asarray(ids)
+    valid = (ids > 0) & (ids < table.shape[0])
+    out = table[np.where(valid, ids, 0)]
+    out[~valid] = 0.0
+    return out
+
+
 def featurize(
     obs_dict: dict,
     vocab: dict,
@@ -1204,7 +1331,9 @@ def featurize(
     ref_map = build_ref_map(obs_dict)
 
     # --- State: card identity ---
-    poke_card_id, poke_feat = _build_poke_tokens(state, your_index)
+    poke_card_id, poke_feat, poke_tool_ids, poke_energy_ids = _build_poke_tokens(
+        state, your_index
+    )
     # Hoist the card-feature conversion early — _build_cls_features and
     # _build_option_tokens both need the same array, and the result dict
     # reuses it instead of calling _cfeat(poke_card_id) a second time.
@@ -1272,6 +1401,11 @@ def featurize(
     result = {
         # State — card features (float32, not int64 ids)
         "poke_card_feat": poke_card_feat,
+        # Attached Tools / Energy cards, per Pokémon slot.  Pooled into the
+        # Pokémon token by TokenEmbedder, the same way the discard pile is
+        # pooled into the summary token.
+        "poke_tool_feat": _cfeat(poke_tool_ids),
+        "poke_energy_feat": _cfeat(poke_energy_ids),
         "hand_card_feat": _cfeat(hand_card_id),
         "stadium_card_feat": _cfeat(stadium_card_id),
         "context_card_feat": _cfeat(context_card_id),
@@ -1315,6 +1449,22 @@ def featurize(
         "log_len": log_len,
         # log_feat is per-sample [L_LOG_MAX, LOG_FEAT_DIM]; column 2 is the
         # card vocab index (belief.py does the batched [:, :, 2] equivalent).
-        "log_card_feat": _cfeat(log_feat[:, 2].astype(np.int64)),
+        "log_card_feat": _cfeat(log_feat[:, LOG_CARD_ID_COLUMN].astype(np.int64)),
+        # Raw ids behind every *_card_feat above.  The model never reads these
+        # -- it consumes the features -- but the shard writer stores them
+        # *instead of* the features (see CARD_FEAT_SOURCES) and ShardDataset
+        # re-gathers on read.  diagnose.py reads them too, to report PAD and
+        # UNKNOWN rates that a materialised feature row cannot distinguish.
+        "poke_card_id": poke_card_id,
+        "poke_tool_ids": poke_tool_ids,
+        "poke_energy_ids": poke_energy_ids,
+        "hand_card_id": hand_card_id,
+        "stadium_card_id": stadium_card_id,
+        "context_card_id": context_card_id,
+        "effect_card_id": effect_card_id,
+        "discard_ids": discard_ids,
+        "prize_ids": prize_ids,
+        "opt_card_id": opt_card_id,
+        "opt_attack_idx": opt_attack_idx,
     }
     return result

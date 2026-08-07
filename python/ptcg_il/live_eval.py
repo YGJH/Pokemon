@@ -151,7 +151,7 @@ class PolicyAgent:
     def __call__(self, obs_dict: dict) -> list[int]:
         import torch
         from ptcg_il.featurizer import featurize
-        from ptcg_il.model.policy import select_multi
+        from ptcg_il.model.policy import decode_single_select, select_multi
 
         select = obs_dict.get("select")
         if select is None:
@@ -168,16 +168,24 @@ class PolicyAgent:
         with torch.no_grad():
             if max_count == 1:
                 logits, _value, _hist = self.policy(batch)
-                logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-                chosen = int(logits.argmax(dim=-1)[0].item())
-                return [chosen]
+                # A minCount==0 select carries a STOP column; picking it means
+                # declining, and returning its index would be engine error 5.
+                return decode_single_select(
+                    logits, batch["opt_mask"], batch.get("stop_column"),
+                )
             else:
                 chosen = select_multi(self.policy, batch)  # [1, batch_max]
-                picks = chosen[0].tolist()
-                # Filter STOP (-2) and padding (-1); keep only regular picks
-                picks = [int(p) for p in picks if p >= 0]
-                picks = picks[:max_count]
-                return picks
+                # Truncate at the first STOP (-2) rather than filtering it out:
+                # _select_multi_raw keeps emitting picks for a sample that has
+                # already stopped, with a stale picked_mask and a stale msgru,
+                # so anything after the STOP is not a decision the model made.
+                picks: list[int] = []
+                for p in chosen[0].tolist():
+                    if p == -2:
+                        break
+                    if p >= 0:
+                        picks.append(int(p))
+                return picks[:max_count]
 
     def __setstate__(self, state: dict) -> None:
         """Restore in a worker process: re-assert eval mode and device.

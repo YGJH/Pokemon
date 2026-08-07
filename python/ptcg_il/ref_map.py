@@ -94,7 +94,7 @@ def build_ref_map(observation: dict) -> dict:
     return ref_map
 
 
-def card_id_at(state: dict, area, player_idx, index) -> int | None:
+def card_id_at(state: dict, area, player_idx, index, select_deck=None) -> int | None:
     """Resolve `(area, playerIndex, index)` to a raw engine card id.
 
     Returns ``None`` when the referenced card is **genuinely hidden** or the
@@ -104,9 +104,23 @@ def card_id_at(state: dict, area, player_idx, index) -> int | None:
     live-eval.
 
     Hidden by design:
-      * ``_DECK``  — the observation carries ``deckCount`` only, never the cards.
       * ``_PRIZE`` — ``prize`` is ``[Card | None]``; face-down slots are ``None``.
       * face-down active (``active[0] is None``).
+      * ``_DECK`` — *unless* `select_deck` is supplied; see below.
+
+    **`select_deck` is the search payload, not a peek at the deck.**  The state
+    carries ``deckCount`` and nothing else, so `_DECK` is unresolvable from
+    *state* alone and guessing would leak.  But when an effect makes you search
+    your own deck, the engine puts the searchable cards in ``select["deck"]``
+    and the options index into *that list* — which is how the real game works,
+    and which the live agent receives verbatim in its own observation.  Passing
+    it here is therefore not a leak; refusing it is the leak's mirror image,
+    where the agent is denied information it legitimately has.
+
+    Measured on the corpus: 100% of ``area == _DECK`` option indices fall inside
+    ``select["deck"]``, and 100% of those entries carry the acting player's own
+    ``playerIndex``.  The `playerIndex` guard below keeps it that way — an entry
+    belonging to the other player is not ours to read.
 
     Note the asymmetry with options: state containers key the card id as
     ``card["id"]``, while options (rarely) use ``cardId``.
@@ -118,8 +132,7 @@ def card_id_at(state: dict, area, player_idx, index) -> int | None:
         return None
 
     if area == _DECK:
-        # Not resolvable, and must not be guessed.
-        return None
+        return _deck_card_id(select_deck, player_idx, index)
 
     if area == _STADIUM:
         card = _first(state.get("stadium"))
@@ -149,6 +162,27 @@ def card_id_at(state: dict, area, player_idx, index) -> int | None:
 
     if not isinstance(card, dict):
         return None
+    cid = card.get("id")
+    return int(cid) if isinstance(cid, int) else None
+
+
+def _deck_card_id(select_deck, player_idx, index) -> int | None:
+    """Card id at *index* of a ``select["deck"]`` payload, or None.
+
+    Returns None when there is no payload (the ordinary case — the deck is
+    hidden), when the index is out of range, or when the entry names a player
+    other than the one the option referenced.
+    """
+    card = _at(select_deck, index)
+    if not isinstance(card, dict):
+        return None
+    owner = card.get("playerIndex")
+    if owner is not None and player_idx is not None:
+        try:
+            if int(owner) != int(player_idx):
+                return None
+        except (TypeError, ValueError):
+            return None
     cid = card.get("id")
     return int(cid) if isinstance(cid, int) else None
 

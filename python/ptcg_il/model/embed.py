@@ -84,7 +84,21 @@ class TokenEmbedder(nn.Module):
         rows[:, 0] = cls_tok
 
         # --- Pokemon tokens (rows 1..12) ---
+        # Attached Tools and Energy cards are pooled in the same mask-aware way
+        # the discard pile is pooled below.  Without them a Pokemon token knows
+        # only *how many* cards are attached (poke_feat[16]/[17]), so a
+        # defensive Tool and an offensive one are the same token, and a Special
+        # Energy is indistinguishable from a basic of the same type.
         poke_emb = self.poke_mlp(x["poke_feat"]) + self.card(x["poke_card_feat"])  # [B, P_MAX, D]
+        for key in ("poke_tool_feat", "poke_energy_feat"):
+            feat = x.get(key)
+            if feat is None:      # shards written before attachments were kept
+                continue
+            emb = self.card(feat)                                       # [B,P,N,D]
+            # All-zero rows are PAD (no such attachment, or a card the engine
+            # has no features for) — the same sentinel the prize pooling reads.
+            mask = (feat.abs().sum(-1) > 0).to(emb.dtype).unsqueeze(-1)  # [B,P,N,1]
+            poke_emb = poke_emb + (emb * mask).sum(dim=2)                # [B,P,D]
         rows[:, 1:13] = poke_emb
 
         # --- Hand tokens (rows 13..42) ---

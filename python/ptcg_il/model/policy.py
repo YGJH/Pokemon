@@ -26,8 +26,15 @@ logger = logging.getLogger(__name__)
 #: the featurizer silently redefines what a checkpoint's weights mean.  Recorded
 #: in ``Policy.config`` and checked by :func:`policy_from_config`, for the same
 #: reason ``ptcg_il.deck`` pins ``vocab_sha1``/``archetypes_sha1``.
+#: ``T_MAX``/``E_MAX`` are here for a different reason than the ``F_*`` widths:
+#: they change no layer shape, because attached cards are pooled through the
+#: *shared* CardFeaturizer (``embed.py``) and add no parameters.  A checkpoint
+#: trained before attachments were kept would therefore load **silently** into a
+#: policy whose Pokémon tokens now carry Tool and Energy embeddings it never
+#: saw.  Recording them here converts that into a refusal.
 FEATURE_DIM_KEYS: tuple[str, ...] = (
     "F_CARD", "F_ATK", "F_POKE", "F_HAND", "F_SUM", "F_GLOBAL", "F_OPT",
+    "T_MAX", "E_MAX",
 )
 
 
@@ -459,6 +466,38 @@ def multiselect_ce(
                 picked_mask[reg_idx, target[reg_idx]] = False
 
     return total_ce
+
+
+def decode_single_select(
+    logits: torch.Tensor,
+    opt_mask: torch.Tensor,
+    stop_column: torch.Tensor | int | None = None,
+) -> list[int]:
+    """Greedy decode of a batch-of-one single-select into engine indices.
+
+    Returns ``[]`` when the argmax lands on the STOP column — the engine reads
+    the returned list as indices into ``select["option"]``, and the STOP column
+    sits one past the real options, so returning it would raise engine error 5
+    (index out of range) rather than declining.  ``minCount == 0`` decisions are
+    exactly the ones that now carry a STOP column (see
+    ``featurizer._build_option_tokens``), and declining is the whole point of
+    them.
+
+    Masked options are never chosen: they are forced to ``-1e9`` first, so a
+    padded slot cannot win the argmax even if the head scores it highly.
+    """
+    logits = logits.masked_fill(~opt_mask, -1e9)
+    chosen = int(logits.argmax(dim=-1)[0].item())
+
+    if stop_column is not None:
+        stop = (
+            int(stop_column[0].item())
+            if isinstance(stop_column, torch.Tensor) and stop_column.dim() > 0
+            else int(stop_column)
+        )
+        if stop >= 0 and chosen == stop:
+            return []
+    return [chosen]
 
 
 def _select_multi_raw(

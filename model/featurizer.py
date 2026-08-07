@@ -49,13 +49,30 @@ LOG_FEAT_DIM = 6 # log_type, player_rel, card_id, area_from, area_to, scalar
 # ============================================================
 # Feature dims (A.1)
 # ============================================================
-F_CARD = 52
-F_ATK = 14
+F_CARD = 212  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 43
+F_ATK = 43    # 14 numeric + 29 attack keywords
 F_POKE = 26
-F_HAND = 2
+F_HAND = 7
 F_SUM = 11
-F_GLOBAL = 93
-F_OPT = 6
+F_GLOBAL = 97
+F_OPT = 8
+
+# Columns 9:12 of a card static row are (basic, stage1, stage2) — see
+# ``ptcg_mine.cards.card_static_row``.  Named here rather than written as a
+# literal at each use because the MCTS determinizer reads it to decide which
+# cards can legally be a face-down active: pointing at column 10 instead yields
+# a plausible non-empty set that the engine then refuses one search root at a
+# time.  ``search_infer`` ships standalone in the submission bundle and cannot
+# import ``ptcg_rl``, so this module is the one place both sides can share.
+CARD_FEAT_BASIC_COL = 9
+
+#: ``card_static_row[2:9]`` is the cardType one-hot (see ptcg_mine.cards).
+CARD_FEAT_CARDTYPE_START = 2
+CARD_TYPE_ITEM = 1
+CARD_TYPE_SUPPORTER = 3
+CARD_TYPE_STADIUM = 4
+CARD_TYPE_BASIC_ENERGY = 5
+CARD_TYPE_SPECIAL_ENERGY = 6
 
 # ============================================================
 # Enum sizes (A.1)
@@ -106,18 +123,56 @@ def normalize_vocab(vocab: dict) -> dict:
 # ============================================================
 
 
-def _remap_card(card_id, id_to_index: dict) -> int:
-    """Remap a real card id to a vocab index.  None → PAD, OOV → UNKNOWN."""
+def _raw_card(card_id) -> int:
+    """Pass an engine card id straight through; ``None`` → PAD.
+
+    Card identity reaches the model as static features looked up by **engine
+    card id**, not as a vocab index.  Going via the vocab is what used to
+    destroy out-of-vocab cards: ``id_to_index.get(id, UNKNOWN_CARD)`` mapped
+    every unseen card to index 1, and index 1 dereferences to the string
+    ``"UNKNOWN"``, which has no engine features — so the card arrived as an
+    all-zero row, indistinguishable from an empty slot.  ``engine_card_features``
+    covers all 1267 engine cards against a ~294-card vocab, so 973 of them were
+    unrepresentable.  That never fires on the training corpus (vocab is built
+    ``all_corpus``) and only shows up in live play.
+
+    PAD stays 0 and no real engine card id is 0, so mask logic keyed on
+    ``== PAD_CARD`` is unaffected.
+    """
     if card_id is None:
         return PAD_CARD
-    return int(id_to_index.get(card_id, UNKNOWN_CARD))
+    return int(card_id)
 
 
-def _remap_attack(attack_id, attack_id_to_index: dict) -> int:
-    """Remap a real attack id to a vocab index.  None → PAD_ATTACK."""
+def _raw_attack(attack_id) -> int:
+    """Pass an engine attack id straight through; ``None`` → PAD_ATTACK.
+
+    Same reasoning as :func:`_raw_card` — 1341 of 1556 engine attacks sit
+    outside the mined attack vocab and used to collapse to PAD_ATTACK.
+    """
     if attack_id is None:
         return PAD_ATTACK
-    return int(attack_id_to_index.get(attack_id, PAD_ATTACK))
+    return int(attack_id)
+
+
+def _card_feat(card_id, engine_features: dict | None) -> np.ndarray:
+    """Return [F_CARD] static features for *card_id*, or zeros if unknown/None."""
+    if engine_features is None or card_id is None:
+        return np.zeros(F_CARD, dtype=np.float32)
+    feat = engine_features.get(card_id)
+    if feat is not None:
+        return np.asarray(feat, dtype=np.float32)
+    return np.zeros(F_CARD, dtype=np.float32)
+
+
+def _attack_feat(attack_id, engine_features: dict | None) -> np.ndarray:
+    """Return [14] static features for *attack_id*, or zeros if unknown/None."""
+    if engine_features is None or attack_id is None:
+        return np.zeros(F_ATK, dtype=np.float32)
+    feat = engine_features.get(attack_id)
+    if feat is not None:
+        return np.asarray(feat, dtype=np.float32)
+    return np.zeros(F_ATK, dtype=np.float32)
 
 
 def _energy_histogram(energies: list, n: int = N_ENERGY) -> np.ndarray:
@@ -160,10 +215,141 @@ def _clip_norm(value: float, norm: float) -> float:
 # ============================================================
 
 
+# Duplicated from ptcg_mine.damage rather than imported: this module is vendored
+# into the Kaggle bundle, where ptcg_mine does not exist.  The constants are
+# engine-measured; python/tests/test_damage.py pins them.
+_WEAKNESS_MULT = 2.0
+_RESISTANCE_DELTA = -30.0
+
+# Slices into a card_static_row (see ptcg_mine.cards).  Named because an
+# off-by-one here reads the wrong energy type and silently mis-scores weakness.
+_CARD_ENERGYTYPE = slice(12, 24)
+_CARD_WEAKNESS = slice(24, 36)
+_CARD_RESISTANCE = slice(36, 48)
+# Derived from F_CARD and F_ATK so a future K_EFFECT change can't drift the
+# offset without also bumping both dims.
+CARD_ATTACK_BLOCK_START = F_CARD - 3 * F_ATK  # == 83
+
+
+def _onehot_index(vec) -> int | None:
+    """Index of the set bit in a one-hot slice, or None if all-zero."""
+    nz = np.flatnonzero(np.asarray(vec) > 0.5)
+    return int(nz[0]) if nz.size else None
+
+
+def _effective_damage(base, atk_type, weakness, resistance) -> float:
+    """Base damage adjusted for weakness/resistance.  Mirrors ptcg_mine.damage."""
+    dmg = float(base)
+    if dmg <= 0.0:
+        return 0.0
+    if weakness is not None and atk_type is not None and weakness == atk_type:
+        dmg *= _WEAKNESS_MULT
+    if resistance is not None and atk_type is not None and resistance == atk_type:
+        dmg += _RESISTANCE_DELTA
+    return max(dmg, 0.0)
+
+
+def _attack_is_affordable(cost_hist, attached_hist) -> bool:
+    """Colorless (index 0) accepts any energy; colored costs need their colour."""
+    cost = np.asarray(cost_hist, dtype=np.float64)
+    have = np.asarray(attached_hist, dtype=np.float64)
+    if cost[1:].sum() > 0 and np.any(have[1:] < cost[1:]):
+        return False
+    return have.sum() >= cost.sum()
+
+
+def _best_damage(attacker_row, defender_row, attached_hist, require_affordable):
+    """Best damage the attacker can deal to the defender, in raw HP units.
+
+    *attacker_row* / *defender_row* are card_static_rows; *attached_hist* is the
+    attacker's 12-wide attached-energy histogram in raw counts.  Reads the three
+    embedded attack blocks rather than the attack table, so no attack-id lookup
+    is needed.
+    """
+    if attacker_row is None or defender_row is None:
+        return 0.0
+    atk_type = _onehot_index(attacker_row[_CARD_ENERGYTYPE])
+    weakness = _onehot_index(defender_row[_CARD_WEAKNESS])
+    resistance = _onehot_index(defender_row[_CARD_RESISTANCE])
+
+    best = 0.0
+    for i in range(3):
+        off = CARD_ATTACK_BLOCK_START + i * F_ATK
+        block = attacker_row[off:off + F_ATK]
+        base = float(block[0]) * ATKDMG_N
+        if base <= 0.0:
+            continue
+        if require_affordable:
+            cost = np.asarray(block[1:13], dtype=np.float64) * ATKCOST_N
+            if not _attack_is_affordable(cost, attached_hist):
+                continue
+        best = max(best, _effective_damage(base, atk_type, weakness, resistance))
+    return best
+
+
+def _ko_pressure(poke_card_feat, poke_feat) -> tuple[float, float, float, float]:
+    """(my_ratio, can_ko_opp, opp_ratio, opp_can_ko_me).
+
+    Poke slot layout (A.1): 0 = my active, 6 = opp active.
+    My side requires affordability; opp side does not.
+    """
+    mine, opp = poke_card_feat[0], poke_card_feat[6]
+    if not np.asarray(mine).any() or not np.asarray(opp).any():
+        return 0.0, 0.0, 0.0, 0.0
+
+    my_energy = np.asarray(poke_feat[0][3:15], dtype=np.float64) * ENERGY_N
+    my_hp = float(poke_feat[0][0]) * HP_N
+    opp_hp = float(poke_feat[6][0]) * HP_N
+
+    my_dmg = _best_damage(mine, opp, my_energy, require_affordable=True)
+    opp_dmg = _best_damage(opp, mine, None, require_affordable=False)
+
+    my_ratio = min(my_dmg / opp_hp, 2.0) if opp_hp > 0 else 0.0
+    opp_ratio = min(opp_dmg / my_hp, 2.0) if my_hp > 0 else 0.0
+    return (my_ratio, 1.0 if my_ratio >= 1.0 else 0.0,
+            opp_ratio, 1.0 if opp_ratio >= 1.0 else 0.0)
+
+
+def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
+                         engine_attack_features) -> float:
+    """Damage this attack would deal to *tgt_slot*, over that slot's current HP.
+
+    Clipped to [0, 2].  Returns 0.0 when the attack or target is unresolvable,
+    which is the same "no information" signal a PAD row carries.
+    """
+    if engine_attack_features is None or attack_id is None:
+        return 0.0
+    arow = engine_attack_features.get(int(attack_id))
+    if arow is None:
+        return 0.0
+    if not (0 <= tgt_slot < P_MAX):
+        return 0.0
+
+    defender = poke_card_feat[tgt_slot]
+    attacker = poke_card_feat[0]            # my active is always the attacker
+    if not np.asarray(defender).any() or not np.asarray(attacker).any():
+        return 0.0
+
+    tgt_hp = float(poke_feat[tgt_slot][0]) * HP_N
+    if tgt_hp <= 0.0:
+        return 0.0
+
+    dmg = _effective_damage(
+        float(arow[0]) * ATKDMG_N,
+        _onehot_index(attacker[_CARD_ENERGYTYPE]),
+        _onehot_index(defender[_CARD_WEAKNESS]),
+        _onehot_index(defender[_CARD_RESISTANCE]),
+    )
+    return min(dmg / tgt_hp, 2.0)
+
+
 def _build_poke_tokens(
-    state: dict, your_index: int, id_to_index: dict
+    state: dict, your_index: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build poke_card_id[P_MAX] int64 and poke_feat[P_MAX, F_POKE] float32.
+
+    ``poke_card_id`` holds raw **engine** card ids (0 = empty slot); ``featurize``
+    turns them into ``poke_card_feat``.  They are not vocab indices.
 
     Slot layout (A.1): 0=my_active, 1..5=my_bench[0..4],
     6=opp_active, 7..11=opp_bench[0..4].
@@ -181,7 +367,7 @@ def _build_poke_tokens(
         if len(active_list) > 0 and active_list[0] is not None:
             poke = active_list[0]
             row = base_row
-            poke_card_id[row] = _remap_card(poke["id"], id_to_index)
+            poke_card_id[row] = _raw_card(poke["id"])
             f = poke_feat[row]
             f[0] = _clip_norm(poke["hp"], HP_N)
             f[1] = _clip_norm(poke["maxHp"], HP_N)
@@ -206,7 +392,7 @@ def _build_poke_tokens(
             if i >= 5:  # safety cap
                 break
             row = base_row + 1 + i
-            poke_card_id[row] = _remap_card(poke["id"], id_to_index)
+            poke_card_id[row] = _raw_card(poke["id"])
             f = poke_feat[row]
             f[0] = _clip_norm(poke["hp"], HP_N)
             f[1] = _clip_norm(poke["maxHp"], HP_N)
@@ -224,33 +410,78 @@ def _build_poke_tokens(
 
 
 def _build_hand_tokens(
-    state: dict, your_index: int, id_to_index: dict
+    state: dict, your_index: int,
+    engine_card_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build hand_card_id[H_MAX] int64 and hand_feat[H_MAX, F_HAND] float32.
 
-    Cards are packed to the front; remaining slots are PAD.
-    hand_feat = [idx / H_MAX, dup_count / COUNT_N].
+    Cards are packed to the front; remaining slots are PAD (all-zero).
+
+    hand_feat = [idx/H_MAX, dup_count/COUNT_N, can_bench, can_evolve,
+                 can_attach_energy, can_play_supporter, can_play_stadium].
+
+    The five legality flags are deterministic and the engine already enumerates
+    legal plays at a MAIN select -- their value is at *non-MAIN* decisions and
+    for lookahead, e.g. seeing while choosing a discard that one candidate is a
+    Supporter not yet played this turn.
     """
     hand_card_id = np.full(H_MAX, PAD_CARD, dtype=np.int64)
     hand_feat = np.zeros((H_MAX, F_HAND), dtype=np.float32)
 
-    hand = state["players"][your_index].get("hand")
+    player = state["players"][your_index]
+    hand = player.get("hand")
     if hand is None:
         return hand_card_id, hand_feat
 
-    # Count duplicates in hand for dup_count feature
     id_counts: dict[int, int] = {}
     for card in hand:
         cid = card["id"]
         id_counts[cid] = id_counts.get(cid, 0) + 1
 
+    bench_has_room = len(player["bench"]) < int(player.get("benchMax", 5))
+    energy_free = not state.get("energyAttached", False)
+    supporter_free = not state.get("supporterPlayed", False)
+    stadium_free = not state.get("stadiumPlayed", False)
+
+    # Ids of my in-play Pokemon that did not arrive this turn -- only those can
+    # be evolved.
+    evolvable_ids: set[int] = set()
+    in_play = list(player["active"] or []) + list(player["bench"] or [])
+    for poke in in_play:
+        if poke is None or poke.get("appearThisTurn", False):
+            continue
+        evolvable_ids.add(int(poke["id"]))
+
     for i, card in enumerate(hand):
         if i >= H_MAX:
             break
         cid = card["id"]
-        hand_card_id[i] = _remap_card(cid, id_to_index)
-        hand_feat[i, 0] = _clip_norm(float(i), HAND_N)
-        hand_feat[i, 1] = _clip_norm(float(id_counts.get(cid, 1)), COUNT_N)
+        hand_card_id[i] = _raw_card(cid)
+        f = hand_feat[i]
+        f[0] = _clip_norm(float(i), HAND_N)
+        f[1] = _clip_norm(float(id_counts.get(cid, 1)), COUNT_N)
+
+        crow = None
+        if engine_card_features is not None and cid is not None:
+            crow = engine_card_features.get(int(cid))
+        if crow is None:
+            continue
+
+        is_basic = crow[CARD_FEAT_BASIC_COL] > 0.5
+        ctype_slice = crow[CARD_FEAT_CARDTYPE_START:CARD_FEAT_CARDTYPE_START + 7]
+
+        def _is(ct):
+            return ctype_slice[ct] > 0.5
+
+        f[2] = 1.0 if (is_basic and _is(0) and bench_has_room) else 0.0
+        if evolution_map is not None:
+            pre = evolution_map.get(int(cid)) or ()
+            f[3] = 1.0 if any(p in evolvable_ids for p in pre) else 0.0
+        f[4] = 1.0 if ((_is(CARD_TYPE_BASIC_ENERGY) or _is(CARD_TYPE_SPECIAL_ENERGY))
+                       and energy_free) else 0.0
+        f[5] = 1.0 if (_is(CARD_TYPE_SUPPORTER) and supporter_free) else 0.0
+        f[6] = 1.0 if (_is(CARD_TYPE_STADIUM) and stadium_free) else 0.0
 
     return hand_card_id, hand_feat
 
@@ -284,18 +515,26 @@ def _build_summary_tokens(state: dict, your_index: int) -> np.ndarray:
 
 
 def _build_stadium_token(
-    state: dict, id_to_index: dict
+    state: dict,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build stadium_card_id[1] int64, stadium_present[1] float32."""
+    """Build stadium_card_id[1] int64 and stadium_present[1] float32."""
     stadium = state.get("stadium", [])
     if len(stadium) > 0:
-        sid = _remap_card(stadium[0]["id"], id_to_index)
-        return np.array([sid], dtype=np.int64), np.array([1.0], dtype=np.float32)
-    return np.array([PAD_CARD], dtype=np.int64), np.array([0.0], dtype=np.float32)
+        sid = _raw_card(stadium[0]["id"])
+        return (
+            np.array([sid], dtype=np.int64),
+            np.array([1.0], dtype=np.float32),
+        )
+    return (
+        np.array([PAD_CARD], dtype=np.int64),
+        np.array([0.0], dtype=np.float32),
+    )
 
 
 def _build_cls_features(
-    state: dict, select: dict, your_index: int, id_to_index: dict
+    state: dict, select: dict, your_index: int,
+    poke_card_feat: np.ndarray | None = None,
+    poke_feat: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build cls_feat[F_GLOBAL] float32, context_card_id[1] int64, effect_card_id[1] int64.
 
@@ -364,19 +603,24 @@ def _build_cls_features(
     ctx_card = select.get("contextCard")
     eff_card = select.get("effect")
     context_card_id = np.array(
-        [_remap_card(ctx_card["id"] if ctx_card else None, id_to_index)],
+        [_raw_card(ctx_card["id"] if ctx_card else None)],
         dtype=np.int64,
     )
     effect_card_id = np.array(
-        [_remap_card(eff_card["id"] if eff_card else None, id_to_index)],
+        [_raw_card(eff_card["id"] if eff_card else None)],
         dtype=np.int64,
     )
+
+    # [93:97] KO pressure.  Zero when either feature table is absent -- an
+    # all-zero block is the same "no information" signal a PAD row carries.
+    if poke_card_feat is not None and poke_feat is not None:
+        cls_feat[93:97] = _ko_pressure(poke_card_feat, poke_feat)
 
     return cls_feat, context_card_id, effect_card_id
 
 
 def _build_discard_prizes(
-    state: dict, your_index: int, id_to_index: dict
+    state: dict, your_index: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build discard_ids[SUM, D_MAX], discard_mask[SUM, D_MAX], prize_ids[SUM, PZ_MAX].
 
@@ -394,7 +638,7 @@ def _build_discard_prizes(
         for i, card in enumerate(disc):
             if i >= D_MAX:
                 break
-            discard_ids[pi, i] = _remap_card(card["id"], id_to_index)
+            discard_ids[pi, i] = _raw_card(card["id"])
             discard_mask[pi, i] = True
 
         # Revealed prizes
@@ -403,7 +647,7 @@ def _build_discard_prizes(
             if i >= PZ_MAX:
                 break
             if card is not None:
-                prize_ids[pi, i] = _remap_card(card["id"], id_to_index)
+                prize_ids[pi, i] = _raw_card(card["id"])
             # else stays PAD
 
     return discard_ids, discard_mask, prize_ids
@@ -474,10 +718,11 @@ def _build_option_tokens(
     select: dict,
     ref_map: dict,
     your_index: int,
-    id_to_index: dict,
-    attack_id_to_index: dict,
     action: list[int] | None = None,
     state: dict | None = None,
+    poke_card_feat: np.ndarray | None = None,
+    poke_feat: np.ndarray | None = None,
+    engine_attack_features: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
     """Build option tensors per A.4/A.7.
 
@@ -490,8 +735,8 @@ def _build_option_tokens(
     after the regular options so the model can learn when to stop picking.
     *stop_column* is the index of that column (or -1 for single-select).
 
-    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id, opt_attack_idx,
-             opt_scalar, opt_mask, index_remap, stop_column).
+    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id,
+             opt_attack_idx, opt_scalar, opt_mask, index_remap, stop_column).
     """
     options = select["option"]
     n_total = len(options)
@@ -567,7 +812,7 @@ def _build_option_tokens(
                 return
             raw = card_id_at(state, area, player_idx, idx)
             if raw is not None:
-                opt_card_id[new_j] = _remap_card(raw, id_to_index)
+                opt_card_id[new_j] = _raw_card(raw)
 
         # Resolve per option type (A.7)
         if otype == 7:  # PLAY
@@ -621,14 +866,22 @@ def _build_option_tokens(
 
         elif otype == 13:  # ATTACK
             opt_src_idx[new_j] = 1  # my active (row 1)
-            opt_attack_idx[new_j] = _remap_attack(
-                opt.get("attackId"), attack_id_to_index
-            )
+            opt_attack_idx[new_j] = _raw_attack(opt.get("attackId"))
             # Some attacks target specific bench slots (snipe effects)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
                 opt_tgt_idx[new_j] = _ref(in_play_area, 1 - your_index, in_play_idx)
+            # Damage preview.  Target is the snipe slot when the option names
+            # one, else the opponent's Active (poke slot 6).  opt_tgt_idx is a
+            # state-token row index (1..12), so poke slot = row - 1.
+            tgt_slot = (int(opt_tgt_idx[new_j]) - 1) if opt_tgt_idx[new_j] > 0 else 6
+            ratio = _attack_damage_ratio(
+                opt.get("attackId"), tgt_slot, poke_card_feat, poke_feat,
+                engine_attack_features,
+            )
+            opt_scalar[new_j, 6] = ratio
+            opt_scalar[new_j, 7] = 1.0 if ratio >= 1.0 else 0.0
 
         elif otype == 3:  # CARD
             area = opt.get("area")
@@ -641,7 +894,7 @@ def _build_option_tokens(
             # it stays PAD for deck slots and face-down prizes.
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[new_j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _raw_card(cid)
             else:
                 _set_card(area, player_idx, index)
 
@@ -654,7 +907,7 @@ def _build_option_tokens(
             # Card id for attachment disambiguation (A.7)
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[new_j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _raw_card(cid)
             else:
                 _set_card(area, player_idx, index)
 
@@ -662,13 +915,13 @@ def _build_option_tokens(
             # src = -1, tgt = -1 (constant-type options)
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[new_j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _raw_card(cid)
 
         elif otype == 0:  # NUMBER
             # src = -1, tgt = -1; scalar carries the number
             cid = opt.get("cardId")
             if cid is not None:
-                opt_card_id[new_j] = _remap_card(cid, id_to_index)
+                opt_card_id[new_j] = _raw_card(cid)
 
     # ---- STOP column for multi-select ----
     stop_column = -1
@@ -740,7 +993,6 @@ def _build_label(
 def _build_log_tokens(
     logs: list[dict],
     your_index: int,
-    id_to_index: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build fixed-size log feature tensor for the belief module.
 
@@ -763,11 +1015,8 @@ def _build_log_tokens(
         if pidx is not None:
             player_rel = 1 if int(pidx) != your_index else -1
 
-        # card id
-        cid = log.get("cardId")
-        card_idx = PAD_CARD
-        if cid is not None:
-            card_idx = id_to_index.get(int(cid), UNKNOWN_CARD)
+        # card id — raw engine id, so log_card_feat resolves OOV cards too
+        card_idx = _raw_card(log.get("cardId"))
 
         # area from/to
         area_from = log.get("fromArea", -1)
@@ -798,12 +1047,60 @@ def _build_log_tokens(
 # ============================================================
 
 
+def _ids_to_feat(ids: np.ndarray, engine_features: dict | None,
+                 feat_dim: int,
+                 index_to_id: dict | list | None = None) -> np.ndarray:
+    """Convert int64 vocab-index array to float32 feature array.
+
+    *ids* contains vocab indices (or engine card IDs for attacks).  Uses
+    *index_to_id* to map vocab index → engine card id → static features.
+    For attack indices or when *index_to_id* is None, treats *ids* as
+    engine IDs directly.
+
+    *index_to_id* may be either form the corpus produces: ``vocab.json`` stores
+    it as the **list** ``["PAD", "UNKNOWN", id2, ...]`` (so slots 0 and 1 are
+    strings, not ids), while the attack mapping is inverted into a dict.  The
+    lookup is resolved once, outside the per-element loop.
+
+    Returns zeros for PAD (0), unknown, or None entries.
+    """
+    result = np.zeros(ids.shape + (feat_dim,), dtype=np.float32)
+    if engine_features is None:
+        return result
+
+    if index_to_id is None:
+        def lookup(v):
+            return v
+    elif isinstance(index_to_id, dict):
+        lookup = index_to_id.get
+    else:
+        def lookup(v):
+            return index_to_id[v] if 0 <= v < len(index_to_id) else None
+
+    for idx in np.ndindex(ids.shape):
+        raw_id = ids[idx]
+        if raw_id is None or int(raw_id) <= 0:
+            continue
+        # Map vocab index → engine card id, then look up features.  UNKNOWN
+        # (index 1) resolves to the string "UNKNOWN" in the list form and has
+        # no engine features, so it correctly stays zeros.
+        engine_id = lookup(int(raw_id))
+        if isinstance(engine_id, (int, np.integer)):
+            feat = engine_features.get(int(engine_id))
+            if feat is not None:
+                result[idx] = feat
+    return result
+
+
 def featurize(
     obs_dict: dict,
     vocab: dict,
     action: list[int] | None = None,
     value_target: float = 0.0,
     sample_weight: float = 1.0,
+    engine_card_features: dict | None = None,
+    engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """Convert one observation + expert action to the Appendix A.4 tensor dict.
 
@@ -815,12 +1112,18 @@ def featurize(
         Expert's chosen option indices (from the off-by-one pairing rule).
         If None (inference mode), placeholder label tensors are returned.
     vocab : dict
-        Mined vocab dict with keys ``"id_to_index"`` and
-        ``"attack_id_to_index"``.
+        Mined vocab dict.  Retained for API compatibility and callers that
+        still inspect it; card and attack identity no longer routes through it
+        — features are looked up by raw engine id (see :func:`_raw_card`).
     value_target : float
         +1 for win, -1 for loss (§1.1).
     sample_weight : float
         Per-sample weight (computed from context/archetype/outcome, C.3).
+    engine_card_features : dict or None
+        ``{engine_card_id: np.ndarray[F_CARD]}`` for ALL engine cards.  Every
+        card is represented purely by these static features — there are no
+        learned id embeddings, so a card the vocab has never seen is still
+        described exactly.  When None, all ``*_card_feat`` keys are zeros.
 
     Returns
     -------
@@ -843,29 +1146,32 @@ def featurize(
     if state is None:
         raise ValueError("featurize called with current=None")
 
-    id_to_index = vocab["id_to_index"]
-    attack_id_to_index = vocab.get("attack_id_to_index", {})
-
     your_index = state["yourIndex"]
 
     # Build ref map for option resolution
     ref_map = build_ref_map(obs_dict)
 
     # --- State: card identity ---
-    poke_card_id, poke_feat = _build_poke_tokens(state, your_index, id_to_index)
-    hand_card_id, hand_feat = _build_hand_tokens(state, your_index, id_to_index)
-    stadium_card_id, stadium_present = _build_stadium_token(state, id_to_index)
+    poke_card_id, poke_feat = _build_poke_tokens(state, your_index)
+    # Hoist the card-feature conversion early — _build_cls_features and
+    # _build_option_tokens both need the same array, and the result dict
+    # reuses it instead of calling _cfeat(poke_card_id) a second time.
+    poke_card_feat = _ids_to_feat(poke_card_id, engine_card_features, F_CARD, None)
+    hand_card_id, hand_feat = _build_hand_tokens(
+        state, your_index, engine_card_features, evolution_map,
+    )
+    stadium_card_id, stadium_present = _build_stadium_token(state)
     cls_feat, context_card_id, effect_card_id = _build_cls_features(
-        state, select, your_index, id_to_index
+        state, select, your_index, poke_card_feat, poke_feat,
     )
     sum_feat = _build_summary_tokens(state, your_index)
     discard_ids, discard_mask, prize_ids = _build_discard_prizes(
-        state, your_index, id_to_index
+        state, your_index
     )
 
     # --- Logs: belief-module input ---
     logs = obs_dict.get("logs", [])
-    log_feat, log_mask, log_len = _build_log_tokens(logs, your_index, id_to_index)
+    log_feat, log_mask, log_len = _build_log_tokens(logs, your_index)
 
     # --- State: categorical token attributes ---
     tok_type, tok_owner, tok_zone, tok_mask = _build_tok_attrs(
@@ -884,8 +1190,11 @@ def featurize(
         index_remap,
         stop_column,
     ) = _build_option_tokens(
-        select, ref_map, your_index, id_to_index, attack_id_to_index, action,
+        select, ref_map, your_index, action,
         state=state,
+        poke_card_feat=poke_card_feat,
+        poke_feat=poke_feat,
+        engine_attack_features=engine_attack_features,
     )
 
     # --- Labels ---
@@ -896,16 +1205,22 @@ def featurize(
         action_len = np.int64(0)
 
     # --- Assemble full dict (A.4) ---
-    return {
-        # State — card identity & structural
-        "poke_card_id": poke_card_id,
-        "hand_card_id": hand_card_id,
-        "stadium_card_id": stadium_card_id,
-        "context_card_id": context_card_id,
-        "effect_card_id": effect_card_id,
-        "discard_ids": discard_ids,
+    # ── Convert all card/attack IDs to feature vectors ─────────────────
+    # The ids above are raw *engine* ids, so no index_to_id hop: passing None
+    # makes _ids_to_feat look them up directly.  Every card the engine knows
+    # about therefore gets its real features, in-vocab or not.
+    _cfeat = lambda ids: _ids_to_feat(ids, engine_card_features, F_CARD, None)
+    _afeat = lambda ids: _ids_to_feat(ids, engine_attack_features, F_ATK, None)
+    result = {
+        # State — card features (float32, not int64 ids)
+        "poke_card_feat": poke_card_feat,
+        "hand_card_feat": _cfeat(hand_card_id),
+        "stadium_card_feat": _cfeat(stadium_card_id),
+        "context_card_feat": _cfeat(context_card_id),
+        "effect_card_feat": _cfeat(effect_card_id),
+        "discard_card_feat": _cfeat(discard_ids),
         "discard_mask": discard_mask,
-        "prize_ids": prize_ids,
+        "prize_card_feat": _cfeat(prize_ids),
         # State — dense features
         "poke_feat": poke_feat,
         "hand_feat": hand_feat,
@@ -921,8 +1236,8 @@ def featurize(
         "opt_type": opt_type,
         "opt_src_idx": opt_src_idx,
         "opt_tgt_idx": opt_tgt_idx,
-        "opt_card_id": opt_card_id,
-        "opt_attack_idx": opt_attack_idx,
+        "opt_card_feat": _cfeat(opt_card_id),
+        "opt_attack_feat": _afeat(opt_attack_idx),
         "opt_scalar": opt_scalar,
         "opt_mask": opt_mask,
         # Labels & bookkeeping
@@ -935,8 +1250,12 @@ def featurize(
         "value_target": np.float32(value_target),
         "sample_weight": np.float32(sample_weight),
         "stop_column": np.int64(stop_column),
-        # Logs (belief module)
+        # Logs (belief module) — card features extracted from log entries
         "log_feat": log_feat,
         "log_mask": log_mask,
         "log_len": log_len,
+        # log_feat is per-sample [L_LOG_MAX, LOG_FEAT_DIM]; column 2 is the
+        # card vocab index (belief.py does the batched [:, :, 2] equivalent).
+        "log_card_feat": _cfeat(log_feat[:, 2].astype(np.int64)),
     }
+    return result

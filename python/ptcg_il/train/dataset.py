@@ -7,16 +7,25 @@ columns via the C.3 formula.
 The shards on disk are ``np.savez_compressed`` archives, and ``np.load``'s
 ``mmap_mode`` is **silently ignored** for ``.npz``: it returns an ``NpzFile``,
 and materialising it decompresses every array into anonymous RAM.  The
-compression ratio is ~94x (5.6 MB on disk -> 528 MB resident for a 50k-sample
-shard, because the padded feature tensors are mostly zeros), and with
-``num_workers=8`` every worker paid it independently — ~14 GB for the real
-187k-sample corpus.
+compression ratio is high (the padded feature tensors are mostly zeros), and
+with ``num_workers=8`` every worker paid it independently.
 
 So each shard is decompressed **once** into a ``.npy``-per-key directory under
 ``shards/.mmap-cache/`` and mmap'd from there.  Resident memory then comes from
 the OS page cache: shared between workers, evictable under pressure, and
 independent of corpus size.  The cache is built in ``__init__`` (parent process,
 one array at a time) so the workers only ever mmap.
+
+That trade only holds while the decompressed corpus fits in page cache, and it
+stopped holding once shards stored the ``*_card_feat`` tensors: at ~0.5%
+nonzero they compress ~240x, so a 26 MB shard became **6.2 GB** on decompression
+and the train split's cache reached 47 GB against 30 GB of RAM.  A shuffled
+epoch draws uniformly across every shard, so the working set is the whole split
+— the kernel never leaves reclaim, and systemd-oomd kills the *entire* terminal
+scope (bash, uv, python, all workers, no traceback) on memory **pressure**
+rather than exhaustion.  The fix is upstream, in what gets stored: shards now
+carry card *ids* and ``_rebuild_card_feats`` re-gathers from the 1.1 MB static
+table, exactly as the ``bel_*`` labels are stored sparsely and densified here.
 """
 
 from __future__ import annotations
@@ -32,6 +41,15 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+from ptcg_il.featurizer import (
+    CARD_FEAT_SOURCES,
+    F_ATK,
+    F_CARD,
+    LOG_CARD_ID_COLUMN,
+    build_static_table,
+    gather_static_feats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +70,7 @@ _INT_KEYS = frozenset({
     "sel_type", "sel_ctx",
     "action_idx", "minCount", "maxCount", "action_len", "stop_column",
     "log_len",
-})
+} | {id_key for id_key, _ in CARD_FEAT_SOURCES.values()})
 
 # Keys that should be float32 (can be cast to bf16)
 _FLOAT_KEYS = frozenset({
@@ -253,10 +271,25 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         # labels.  Read from engine_card_features.npy (max engine card id + 1).
         self.n_all_cards: int = 0
         ecf_path = data_dir / "engine_card_features.npy"
+        ecf: dict = {}
         if ecf_path.exists():
-            import numpy as _np
-            ecf = _np.load(ecf_path, allow_pickle=True).item()
+            ecf = np.load(ecf_path, allow_pickle=True).item()
             self.n_all_cards = max(ecf.keys()) + 1 if ecf else 0
+
+        # Dense static tables for rebuilding the *_card_feat tensors the shards
+        # no longer carry (CARD_FEAT_SOURCES).  A few MB each, built once in the
+        # parent so forked workers share the pages rather than each loading a
+        # copy.  A missing file yields an all-zero table, which is exactly what
+        # featurize produces when handed no engine features — so a corpus built
+        # without them keeps training on zeros instead of failing here.
+        eaf_path = data_dir / "engine_attack_features.npy"
+        eaf: dict = (
+            np.load(eaf_path, allow_pickle=True).item() if eaf_path.exists() else {}
+        )
+        self._static_tables = {
+            "card": build_static_table(ecf, F_CARD),
+            "attack": build_static_table(eaf, F_ATK),
+        }
 
         # Load meta
         meta_path = data_dir / "meta.parquet"
@@ -407,8 +440,39 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
             float(row["sample_weight"]), dtype=torch.float32
         )
 
+        self._rebuild_card_feats(sample)
         self._densify_belief(sample)
         return sample
+
+    def _rebuild_card_feats(self, sample: dict[str, torch.Tensor]) -> None:
+        """Gather the ``*_card_feat`` tensors the shard stores ids for.
+
+        The model reads features, never ids (``model/embed.py``), so this has to
+        happen before the sample leaves the dataset — collate would work too,
+        but doing it here keeps every ShardDataset consumer (offline eval,
+        diagnose) on one path.
+
+        Ids are authoritative wherever they exist.  Shards written before the
+        format change carry the features directly and no ids at all; those keys
+        are left exactly as they were, so an old corpus trains unchanged.
+        """
+        for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
+            if id_key not in sample:
+                continue
+            ids = sample[id_key].numpy()
+            sample[feat_key] = torch.from_numpy(
+                gather_static_feats(ids, self._static_tables[kind])
+            )
+
+        # log_card_feat has no id key of its own — log_feat column 2 is the id.
+        # Keyed on log_card_feat's absence rather than log_feat's presence: a
+        # legacy shard has both, and its stored features are the ones its
+        # checkpoints were trained against.
+        if "log_card_feat" not in sample and "log_feat" in sample:
+            log_ids = sample["log_feat"][:, LOG_CARD_ID_COLUMN].long().numpy()
+            sample["log_card_feat"] = torch.from_numpy(
+                gather_static_feats(log_ids, self._static_tables["card"])
+            )
 
     def _densify_belief(self, sample: dict[str, torch.Tensor]) -> None:
         """Sparse belief labels -> normalised distributions over the vocab.

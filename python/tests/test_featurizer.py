@@ -17,6 +17,7 @@ from ptcg_il.featurizer import (
     DECK_N,
     DMGCTR_N,
     ENERGY_N,
+    E_MAX,
     F_ATK,
     F_CARD,
     F_GLOBAL,
@@ -36,6 +37,7 @@ from ptcg_il.featurizer import (
     PZ_MAX,
     PAD_ATTACK,
     SUM,
+    T_MAX,
     TURN_N,
     featurize,
     option_groups,
@@ -913,6 +915,11 @@ class TestEndToEnd:
     REQUIRED_KEYS = {
         # State — card identity, as static features (no learned id embeddings)
         "poke_card_feat",
+        # Cards attached to a Pokémon.  Kept as identities, not counts: a
+        # defensive Tool and an offensive one are otherwise the same token, and
+        # a Special Energy is indistinguishable from a basic of its type.
+        "poke_tool_feat",
+        "poke_energy_feat",
         "hand_card_feat",
         "stadium_card_feat",
         "context_card_feat",
@@ -940,6 +947,20 @@ class TestEndToEnd:
         "opt_scalar",
         "opt_mask",
         "opt_group",
+        # Raw ids behind the *_card_feat tensors above.  The model never reads
+        # these; the shard writer stores them *instead of* the features, which
+        # are a ~200x larger gather from a frozen table (CARD_FEAT_SOURCES).
+        "poke_card_id",
+        "poke_tool_ids",
+        "poke_energy_ids",
+        "hand_card_id",
+        "stadium_card_id",
+        "context_card_id",
+        "effect_card_id",
+        "discard_ids",
+        "prize_ids",
+        "opt_card_id",
+        "opt_attack_idx",
         # Labels & bookkeeping
         "action_idx",
         "action_len",
@@ -1061,6 +1082,8 @@ class TestEndToEnd:
 
         expected_shapes = {
             "poke_card_feat": (P_MAX, F_CARD),
+            "poke_tool_feat": (P_MAX, T_MAX, F_CARD),
+            "poke_energy_feat": (P_MAX, E_MAX, F_CARD),
             "hand_card_feat": (H_MAX, F_CARD),
             "stadium_card_feat": (1, F_CARD),
             "context_card_feat": (1, F_CARD),
@@ -1441,15 +1464,25 @@ class TestOptCardId:
         assert n_checked > 0, "fixture offered no hand-referencing PLAY option"
 
     def test_no_hidden_card_ids(self):
-        """Deck refs and face-down prize refs must stay PAD (information leak).
+        """Genuinely hidden refs stay PAD; a searched deck is not hidden.
 
         Writing an id for a card the live agent cannot see inflates offline
-        metrics and collapses at live-eval.
+        metrics and collapses at live-eval.  The converse is a defect too: a
+        deck being *searched* is handed to the acting player in
+        ``select["deck"]``, and the live agent receives that same payload, so
+        refusing to read it denies the model information it legitimately has —
+        and leaves every option in the search byte-identical.
+
+        So the invariant is conditional on the payload, not on the area:
+          * ``area == DECK`` **with** ``select["deck"]``  -> resolves
+          * ``area == DECK`` **without** it               -> PAD
+          * face-down prize                               -> PAD, always
         """
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
 
         n_hidden_seen = 0
+        n_deck_resolved = 0
         for step_i in range(len(ep["steps"])):
             for player_i in (0, 1):
                 try:
@@ -1459,6 +1492,7 @@ class TestOptCardId:
                 if obs is None or not (obs.get("select") or {}).get("option"):
                     continue
                 state = obs["current"]
+                deck_payload = obs["select"].get("deck")
                 out = featurize(obs, vocab,
                                 engine_card_features=_engine_card_features())
                 for j, opt in enumerate(obs["select"]["option"]):
@@ -1470,9 +1504,15 @@ class TestOptCardId:
                     if area is None:
                         continue
                     if int(area) == 1:
-                        assert np.all(out["opt_card_feat"][j] == 0.0), (
-                            f"deck ref leaked at step {step_i} option {j}")
-                        n_hidden_seen += 1
+                        if deck_payload and idx is not None and 0 <= idx < len(deck_payload):
+                            assert out["opt_card_id"][j] == deck_payload[idx]["id"], (
+                                f"searched deck card unresolved at step {step_i} "
+                                f"option {j}")
+                            n_deck_resolved += 1
+                        else:
+                            assert np.all(out["opt_card_feat"][j] == 0.0), (
+                                f"deck ref leaked at step {step_i} option {j}")
+                            n_hidden_seen += 1
                     elif int(area) == 6 and idx is not None:
                         pi = opt.get("playerIndex", state["yourIndex"])
                         try:
@@ -1484,6 +1524,7 @@ class TestOptCardId:
                                 f"face-down prize leaked at step {step_i} option {j}")
                             n_hidden_seen += 1
 
+        assert n_deck_resolved > 0, "fixture contained no searched-deck reference"
         assert n_hidden_seen > 0, "fixture contained no hidden-zone reference to check"
 
     def test_populated_ids_match_their_location(self):

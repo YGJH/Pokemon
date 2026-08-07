@@ -345,12 +345,12 @@ def _compute_loss(
         # max(action_len) full-batch pointer passes with all activations
         # retained, which is both wasted compute for the ~95% single-select
         # majority and the reason batch_size=1024 exhausts a 16GB GPU.
-        # A few optional single-select rows (minCount == 0) record the expert
-        # declining, with no STOP column emitted — action_idx[:, 0] is -1 and
-        # there is no representable target, so they contribute zero loss.
-        # ``multiselect_ce`` already guards this via ``target >= 0``; the
-        # single-select path must too, or the CE gather indexes with -1 and
-        # trips a device-side assert.
+        # Optional single-select rows (minCount == 0) now carry a STOP column,
+        # so an expert who declined is labelled with it and trains like any
+        # other target.  ``has_target`` still guards the gather: shards written
+        # before that change record declining as action_idx[:, 0] == -1, and a
+        # CE gather with -1 trips a device-side assert rather than failing
+        # cleanly.  ``multiselect_ce`` guards the same way via ``target >= 0``.
         has_target = batch["action_idx"][:, 0] >= 0
         single_ok = single & has_target
 

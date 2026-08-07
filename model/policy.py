@@ -5,6 +5,8 @@ teacher-forced AR training for multi-select decisions.  ``select_multi``
 handles greedy AR inference.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +17,26 @@ from model.encoder import Encoder
 from model.pointer import PointerHead
 from model.value import ValueHead
 
+logger = logging.getLogger(__name__)
+
+#: Featurizer widths that determine input layer shapes.  These are module-level
+#: constants in ``ptcg_il.featurizer`` baked into ``nn.Linear`` shapes at
+#: construction (``cards.py`` ``MLP(F_CARD, D, D)``, ``embed.py``
+#: ``MLP(F_POKE, ...)``, ``pointer.py`` ``nn.Linear(D + F_OPT, D)``), so editing
+#: the featurizer silently redefines what a checkpoint's weights mean.  Recorded
+#: in ``Policy.config`` and checked by :func:`policy_from_config`, for the same
+#: reason ``ptcg_il.deck`` pins ``vocab_sha1``/``archetypes_sha1``.
+FEATURE_DIM_KEYS: tuple[str, ...] = (
+    "F_CARD", "F_ATK", "F_POKE", "F_HAND", "F_SUM", "F_GLOBAL", "F_OPT",
+)
+
+
+def current_feature_dims() -> dict[str, int]:
+    """Snapshot the live ``ptcg_il.featurizer`` widths."""
+    from model import featurizer as _fz
+
+    return {k: int(getattr(_fz, k)) for k in FEATURE_DIM_KEYS}
+
 
 class Policy(nn.Module):
     """End-to-end imitation-learning policy: embed -> encode -> pointer + value.
@@ -23,12 +45,12 @@ class Policy(nn.Module):
     CLS token.  Pass ``history_h`` to ``forward`` for sequential inference;
     omit it (or pass None) during independent-sample training.
 
+    Cards and attacks are represented purely by their static features (no
+    learned id embeddings), so the model generalises zero-shot to any card
+    the engine knows about.
+
     Parameters
     ----------
-    V : int
-        Card vocab size.
-    A : int
-        Attack vocab size.
     D : int
         Model dimension (256).
     heads : int
@@ -37,51 +59,45 @@ class Policy(nn.Module):
         Encoder layers (4).
     ff : int
         Feed-forward hidden dim (1024).
-    card_static_table : Tensor[V, 52] or None
-    attack_static_table : Tensor[A, 14] or None
+    n_opp_arch : int
+        Number of opponent archetypes for belief head.
+    n_all_cards : int
+        Total number of engine cards (for belief card matrix).
     """
 
     def __init__(
         self,
-        V: int,
-        A: int,
         D: int = 256,
         heads: int = 8,
         layers: int = 4,
         ff: int = 1024,
-        card_static_table: torch.Tensor | None = None,
-        attack_static_table: torch.Tensor | None = None,
         n_opp_arch: int = 0,
+        n_all_cards: int = 0,
+        all_card_feat: torch.Tensor | None = None,
     ):
         super().__init__()
-        self.embed = TokenEmbedder(V, D, card_static_table)
+        self.embed = TokenEmbedder(D)
         self.encoder = Encoder(D, heads, layers, ff)
-        self.pointer = PointerHead(A, D, heads, attack_static_table)
+        self.pointer = PointerHead(D, heads)
         self.pointer.card = self.embed.card
         self.value = ValueHead(D)
-        self.belief = BeliefModule(V, D)
-        self.belief.card_emb = self.embed.card  # share CardEncoder
-        # Supervised opponent-card predictions.  Kept optional so existing
-        # checkpoints (whose state_dict has no belief_heads.* keys) still load,
-        # and so a run that does not want the auxiliary loss pays nothing.
-        self.belief_heads = BeliefHeads(V, D, n_opp_arch, card_emb=self.embed.card)
+        self.belief = BeliefModule(D)
+        self.belief.card_emb = self.embed.card  # share CardFeaturizer
+        self.belief_heads = BeliefHeads(D, n_opp_arch, n_all_cards,
+                                         card_emb=self.embed.card)
+        if all_card_feat is not None:
+            self.belief_heads.set_all_card_feat(all_card_feat)
         self.n_opp_arch = n_opp_arch
         self.history_gru = nn.GRUCell(D, D)  # cross-turn memory on CLS token
         self.D = D
-        # Every argument needed to rebuild this module, recorded here rather
-        # than derived from state-dict shapes at load time.  Checkpoints written
-        # before this existed carry an empty ``config``, which is why loading one
-        # meant inferring V/A/D/heads/layers/ff from tensor shapes and why the
-        # packed ``main.py`` still needs ``strict=False``.  RL loads two policies
-        # (θ and the frozen π_IL) and cannot afford that guesswork.
         self.config: dict[str, int] = {
-            "V": V,
-            "A": A,
             "D": D,
             "heads": heads,
             "layers": layers,
             "ff": ff,
             "n_opp_arch": n_opp_arch,
+            "n_all_cards": n_all_cards,
+            "feat_dims": current_feature_dims(),
         }
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
@@ -97,7 +113,10 @@ class Policy(nn.Module):
 
         # Belief module: encode logs into belief state
         if "log_feat" in x and x.get("log_mask") is not None:
-            belief = self.belief(x["log_feat"], x["log_mask"])  # [B, D]
+            belief = self.belief(
+                x["log_feat"], x["log_mask"],
+                log_card_feat=x.get("log_card_feat"),
+            )  # [B, D]
         else:
             belief = torch.zeros(B, self.D, device=device)
 
@@ -169,7 +188,67 @@ class Policy(nn.Module):
         return logits, value, history_h.detach(), belief
 
 
-def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
+#: The belief archetype classifier's output layer.  Its width is
+#: ``len(archetypes.json["opp_ids"])``, which grows when a seeded mining run
+#: appends a new 𝒟_opp archetype (``ptcg_mine.archetype._append_only``).
+_ARCH_HEAD_PREFIX = "belief_heads.arch_head."
+
+
+def widen_belief_arch_head(policy: Policy, state_dict: dict) -> tuple[dict, int, int]:
+    """Copy an older, narrower archetype head into this policy's wider one.
+
+    ``𝒟_opp`` is append-only, so slot *i* means the same archetype it always
+    did and the old head's rows are a strict prefix of the new one's.  Copying
+    them keeps everything the old model learned about the archetypes it saw and
+    leaves the appended rows at their initialisation.
+
+    This is only sound *because* the ordering is append-only.  Against a
+    re-baselined ``archetypes.json`` the prefix rows describe different decks,
+    and a prefix copy would be worse than a fresh head — it would look trained.
+    Callers must therefore opt in, and only when the artifacts share a lineage
+    generation with the checkpoint.
+
+    Returns ``(patched_state_dict, old_width, new_width)``; the dict is
+    unchanged and the widths equal when there is nothing to widen.  Raises if
+    the head *shrank*, which means a re-cluster, not an append.
+    """
+    model_sd = policy.state_dict()
+    old_w = new_w = 0
+    patched = state_dict
+    for key, want in model_sd.items():
+        if not key.startswith(_ARCH_HEAD_PREFIX):
+            continue
+        have = state_dict.get(key)
+        if have is None or have.shape == want.shape:
+            continue
+        if have.shape[1:] != want.shape[1:]:
+            raise RuntimeError(
+                f"{key}: checkpoint shape {list(have.shape)} differs from "
+                f"{list(want.shape)} in a dimension that is not the archetype "
+                "count — this is not an appended 𝒟_opp slot."
+            )
+        if have.shape[0] > want.shape[0]:
+            raise RuntimeError(
+                f"{key}: checkpoint has {have.shape[0]} archetype slots but "
+                f"this policy has {want.shape[0]}. 𝒟_opp shrank, which means "
+                "the archetypes were re-clustered rather than appended to. The "
+                "old rows now describe different decks; retrain the belief "
+                "head instead of copying them."
+            )
+        if patched is state_dict:
+            patched = dict(state_dict)
+        grown = want.clone()
+        grown[: have.shape[0]] = have
+        patched[key] = grown
+        old_w, new_w = int(have.shape[0]), int(want.shape[0])
+    return patched, old_w, new_w
+
+
+def load_policy_state(
+    policy: Policy,
+    state_dict: dict,
+    allow_belief_widening: bool = False,
+) -> list[str]:
     """``policy.load_state_dict`` that tolerates a pre-belief checkpoint.
 
     Every checkpoint written before :class:`~ptcg_il.model.belief.BeliefHeads`
@@ -178,8 +257,25 @@ def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
     else still raises, because a silently half-loaded policy evaluates as a
     plausible-looking but randomly-initialised model.
 
+    With *allow_belief_widening*, a checkpoint whose archetype head is narrower
+    than this policy's is accepted and its rows copied into the leading slots —
+    see :func:`widen_belief_arch_head` for the condition that makes that sound.
+    It is off by default: a shape mismatch is the only signal that the 𝒟_opp
+    set moved, and swallowing it by default would let a re-baselined corpus load
+    a checkpoint whose belief slots mean different decks.
+
     Returns the list of belief keys that were left at their initial values.
     """
+    if allow_belief_widening:
+        state_dict, old_w, new_w = widen_belief_arch_head(policy, state_dict)
+        if new_w > old_w > 0:
+            logger.warning(
+                "belief archetype head widened %d → %d slots; rows 0..%d were "
+                "copied from the checkpoint and %d appended slot(s) start "
+                "untrained. This is only correct if archetypes.json was seeded, "
+                "not re-baselined.",
+                old_w, new_w, old_w - 1, new_w - old_w,
+            )
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
     belief_missing = [k for k in missing if k.startswith("belief_heads.")]
     other = [k for k in missing if not k.startswith("belief_heads.")]
@@ -191,39 +287,50 @@ def load_policy_state(policy: Policy, state_dict: dict) -> list[str]:
     return belief_missing
 
 
-def policy_from_config(
-    config: dict,
-    card_static_table: torch.Tensor | None = None,
-    attack_static_table: torch.Tensor | None = None,
-) -> Policy:
+def policy_from_config(config: dict,
+                       all_card_feat: torch.Tensor | None = None) -> Policy:
     """Rebuild a :class:`Policy` from a checkpoint's ``config`` record.
 
-    Raises ``KeyError`` when the record is missing a required size rather than
-    falling back to a default.  A silently-wrong ``D`` or ``heads`` produces a
-    module whose ``load_state_dict`` fails loudly, but a wrong ``n_opp_arch``
-    does not — the belief head just changes width, and
-    :func:`load_policy_state` forgives missing belief keys.  Guessing here would
-    turn that into a plausible-looking model with randomly-initialised heads.
-
-    Checkpoints written before ``Policy.config`` existed have no such record;
-    callers must build the policy from artifact sizes instead.
+    Supports both old configs (with ``V``/``A`` from the id_emb era) and new
+    configs (pure-feature model).  ``V``/``A`` are ignored — the pure-feature
+    model does not need them.
     """
-    missing = [k for k in ("V", "A", "D", "heads", "layers", "ff") if k not in config]
+    required = ["D", "heads", "layers", "ff"]
+    missing = [k for k in required if k not in config]
     if missing:
         raise KeyError(
             f"checkpoint config is missing {missing}; it predates Policy.config "
-            "and the policy must be built from vocab.json/archetypes.json sizes"
+            "and the policy must be built from artifact sizes instead"
         )
+
+    # A featurizer edit changes every input width at once, and the resulting
+    # load failure names layer shapes rather than the cause.  Checkpoints from
+    # before this record was added carry no feat_dims and are let through --
+    # they fail later on shape, as they always did.
+    recorded = config.get("feat_dims")
+    if recorded:
+        live = current_feature_dims()
+        bad = {k: (int(v), live[k]) for k, v in recorded.items()
+               if k in live and int(v) != live[k]}
+        if bad:
+            detail = ", ".join(
+                f"{k}: checkpoint {was}, current {now}" for k, (was, now) in sorted(bad.items())
+            )
+            raise ValueError(
+                f"checkpoint was trained with different featurizer widths ({detail}). "
+                "ptcg_il/featurizer.py changed since it was written, so its weights "
+                "no longer mean what the current features mean. Retrain, or check out "
+                "the featurizer generation that produced it."
+            )
+
     return Policy(
-        V=int(config["V"]),
-        A=int(config["A"]),
         D=int(config["D"]),
         heads=int(config["heads"]),
         layers=int(config["layers"]),
         ff=int(config["ff"]),
-        card_static_table=card_static_table,
-        attack_static_table=attack_static_table,
         n_opp_arch=int(config.get("n_opp_arch", 0)),
+        n_all_cards=int(config.get("n_all_cards", 0)),
+        all_card_feat=all_card_feat,
     )
 
 
