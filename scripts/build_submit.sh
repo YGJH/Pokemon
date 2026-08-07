@@ -68,13 +68,17 @@ if [[ "$ENSEMBLE" == 1 ]]; then
     done
 fi
 
+# --ensemble 自己帶了成員清單，下面整段單一 checkpoint 的挑選邏輯在那個模式
+# 下算出來的 $CKPT 從頭到尾沒人用。留著只會做兩件壞事：印一段講 a0/ELO 的訊息，
+# 讓人以為打包的是那個 checkpoint；以及用「$CKPT 不存在」中止一次跟它無關的打包。
+if [[ "$ENSEMBLE" == 0 ]]; then
+
 ARCH="${POSITIONAL[0]:-a0}"
 EXPLICIT_CKPT="${POSITIONAL[1]:-}"
 
 IL_DIR="python/checkpoints_${ARCH}"
 MCTS_DIR="python/checkpoints_${ARCH}_mcts"
 ELO_FILE="${MCTS_DIR}/elo_ratings.json"
-echo "$ELO_FILE"
 if [[ -n "$EXPLICIT_CKPT" ]]; then
     # ── 手動指定 checkpoint ─────────────────────────────────────────────
     CKPT="$EXPLICIT_CKPT"
@@ -136,6 +140,8 @@ if [[ ! -f "$CKPT" ]]; then
     ls -d python/checkpoints* 2>/dev/null | sed 's/^/  /' >&2
     exit 1
 fi
+
+fi  # ENSEMBLE == 0
 
 # ── Build Rust MCTS library ─────────────────────────────────────────────
 RUST_DIR="python/ptcg_search"
