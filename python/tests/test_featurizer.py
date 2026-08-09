@@ -840,7 +840,15 @@ class TestMultiSelectAndRefs:
         )
 
     def test_attack_option_ref(self):
-        """ATTACK option: src = my active row 1, tgt = -1, attack features set."""
+        """ATTACK grounds src/tgt/card on the board, not on constants.
+
+        An attack option carries only ``{type, attackId}``, so everything else
+        has to be dereferenced from the state.  Before that was done, ``src``
+        was the literal 1, ``tgt`` was -1 and ``opt_card_id`` was PAD for every
+        attack — which made ``opt_type_emb``, ``src``, ``tgt`` and ``card_enc``
+        byte-identical across the options and left the pointer head choosing
+        between attacks on ``opt_attack_feat`` alone.
+        """
         ep = _load_episode()
         vocab = _build_test_vocab_with_attacks(ep)
         # Find a step with ATTACK options
@@ -853,6 +861,12 @@ class TestMultiSelectAndRefs:
         options = obs["select"]["option"]
         assert len(options) <= O_MAX, "options were reordered; j is not the raw index"
 
+        state = obs["current"]
+        me = state["yourIndex"]
+        my_active = state["players"][me]["active"][0]
+        opp_active = state["players"][1 - me]["active"][0]
+        expected_card = int(my_active["id"])
+
         n_attacks = 0
         for j, opt in enumerate(options):
             if not result["opt_mask"][j] or int(opt["type"]) != 13:
@@ -860,7 +874,18 @@ class TestMultiSelectAndRefs:
             assert result["opt_src_idx"][j] == 1, (
                 f"ATTACK opt[{j}] src should be my active row 1"
             )
-            assert result["opt_tgt_idx"][j] == -1
+            # No snipe target named, so the default is the defending Active —
+            # the same slot the damage-preview scalar already scores against.
+            assert opt.get("inPlayIndex") is None, "fixture assumption: no snipe"
+            expected_tgt = 7 if opp_active is not None else -1
+            assert result["opt_tgt_idx"][j] == expected_tgt, (
+                f"ATTACK opt[{j}] tgt should be the defending Active row "
+                f"{expected_tgt}, got {result['opt_tgt_idx'][j]}"
+            )
+            assert result["opt_card_id"][j] == expected_card, (
+                f"ATTACK opt[{j}] should carry the attacker's card id "
+                f"{expected_card}, got {result['opt_card_id'][j]}"
+            )
             # The attack reaches the model as static features, not an index.
             assert np.array_equal(
                 result["opt_attack_feat"][j],
@@ -1681,3 +1706,221 @@ def test_featurize_emits_opt_group():
     assert (out["opt_group"][~valid] == -1).all()
     assert (out["opt_group"][valid] >= 0).all()
     assert valid.sum() > 0, "fixture produced no options — the assertions above are vacuous"
+
+
+# ============================================================
+# Independently-verifiable guards for the 2026-08-07 change set
+# ============================================================
+
+
+class TestEvolutionMapIsWired:
+    """A1 — ``hand_feat[3]`` (``can_evolve``) was constant 0 in every shard.
+
+    ``featurize`` has always accepted ``evolution_map`` and ``ptcg_mine`` has
+    always written ``evolution_map.npy``, but nothing loaded it, so the column
+    never fired once across 436 564 hand-card rows.  These tests fail if the
+    argument stops reaching the flag, in either direction.
+    """
+
+    def test_can_evolve_is_zero_without_the_map(self):
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+        obs, action = _get_active_step(ep, 8, 0)
+        out = featurize(obs, vocab, action,
+                        engine_card_features=_engine_card_features())
+        assert out["hand_feat"][:, 3].max() == 0.0
+
+    def test_can_evolve_fires_when_the_map_is_supplied(self):
+        """Needs a hand card whose pre-evolution is in play and not new."""
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+        ecf = _engine_card_features()
+
+        # evolution_map maps card id -> [pre-evolution card ids].  Build one
+        # from the fixture itself so the test does not depend on data/.
+        n_checked = 0
+        for step in range(4, 60):
+            for player in (0, 1):
+                try:
+                    obs, action = _get_active_step(ep, step, player)
+                except (AssertionError, IndexError, KeyError, ValueError):
+                    continue
+                state = obs.get("current")
+                if not state:
+                    continue
+                me = state["yourIndex"]
+                p = state["players"][me]
+                hand = p.get("hand") or []
+                in_play = [q for q in (list(p["active"] or []) + list(p["bench"] or []))
+                           if q is not None and not q.get("appearThisTurn", False)]
+                if not hand or not in_play:
+                    continue
+                # Declare the first hand card an evolution of the first in-play one.
+                evo = {int(hand[0]["id"]): [int(in_play[0]["id"])]}
+                out = featurize(obs, vocab, action,
+                                engine_card_features=ecf, evolution_map=evo)
+                n_checked += 1
+                assert out["hand_feat"][0, 3] == 1.0, (
+                    "can_evolve stayed 0 with a matching evolution_map entry — "
+                    "the argument is not reaching _build_hand_tokens"
+                )
+                return
+        assert n_checked > 0, "fixture produced no evolvable state — test is vacuous"
+
+
+class TestGatherMatchesTheLoop:
+    """A5 — ``featurize`` now gathers static features vectorised.
+
+    The vectorised path must be *bit-identical* to the ``_ids_to_feat`` loop it
+    replaced; a divergence here silently redefines every card the model sees.
+    """
+
+    def test_featurize_matches_ids_to_feat_elementwise(self):
+        from ptcg_il.featurizer import CARD_FEAT_SOURCES, _ids_to_feat
+
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+        ecf, eaf = _engine_card_features(), _engine_attack_features()
+        obs, action = _get_active_step(ep, 16, 1)
+        out = featurize(obs, vocab, action,
+                        engine_card_features=ecf, engine_attack_features=eaf)
+
+        n_checked = 0
+        for feat_key, (id_key, which) in CARD_FEAT_SOURCES.items():
+            table, dim = (ecf, F_CARD) if which == "card" else (eaf, F_ATK)
+            expected = _ids_to_feat(out[id_key], table, dim, None)
+            assert np.array_equal(out[feat_key], expected), (
+                f"{feat_key} diverged from the _ids_to_feat reference"
+            )
+            n_checked += 1
+        assert n_checked == len(CARD_FEAT_SOURCES) > 0
+
+    def test_missing_tables_still_give_zeros(self):
+        ep = _load_episode()
+        vocab = _build_test_vocab(ep)
+        obs, action = _get_active_step(ep, 16, 1)
+        out = featurize(obs, vocab, action)
+        assert out["poke_card_feat"].shape == (P_MAX, F_CARD)
+        assert not out["poke_card_feat"].any()
+
+    def test_two_dicts_do_not_share_a_cached_table(self):
+        """The cache is keyed on ``id()``; a stale hit would be silent."""
+        from ptcg_il.featurizer import _static_table_for
+
+        a = {5: np.ones(F_CARD, dtype=np.float32)}
+        b = {5: np.full(F_CARD, 2.0, dtype=np.float32)}
+        ta, tb = _static_table_for(a, F_CARD), _static_table_for(b, F_CARD)
+        assert ta[5][0] == 1.0 and tb[5][0] == 2.0
+        assert _static_table_for(a, F_CARD) is ta, "cache did not hit for the same dict"
+
+
+class TestEnergyScaling:
+    """A3 — energy counts entered the Pokémon token ~10x weaker than its flags."""
+
+    def test_energy_divisor_covers_the_measured_maximum(self):
+        # Max energies observed on one Pokémon over the corpus is 7.
+        assert ENERGY_N == 8.0
+        assert ENERGY_N > 7.0, "divisor must not clip a real board state"
+
+    def test_ko_pressure_recovers_raw_counts(self):
+        """``_ko_pressure`` multiplies by ENERGY_N; the two must stay in step."""
+        from ptcg_il.featurizer import _energy_histogram
+
+        hist = _energy_histogram([0, 0, 3])
+        assert np.isclose(hist[0] * ENERGY_N, 2.0)
+        assert np.isclose(hist[3] * ENERGY_N, 1.0)
+
+
+def _poke(card_id: int, serial: int) -> dict:
+    return {"id": card_id, "serial": serial, "hp": 100, "maxHp": 100,
+            "appearThisTurn": False, "energies": [], "energyCards": [],
+            "tools": [], "preEvolution": []}
+
+
+def _obs_with_bench(same_card_id: int = 104) -> dict:
+    """Minimal observation: I have an Active plus one Bench of the *same* card."""
+    def player(active, bench):
+        return {"active": active, "bench": bench, "benchMax": 5, "deckCount": 40,
+                "discard": [], "prize": [None] * 6, "handCount": 0, "hand": [],
+                "poisoned": False, "burned": False, "asleep": False,
+                "paralyzed": False, "confused": False}
+
+    return {
+        "select": {"type": 0, "context": 0, "minCount": 1, "maxCount": 1,
+                   "option": [{"type": 14}]},
+        "logs": [],
+        "current": {
+            "turn": 5, "turnActionCount": 0, "yourIndex": 0, "firstPlayer": 0,
+            "supporterPlayed": False, "stadiumPlayed": False,
+            "energyAttached": False, "retreated": False, "result": -1,
+            "stadium": [], "looking": None,
+            "players": [
+                player([_poke(same_card_id, 13)], [_poke(same_card_id, 73)]),
+                player([_poke(200, 91)], []),
+            ],
+        },
+    }
+
+
+class TestSkillAndRetreatRefs:
+    """B2 — SKILL options differ only by ``serial``; RETREAT never duplicates."""
+
+    def test_skill_options_resolve_serial_to_distinct_rows(self):
+        from ptcg_il.ref_map import serial_row
+
+        # Synthetic: the sample episode is 19 steps and never benches a Pokémon
+        # for the acting player, so a fixture-driven version of this test would
+        # pass vacuously.  Two copies of the *same card* is exactly the case
+        # that matters — they share cardId and differ only by serial.
+        obs = _obs_with_bench(same_card_id=104)
+        ref_map = build_ref_map(obs)
+
+        assert serial_row(ref_map, 13) == 1, "active should resolve to row 1"
+        assert serial_row(ref_map, 73) == 2, "first bench slot should resolve to row 2"
+        assert serial_row(ref_map, 13) != serial_row(ref_map, 73), (
+            "two copies of the same card must resolve to different rows — this is "
+            "the only thing that separates their SKILL options"
+        )
+        assert serial_row(ref_map, 91) == 7, "opponent active should resolve to row 7"
+
+    def test_unknown_serial_falls_back_to_the_null_token(self):
+        from ptcg_il.ref_map import serial_row
+
+        ref_map = build_ref_map(_obs_with_bench())
+        assert serial_row(ref_map, 999999) == -1
+        assert serial_row(ref_map, None) == -1
+
+    def test_skill_options_get_distinct_src_rows_end_to_end(self):
+        """The whole point: two same-card SKILLs must not be one option group."""
+        obs = _obs_with_bench(same_card_id=104)
+        obs["select"]["option"] = [
+            {"type": 15, "cardId": 104, "serial": 13},
+            {"type": 15, "cardId": 104, "serial": 73},
+        ]
+        out = featurize(obs, _build_test_vocab(_load_episode()), [0],
+                        engine_card_features=_engine_card_features())
+
+        assert out["opt_src_idx"][0] == 1 and out["opt_src_idx"][1] == 2
+        assert out["opt_card_id"][0] == out["opt_card_id"][1] == 104
+        groups = out["opt_group"][out["opt_mask"]]
+        assert len(set(groups.tolist())) == 2, (
+            "the two SKILL options collapsed into one equivalence class, so the "
+            "group-marginal CE would train them at zero loss"
+        )
+
+    def test_retreat_resolves_the_active_rather_than_hardcoding_row_1(self):
+        obs = _obs_with_bench()
+        obs["select"]["option"] = [{"type": 12}]
+        out = featurize(obs, _build_test_vocab(_load_episode()), [0],
+                        engine_card_features=_engine_card_features())
+        assert out["opt_src_idx"][0] == 1
+        assert out["opt_card_id"][0] == 104
+
+        # With no Active in play the row does not exist; pointing at it would
+        # gather a PAD token as though it were a real Pokémon.
+        obs2 = _obs_with_bench()
+        obs2["current"]["players"][0]["active"] = []
+        obs2["select"]["option"] = [{"type": 12}]
+        out2 = featurize(obs2, _build_test_vocab(_load_episode()), [0],
+                         engine_card_features=_engine_card_features())
+        assert out2["opt_src_idx"][0] == -1

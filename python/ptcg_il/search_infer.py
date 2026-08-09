@@ -14,9 +14,11 @@ from typing import Any
 import numpy as np
 
 # Set by the agent at import time to provide engine card/attack features
-# for the pure-feature featurizer.
+# for the pure-feature featurizer.  `_evolution_map` feeds hand_feat[3]
+# (`can_evolve`), which is constant 0 without it.
 _engine_card_features: dict | None = None
 _engine_attack_features: dict | None = None
+_evolution_map: dict | None = None
 
 # ── Rust library loading ──────────────────────────────────────────────────
 
@@ -169,7 +171,10 @@ def predict_opponent_deck(
     try:
         from model.featurizer import featurize
 
-        feats = featurize(obs_dict, vocab)
+        feats = featurize(obs_dict, vocab,
+                          engine_card_features=_engine_card_features,
+                          engine_attack_features=_engine_attack_features,
+                          evolution_map=_evolution_map)
         batch = _dict_to_batch(feats, device)
 
         with _no_grad():
@@ -431,7 +436,8 @@ def _policy_evaluate_leaf(
     obs_dict = json.loads(obs_json)
     feats = featurize(obs_dict, vocab,
                       engine_card_features=_engine_card_features,
-                      engine_attack_features=_engine_attack_features)
+                      engine_attack_features=_engine_attack_features,
+                      evolution_map=_evolution_map)
     batch = _dict_to_batch(feats, device)
 
     # Mirror Policy.forward: _encode returns (h, history_h), and PointerHead
@@ -470,7 +476,8 @@ def _greedy_action(
 
     feats = featurize(obs_dict, vocab,
                       engine_card_features=_engine_card_features,
-                      engine_attack_features=_engine_attack_features)
+                      engine_attack_features=_engine_attack_features,
+                      evolution_map=_evolution_map)
     batch = _dict_to_batch(feats, device)
     max_count = int(feats.get("maxCount", 1))
 

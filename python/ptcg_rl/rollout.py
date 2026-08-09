@@ -177,6 +177,7 @@ class PolicyActor:
         seed: int = 0,
         engine_card_features: dict | None = None,
         engine_attack_features: dict | None = None,
+        evolution_map: dict | None = None,
     ):
         self.policy = policy
         self.vocab = vocab
@@ -186,6 +187,7 @@ class PolicyActor:
         self.bf16 = bf16 and self.device.type == "cuda"
         self.engine_card_features = engine_card_features
         self.engine_attack_features = engine_attack_features
+        self.evolution_map = evolution_map
         # The generator must live on the same device as the tensors it samples
         # from: `torch.multinomial` rejects a CPU generator for a CUDA input
         # outright rather than falling back.
@@ -229,7 +231,8 @@ class PolicyActor:
                 samples.append(featurize(
                     req["obs"], self.vocab,
                     engine_card_features=self.engine_card_features,
-                    engine_attack_features=self.engine_attack_features))
+                    engine_attack_features=self.engine_attack_features,
+                    evolution_map=self.evolution_map))
             except (ValueError, TypeError, KeyError) as e:
                 logger.debug("featurize failed, falling back to first legal: %s", e)
                 self.n_featurize_failures += 1

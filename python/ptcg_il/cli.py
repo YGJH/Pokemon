@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULTS = {
     # Model
     "d_model": 256,
-    "layers": 4,
+    "layers": 8,
     "heads": 8,
     "ff": 1024,
     "dropout": 0.1,
@@ -112,12 +112,23 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="Min games for expert eligibility (default: 50)")
     bs_config.add_argument("--jaccard-thresh", type=float, default=0.90,
                          help="Jaccard threshold for archetype clustering (default: 0.90)")
-    bs_config.add_argument("--samples-per-shard", type=int, default=50000,
-                         help="Max samples per .npz shard file (default: 50000)")
+    bs_config.add_argument("--samples-per-shard", type=int, default=None,
+                         help="Max samples per .npz shard file. Default: derived "
+                              "from --mem-budget-gb and the measured size of the "
+                              "first real sample. Pass an int to pin it and "
+                              "ignore the budget.")
+    bs_config.add_argument("--mem-budget-gb", type=float, default=None,
+                         help="Ceiling on the writer's resident memory in GiB "
+                              "(default: 2.0). Sizes the three shard buffers, "
+                              "which are its largest term; meta.parquet is "
+                              "streamed and costs ~40 MB regardless. Ignored "
+                              "when --samples-per-shard is given.")
     bs_parser.add_argument("--jobs", "-j", type=int, default=None,
-                         help="Worker processes for the pass-A episode scan "
-                              "(default: os.cpu_count(); 1 disables the pool). "
-                              "Order-preserving, so this cannot change the output.")
+                         help="Worker processes for both corpus passes — the "
+                              "pass-A selection scan and the pass-B featurize "
+                              "(default: os.cpu_count(); 1 disables both pools). "
+                              "Both are order-preserving, so this cannot change "
+                              "the output.")
     bs_parser.add_argument("--force", action="store_true",
                          help="Rebuild even when the corpus, config, code and "
                               "vocab/archetypes are unchanged since the last "
@@ -304,6 +315,15 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Split for --eval-only (default: val). Baselines are "
                            "recorded from 'test' — RL_SPEC §10.2 condition 3 is a "
                            "held-out check, and 'val' drove model selection.")
+    base.add_argument("--ensemble-select", type=int, default=None, metavar="K",
+                      help="With --eval-only and 2+ --ckpt: fit a greedy "
+                           "forward selection of ensemble members on the val "
+                           "split, record the full ordering into "
+                           "<data-dir>/il_baselines.json, and evaluate the "
+                           "best K on test. build_submit.sh --ensemble-top "
+                           "reads that ordering. Requires --eval-split val: "
+                           "greedy on test would fit the subset to the split "
+                           "the recorded score claims to hold out.")
     base.add_argument("--record-baseline", action="store_true",
                       help="Write this checkpoint's offline-eval scores to "
                            "<data-dir>/il_baselines.json, SHA-1-pinned to the "
@@ -441,7 +461,7 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
     """
     from ptcg_mine import stamp
     from ptcg_mine.config import MineConfig
-    from ptcg_il.shard_writer import build_shards
+    from ptcg_il.shard_writer import DEFAULT_MEM_BUDGET_GB, build_shards
 
     config = MineConfig(
         raw_dir=Path(args.raw_dir),
@@ -450,8 +470,20 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
         g_min=args.g_min,
         jaccard_thresh=args.jaccard_thresh,
     )
+    # getattr for the same reason `jobs` uses it below: callers build this
+    # Namespace by hand, so a new flag must not be mandatory on it.
+    mem_budget_gb = getattr(args, "mem_budget_gb", None)
+    if mem_budget_gb is None:
+        mem_budget_gb = DEFAULT_MEM_BUDGET_GB
+    # Both knobs are stamped, because either one can change the shard size and a
+    # shard size change repoints every `(shard, row)` pair in meta.parquet.  The
+    # budget matters even though it only *derives* the size: the per-sample cost
+    # it divides comes from the featurizer, whose source files the fingerprint
+    # already covers, so budget + code together pin the result.
     params = stamp.params_from_config(
-        "shards", config, **{"samples-per-shard": args.samples_per_shard}
+        "shards", config,
+        **{"samples-per-shard": args.samples_per_shard,
+           "mem-budget-gb": mem_budget_gb},
     )
 
     if not args.force:
@@ -471,6 +503,7 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
 
     logger.info("Phase 3: building shards from %s → %s", config.raw_dir, config.out_dir)
     summary = build_shards(config, samples_per_shard=args.samples_per_shard,
+                           mem_budget_gb=mem_budget_gb,
                            jobs=getattr(args, "jobs", None))
 
     logger.info("Shard build complete:")
@@ -737,6 +770,24 @@ def _cmd_eval_only_ensemble(
     split = getattr(args, "eval_split", "val")
     belief = _belief_weights(args) is not None
 
+    select_k = getattr(args, "ensemble_select", None)
+    if select_k is not None:
+        if split != "val":
+            logger.error(
+                "--ensemble-select requires --eval-split val (got %r): the "
+                "subset that maximises a test score is fit to test, and the "
+                "ens-%d record written afterwards would then be a selection "
+                "target wearing the name of a held-out claim",
+                split, select_k,
+            )
+            return 1
+        if not 1 <= select_k <= len(ckpt_paths):
+            logger.error(
+                "--ensemble-select %d is out of range for %d checkpoints",
+                select_k, len(ckpt_paths),
+            )
+            return 1
+
     # Build eval loader
     eval_ds = ShardDataset(args.data_dir, split=split, shuffle=False,
                            archetype_self=args.archetype_self)
@@ -803,21 +854,145 @@ def _cmd_eval_only_ensemble(
         best_idx, best_top1, ens_top1 - best_top1,
     )
 
-    # Record baseline
+    # Record baseline.  The per-member table rides along: these numbers were
+    # just computed and printed, and discarding them is what forced a re-eval
+    # every time somebody wanted to compare members.
     if getattr(args, "record_baseline", False):
-        from ptcg_il.baselines import record_ensemble_baseline
+        from ptcg_il.baselines import member_record, record_ensemble_baseline
 
         record_ensemble_baseline(
             args.data_dir, args.archetype_self, ckpt_paths,
             ens_metrics,
+            members=[member_record(p, m)
+                     for p, m in zip(ckpt_paths, member_metrics)],
         )
         logger.info("Recorded ensemble baseline (SHA-pinned to %d checkpoints)",
                     len(ckpt_paths))
+
+    # Greedy subset selection (Kaggle caps submitted checkpoints)
+    if select_k is not None:
+        rc = _record_ensemble_selection(
+            ensemble, ckpt_paths, member_metrics, eval_loader, device,
+            select_k, split, artifacts, args,
+        )
+        if rc != 0:
+            return rc
 
     # Live eval: ensemble vs. best single member head-to-head
     if args.live_eval:
         _run_ensemble_live_eval(ensemble, best_idx, artifacts, args)
 
+    return 0
+
+
+def _record_ensemble_selection(
+    ensemble: Any,
+    ckpt_paths: list[str],
+    member_metrics: list[dict],
+    eval_loader: Any,
+    device: Any,
+    select_k: int,
+    split: str,
+    artifacts: dict,
+    args: argparse.Namespace,
+) -> int:
+    """Fit a greedy member ordering on *split*, then verify the top-K on test.
+
+    Two artifacts come out of this, deliberately kept apart:  the ordering,
+    recorded against the full member set and marked with the split it was fit
+    on, and an ``ens-K`` baseline measured on **test** for the subset the
+    ordering chose.  The second is the number worth quoting; the first is what
+    ``build_submit.sh --ensemble-top`` reads.
+    """
+    import torch
+    import torch.nn as nn
+    from ptcg_il.baselines import (
+        member_record, record_ensemble_baseline, record_ensemble_selection,
+    )
+    from ptcg_il.ensemble import EnsemblePolicy
+    from ptcg_il.ensemble_select import (
+        build_selection, collect_member_probs, greedy_order,
+    )
+    from ptcg_il.train.dataset import ShardDataset, collate_fn
+    from ptcg_il.train.eval import offline_eval
+    from torch.utils.data import DataLoader
+
+    logger.info("Caching member probabilities for greedy selection (%s split)...", split)
+    probs, targets = collect_member_probs(list(ensemble.members), eval_loader, device)
+    logger.info(
+        "Cached %d non-trivial single-select rows x %d members (%.1f MB)",
+        probs.shape[1], probs.shape[0], probs.nbytes / 1e6,
+    )
+
+    order, scores = greedy_order(probs, targets)
+
+    print(f"\nGreedy forward selection ({split} split, nontrivial_top1):")
+    print(f"{'k':>3} {'added':>7} {'ensemble':>10} {'delta':>8}")
+    print("-" * 32)
+    for k, (idx, score) in enumerate(zip(order, scores), start=1):
+        delta = score - scores[k - 2] if k > 1 else 0.0
+        mark = "  <-- --ensemble-top" if k == select_k else ""
+        print(f"{k:>3} {idx:>7} {score:>10.4f} {delta:>+8.4f}{mark}")
+    best_k = int(max(range(len(scores)), key=lambda i: scores[i])) + 1
+    if best_k != select_k:
+        logger.info(
+            "Greedy peaks at k=%d (%.4f) on %s, not the requested k=%d (%.4f)",
+            best_k, scores[best_k - 1], split, select_k, scores[select_k - 1],
+        )
+
+    record_ensemble_selection(
+        args.data_dir, args.archetype_self, ckpt_paths,
+        [member_record(p, m) for p, m in zip(ckpt_paths, member_metrics)],
+        build_selection(order, scores, ckpt_paths,
+                        split=split, n_rows=int(probs.shape[1])),
+    )
+
+    # Verify the chosen subset on the held-out split.  Reusing the loaded
+    # members rather than re-reading from disk: same weights, and
+    # EnsemblePolicy holds nothing per-member that a subset would invalidate.
+    chosen_idx = order[:select_k]
+    chosen_paths = [ckpt_paths[i] for i in chosen_idx]
+    logger.info("Verifying the top-%d subset on the test split: %s",
+                select_k, ", ".join(str(i) for i in chosen_idx))
+
+    try:
+        test_ds = ShardDataset(args.data_dir, split="test", shuffle=False,
+                               archetype_self=args.archetype_self)
+    except (ValueError, FileNotFoundError) as e:
+        logger.warning(
+            "Selection recorded, but the test split is unavailable (%s) — no "
+            "ens-%d baseline was written", e, select_k,
+        )
+        return 0
+
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"), drop_last=False,
+    )
+    subset = EnsemblePolicy(nn.ModuleList([ensemble.members[i] for i in chosen_idx]))
+    subset.to(device)
+    subset.eval()
+    subset_metrics = offline_eval(
+        subset, test_loader, device, lambda_v=args.lambda_v,
+        belief=_belief_weights(args) is not None,
+    )
+    logger.info(
+        "Top-%d subset on test: top1_macro=%.4f, top1_micro=%.4f, "
+        "top1_nontrivial=%.4f, value_corr=%.4f, value_std=%.4f",
+        select_k,
+        subset_metrics.get("val/top1_macro", 0.0),
+        subset_metrics.get("val/top1_micro", 0.0),
+        subset_metrics.get("val/top1_nontrivial", 0.0),
+        subset_metrics.get("val/value_corr", 0.0),
+        subset_metrics.get("val/value_std", 0.0),
+    )
+    record_ensemble_baseline(
+        args.data_dir, args.archetype_self, chosen_paths, subset_metrics,
+    )
+    del subset
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return 0
 
 
@@ -832,16 +1007,18 @@ def _run_ensemble_live_eval(
     # Build agents
     ensemble_agent = make_agent_from_policy(
         ensemble, artifacts["vocab"], artifacts["fixed_deck"], device="cpu",
+        data_dir=args.data_dir,
     )
     best_member = ensemble.members[best_idx]
     best_single_agent = make_agent_from_policy(
         best_member, artifacts["vocab"], artifacts["fixed_deck"], device="cpu",
+        data_dir=args.data_dir,
     )
 
     # Run head-to-head
     evaluator = LiveEvaluator(
         ensemble, artifacts["vocab"], artifacts["fixed_deck"],
-        n_workers=args.live_eval_workers,
+        n_workers=args.live_eval_workers, data_dir=args.data_dir,
     )
     evaluator._agent_fn = ensemble_agent
 
@@ -892,6 +1069,7 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
         artifacts["vocab"],
         artifacts["fixed_deck"],
         n_workers=args.live_eval_workers,
+        data_dir=args.data_dir,
     )
 
     opponents: dict[str, Any] = {
@@ -915,7 +1093,7 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
             oracle_policy = copy.deepcopy(policy).to("cpu").eval()
             oracle = OpponentDeckOracle(
                 oracle_policy, artifacts["vocab"], artifacts["archetypes"],
-                device="cpu",
+                device="cpu", data_dir=args.data_dir,
             )
             opponents["search_planner_belief"] = SearchPlannerAgent(oracle=oracle)
         except Exception as e:
@@ -934,7 +1112,8 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
                 frozen_policy, ckpt["model_state_dict"],
                 allow_belief_widening=getattr(args, "allow_belief_widening", False))
             frozen_agent = make_agent_from_policy(
-                frozen_policy, artifacts["vocab"], artifacts["fixed_deck"], device="cpu"
+                frozen_policy, artifacts["vocab"], artifacts["fixed_deck"],
+                device="cpu", data_dir=args.data_dir,
             )
             opponents["frozen_ckpt"] = frozen_agent
             logger.info("Added frozen_ckpt opponent from %s (step %d)", args.resume, ckpt["step"])

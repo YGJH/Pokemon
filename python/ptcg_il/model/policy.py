@@ -95,7 +95,6 @@ class Policy(nn.Module):
         if all_card_feat is not None:
             self.belief_heads.set_all_card_feat(all_card_feat)
         self.n_opp_arch = n_opp_arch
-        self.history_gru = nn.GRUCell(D, D)  # cross-turn memory on CLS token
         self.D = D
         self.config: dict[str, int] = {
             "D": D,
@@ -110,9 +109,21 @@ class Policy(nn.Module):
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shared encode path: embed → encode → history GRU on CLS.
+        """Shared encode path: embed → encode → add belief to CLS.
 
-        Returns ``(h, history_h)`` where *h* has the history-augmented CLS token.
+        Returns ``(h, history_h)`` where *h* has the belief-augmented CLS token.
+
+        *history_h* is accepted and returned unchanged, for callers that still
+        pass it.  It no longer does anything: the ``history_gru`` that consumed
+        it has been removed.  Nothing in ``ptcg_il``, ``ptcg_rl``, ``live_eval``
+        or ``main.py`` ever threaded a non-zero state into it, so with ``h = 0``
+        the GRUCell reduced to ``(1-z) ⊙ tanh(Wx+b)`` with a measured mean update
+        gate of 0.0146 — a pure tanh squash that left **69% of the CLS dims
+        saturated** (|n| > 0.99), dropped CLS rms 1.31 → 0.96, and gave
+        per-dim corr(pre, post) ≈ −0.07.  The value head and the pointer's CLS
+        key/value read only that vector, so the one thing the "cross-turn
+        memory" did was bottleneck the global summary token.  The CLS row now
+        passes through with the belief residual and nothing else.
         """
         B = x["tok_type"].shape[0]
         device = x["tok_type"].device
@@ -128,13 +139,12 @@ class Policy(nn.Module):
         else:
             belief = torch.zeros(B, self.D, device=device)
 
-        # Cross-turn GRU on CLS token (augmented with belief)
-        cls_token = h[:, 0, :] + belief                      # [B, D]
         if history_h is None:
             history_h = torch.zeros(B, self.D, device=device)
-        cls_out = self.history_gru(cls_token, history_h)     # [B, D]
+
         # Replace CLS without in-place mutation (preserves autograd graph)
-        h = torch.cat([cls_out.unsqueeze(1), h[:, 1:, :]], dim=1)  # [B, L, D]
+        cls_token = h[:, 0, :] + belief                      # [B, D]
+        h = torch.cat([cls_token.unsqueeze(1), h[:, 1:, :]], dim=1)  # [B, L, D]
 
         return h, history_h
 
@@ -200,6 +210,10 @@ class Policy(nn.Module):
 #: ``len(archetypes.json["opp_ids"])``, which grows when a seeded mining run
 #: appends a new 𝒟_opp archetype (``ptcg_mine.archetype._append_only``).
 _ARCH_HEAD_PREFIX = "belief_heads.arch_head."
+
+#: Parameters of the removed cross-turn GRU.  Kept as a named constant because
+#: :func:`load_policy_state` has to recognise them in older checkpoints.
+_HISTORY_GRU_PREFIX = "history_gru."
 
 
 def widen_belief_arch_head(policy: Policy, state_dict: dict) -> tuple[dict, int, int]:
@@ -274,6 +288,22 @@ def load_policy_state(
 
     Returns the list of belief keys that were left at their initial values.
     """
+    # ``history_gru`` was removed (see Policy._encode).  Every checkpoint written
+    # before that still carries its four parameters, and they would land in
+    # ``unexpected`` and raise below.  Dropping them is safe in a way that
+    # dropping an *unknown* key would not be: the module is gone, nothing reads
+    # its weights, and the CLS row it used to transform now passes through
+    # untouched.  Anything else unexpected still raises.
+    stale = [k for k in state_dict if k.startswith(_HISTORY_GRU_PREFIX)]
+    if stale:
+        state_dict = {k: v for k, v in state_dict.items()
+                      if not k.startswith(_HISTORY_GRU_PREFIX)}
+        logger.info(
+            "dropped %d stale history_gru parameter(s) from the checkpoint; the "
+            "module was removed and the CLS token is no longer squashed through it",
+            len(stale),
+        )
+
     if allow_belief_widening:
         state_dict, old_w, new_w = widen_belief_arch_head(policy, state_dict)
         if new_w > old_w > 0:

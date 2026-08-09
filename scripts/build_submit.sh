@@ -16,6 +16,19 @@
 #   ./scripts/build_submit.sh a1                      # a1, 自動選最高 ELO
 #   ./scripts/build_submit.sh a0 path/to/ckpt.pt      # 手動指定 checkpoint
 #   ./scripts/build_submit.sh a0 --no-mcts            # 純 policy，不含任何搜尋
+#   ./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s*/ckpt-best.pt" \
+#       --ensemble-top 7                              # 10 個成員裡挑最好的 7 個
+#
+# --ensemble-top N: Kaggle 限制一次能提交幾個 checkpoint，所以 10 個成員要砍到
+# N 個。挑法是讀 data/il_baselines.json 裡記錄的 greedy forward selection 順序
+# —— 不是 glob 順序，也不是「單模型分數最高的 N 個」：ensemble 靠的是成員之間
+# 不相關，所以單獨最好的 7 個不等於合起來最好的 7 個。
+# 那份順序要先跑這行才會存在（在 val 上挑，再用 test 驗證選出來的子集）:
+#   cd python && uv run python -m ptcg_il.cli train --eval-only \
+#       --data-dir data --archetype-self 1 --eval-split val --ensemble-select 7 \
+#       --ckpt checkpoints_a1_s0/ckpt-best.pt --ckpt ... （10 個都要帶）
+# 沒有記錄就直接中止，不會安靜地拿前 N 個 —— 那會打包出一個「看起來有挑過」
+# 但其實沒有的 submission，而且後面沒有任何一步會拆穿它。
 #
 # 會自動編譯 Rust MCTS library (libptcg_search.so) 並打包進 submission。
 # 如果 cargo 找不到，會跳過並在 submission 中使用 greedy fallback。
@@ -29,11 +42,14 @@ set -euo pipefail
 
 ENSEMBLE=0
 ENSEMBLE_PATHS=()
+ENSEMBLE_TOP=""
+DATA_DIR="python/data"
 NO_MCTS=0
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-mcts) NO_MCTS=1; shift ;;
+        --ensemble-top) ENSEMBLE_TOP="${2:?--ensemble-top needs a number}"; shift 2 ;;
         --ensemble)
             ENSEMBLE=1
             shift
@@ -62,6 +78,41 @@ if [[ "$ENSEMBLE" == 1 ]]; then
         exit 1
     fi
     ENSEMBLE_PATHS=("${EXPANDED_PATHS[@]}")
+
+    # ── --ensemble-top: keep the best N of the matched members ──────────────
+    # Kaggle caps how many checkpoints a submission may carry, so a 10-seed
+    # ensemble has to be cut down.  The subset comes from the greedy ordering
+    # recorded in il_baselines.json, *not* from the glob order and not from
+    # per-member scores: an ensemble gains from decorrelated members, so the
+    # best N individually is not the best N together.
+    #
+    # No fallback on purpose.  Quietly taking the first N of a glob would
+    # produce a submission that looks selected and is not, and nothing
+    # downstream ever contradicts it.
+    if [[ -n "$ENSEMBLE_TOP" ]]; then
+        if [[ "$ENSEMBLE_TOP" -ge "${#ENSEMBLE_PATHS[@]}" ]]; then
+            echo "--ensemble-top $ENSEMBLE_TOP >= ${#ENSEMBLE_PATHS[@]} matched members — keeping all"
+        else
+            # ptcg_il lives under python/, so the selector runs from there and
+            # the checkpoint paths have to be absolute to survive the cd.
+            CKPT_ARGS_SEL=()
+            for p in "${ENSEMBLE_PATHS[@]}"; do
+                CKPT_ARGS_SEL+=(--ckpt "$(realpath "$p")")
+            done
+            # Resolved out here: inside the $( cd python && … ) subshell a
+            # relative python/data would be looked up from python/.
+            DATA_DIR_ABS="$(realpath "$DATA_DIR")"
+            echo "Selecting top $ENSEMBLE_TOP of ${#ENSEMBLE_PATHS[@]} members..."
+            SELECTED=$(cd python && uv run python -m ptcg_il.ensemble_select \
+                --data-dir "$DATA_DIR_ABS" \
+                --top "$ENSEMBLE_TOP" "${CKPT_ARGS_SEL[@]}") || {
+                echo "ERROR: could not resolve --ensemble-top $ENSEMBLE_TOP" >&2
+                exit 1
+            }
+            mapfile -t ENSEMBLE_PATHS <<< "$SELECTED"
+        fi
+    fi
+
     echo "Ensemble: ${#ENSEMBLE_PATHS[@]} members"
     for p in "${ENSEMBLE_PATHS[@]}"; do
         echo "  $p"

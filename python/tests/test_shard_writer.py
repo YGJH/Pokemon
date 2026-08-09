@@ -19,7 +19,7 @@ from ptcg_il.shard_writer import (
     _split_of,
     build_shards,
 )
-from ptcg_mine.archetype import Archetype, cluster_decks, canon
+from ptcg_mine.archetype import Archetype, assign_archetype, cluster_decks, canon
 
 
 # ============================================================
@@ -363,6 +363,83 @@ class TestIsKeptGame:
             ep_draw, 0, {"expert_a"}, set(self_ids), set(opp_ids), archetypes
         )
 
+    def test_experts_none_keeps_a_team_no_filter_would_have_selected(self):
+        """``experts=None`` -- the production path -- applies no team filter.
+
+        The top-K filter discarded 92.3% of the real corpus (8027 of 104418
+        (episode, player) pairs).  Skill is a per-row weight now, so a
+        non-expert team's rows must be *written*, with ``skill_w`` deciding how
+        much they count.  If this reverts to filtering, the corpus silently
+        shrinks 13x and only the row count in the build log would show it.
+        """
+        ep = _make_synthetic_episode(
+            teams=("nobody_special", "other"),
+            deck_p0=_make_deck(1),
+            deck_p1=_make_deck(2),
+        )
+        archetypes, self_ids, opp_ids = _build_test_archetypes()
+
+        assert _is_kept_game(ep, 0, None, set(self_ids), set(opp_ids), archetypes)
+        # ...and an explicit set still filters, so the old corpus is reproducible.
+        assert not _is_kept_game(
+            ep, 0, {"expert_a"}, set(self_ids), set(opp_ids), archetypes
+        )
+
+    def test_experts_none_still_applies_the_archetype_filters(self):
+        """Dropping the team filter must not drop the deck filters with it."""
+        ep = _make_synthetic_episode(
+            teams=("nobody_special", "other"),
+            deck_p0=_make_deck(1),
+            deck_p1=_make_deck(2),
+        )
+        archetypes, self_ids, opp_ids = _build_test_archetypes()
+
+        assert not _is_kept_game(ep, 0, None, set(), set(opp_ids), archetypes)
+        assert not _is_kept_game(ep, 0, None, set(self_ids), set(), archetypes)
+
+    def test_opp_ids_none_accepts_an_off_list_opponent(self):
+        """``opp_ids=None`` keeps the row; ``self_ids`` is still enforced.
+
+        These are deliberately asymmetric.  An off-list *opponent* still trains
+        the policy and three of the four belief heads, abstaining only on
+        ``bel_arch``; an off-list *own* deck is a different game entirely.
+        """
+        ep = _make_synthetic_episode(
+            teams=("anyone", "other"),
+            deck_p0=_make_deck(1),
+            deck_p1=_make_deck(2),
+        )
+        archetypes, self_ids, opp_ids = _build_test_archetypes()
+        arch_2 = assign_archetype(_make_deck(2), archetypes)
+        assert arch_2 is not None, "fixture must produce a real opponent archetype"
+        without_opp = set(opp_ids) - {arch_2}
+
+        assert not _is_kept_game(
+            ep, 0, None, set(self_ids), without_opp, archetypes
+        ), "an explicit set must still filter"
+        assert _is_kept_game(ep, 0, None, set(self_ids), None, archetypes)
+        # self_ids has no such escape
+        assert not _is_kept_game(ep, 0, None, set(), None, archetypes)
+
+    def test_opp_ids_none_accepts_an_opponent_matching_no_cluster_at_all(self):
+        """The unclustered case, not just the off-list one.
+
+        ``assign_archetype`` returns None when no representative matches at the
+        jaccard threshold.  ``None in opp_ids`` was already False, so this row
+        was dropped by the same condition -- but it is the case pass B used to
+        drop a *second* time, and reinstating either one silently restores the
+        filter.
+        """
+        ep = _make_synthetic_episode(
+            teams=("anyone", "other"),
+            deck_p0=_make_deck(1),
+            deck_p1=_make_deck(999),  # matches no cluster
+        )
+        archetypes, self_ids, _ = _build_test_archetypes()
+        assert assign_archetype(_make_deck(999), archetypes) is None
+
+        assert _is_kept_game(ep, 0, None, set(self_ids), None, archetypes)
+
     def test_invalid_deck_caught(self):
         """An episode with a malformed deck should not crash _is_kept_game."""
         ep = _make_synthetic_episode(
@@ -592,6 +669,230 @@ class TestBuildShards:
         meta = pd.read_parquet(meta_path)
         assert set(meta.columns) == set(META_COLUMNS)
         assert len(meta) == summary["total_samples"]
+
+    def test_no_expert_filter_keeps_more_rows_and_weights_them_by_skill(self, tmp_path):
+        """The production path (``experts=None``) writes every team, weighted.
+
+        Two assertions that must hold together: the corpus **grows** (teams the
+        top-K filter excluded now contribute rows), and ``skill_w`` **varies**
+        across those teams (so the extra rows do not count as much as an
+        expert's).  Either one alone is satisfiable by a bug -- keeping
+        everything at weight 1.0 imitates the median player, and keeping the
+        filter while writing a weight column changes nothing.
+        """
+        from ptcg_mine.config import MineConfig
+
+        episodes, vocab, archetypes, self_ids, opp_ids, experts = self._setup_test_data(tmp_path)
+
+        def _run(out_name, experts_arg):
+            out_dir = tmp_path / out_name
+            out_dir.mkdir()
+            with open(out_dir / "vocab.json", "w") as f:
+                json.dump(vocab, f)
+            with open(out_dir / "archetypes.json", "w") as f:
+                json.dump({
+                    "self_ids": self_ids,
+                    "opp_ids": opp_ids,
+                    "fixed_deck": [1] * 60,
+                    "archetypes": [
+                        {"id": a.id, "representative": list(a.representative),
+                         "frequency": a.frequency, "n_members": len(getattr(a, "members", []))}
+                        for a in archetypes
+                    ],
+                }, f)
+            summary = build_shards(
+                config=MineConfig(raw_dir=tmp_path / "raw", out_dir=out_dir),
+                episodes=episodes, vocab=vocab, archetypes_data=archetypes,
+                self_ids=self_ids, opp_ids=opp_ids, experts=experts_arg,
+            )
+            return summary, pd.read_parquet(out_dir / "meta.parquet")
+
+        filtered_summary, filtered_meta = _run("filtered", experts)
+        all_summary, all_meta = _run("unfiltered", None)
+
+        assert filtered_summary["total_samples"] > 0, "fixture produced no filtered rows"
+        assert all_summary["n_kept_games"] > filtered_summary["n_kept_games"]
+        assert set(all_meta["team"]) > set(filtered_meta["team"])
+
+        assert "skill_w" in all_meta.columns
+        assert (all_meta["skill_w"] > 0).all(), "a zeroed row is an invisible drop"
+        assert all_meta["skill_w"].nunique() > 1, "skill_w must vary between teams"
+
+    def test_off_list_opponents_are_written_with_the_ignore_sentinel(self, tmp_path):
+        """Rows the D_opp filter used to drop are kept, and marked -1.
+
+        Both halves matter.  If the rows are missing, dropping the filter did
+        nothing.  If they are present but carry a real class index, the belief
+        head is being trained on a label that means "archetype 0" when the
+        truth is "not in the list" — which no loss curve would reveal.
+        """
+        from ptcg_mine.config import MineConfig
+
+        episodes, vocab, archetypes, self_ids, opp_ids, _ = self._setup_test_data(tmp_path)
+
+        def _run(out_name, filter_opp, opp_id_list):
+            out_dir = tmp_path / out_name
+            out_dir.mkdir()
+            with open(out_dir / "vocab.json", "w") as f:
+                json.dump(vocab, f)
+            with open(out_dir / "archetypes.json", "w") as f:
+                json.dump({
+                    "self_ids": self_ids, "opp_ids": opp_id_list, "fixed_deck": [1] * 60,
+                    "archetypes": [
+                        {"id": a.id, "representative": list(a.representative),
+                         "frequency": a.frequency, "n_members": len(getattr(a, "members", []))}
+                        for a in archetypes
+                    ],
+                }, f)
+            summary = build_shards(
+                config=MineConfig(raw_dir=tmp_path / "raw", out_dir=out_dir),
+                episodes=episodes, vocab=vocab, archetypes_data=archetypes,
+                self_ids=self_ids, opp_ids=opp_id_list, experts=None,
+                filter_opp=filter_opp,
+            )
+            return summary, pd.read_parquet(out_dir / "meta.parquet")
+
+        # Shrink D_opp to a single archetype so some opponents fall off the list.
+        narrow = opp_ids[:1]
+        filtered, filtered_meta = _run("filtered", True, narrow)
+        kept, kept_meta = _run("kept", False, narrow)
+
+        assert filtered["total_samples"] > 0, "fixture produced no filtered rows"
+        assert kept["n_kept_games"] > filtered["n_kept_games"]
+
+        assert set(filtered_meta["archetype_opp"]) <= set(narrow), (
+            "with the filter on, every opponent must be in D_opp"
+        )
+        off_list = kept_meta[~kept_meta["archetype_opp"].isin(narrow)]
+        assert len(off_list) > 0, "no off-list rows were recovered"
+
+        # meta keeps the opponent's real global cluster id -- that is not the
+        # belief label.  The head only has classes for D_opp, so the *shard*
+        # must carry -1 for exactly these rows.
+        checked = 0
+        for shard_name, group in off_list.groupby("shard"):
+            data = np.load(tmp_path / "kept" / "shards" / shard_name)
+            bel = data["bel_arch"][group["row"].to_numpy()]
+            assert (bel == -1).all(), (
+                f"{shard_name}: off-list opponents must be ignored by the arch "
+                f"head, got classes {sorted(set(bel.tolist()))}"
+            )
+            checked += len(group)
+        assert checked == len(off_list)
+
+        # ...and in-list rows must still carry a real class, or the head trains
+        # on nothing at all and this test would pass vacuously.
+        in_list = kept_meta[kept_meta["archetype_opp"].isin(narrow)]
+        assert len(in_list) > 0
+        for shard_name, group in in_list.groupby("shard"):
+            data = np.load(tmp_path / "kept" / "shards" / shard_name)
+            bel = data["bel_arch"][group["row"].to_numpy()]
+            assert (bel >= 0).all()
+
+    def test_an_unclustered_opponent_survives_both_passes(self, tmp_path):
+        """The opponent deck that matches *no* cluster, end to end.
+
+        Distinct from the off-list case and easy to lose: pass A decides to keep
+        the row, then pass B recomputes ``opp_arch``, gets None, and used to
+        ``continue`` on it -- silently reinstating the filter one pass after it
+        was lifted, for exactly the most unusual decks.  The fixture's opponents
+        must genuinely fail to cluster, or this passes vacuously.
+        """
+        from ptcg_mine.config import MineConfig
+
+        _, vocab_src, archetypes, self_ids, opp_ids, _ = self._setup_test_data(tmp_path)
+        assert assign_archetype(_make_deck(999), archetypes) is None
+
+        episodes = []
+        for i in range(4):
+            eid = f"odd_ep_{i:04d}"
+            episodes.append((eid, _make_synthetic_episode(
+                episode_id=eid,
+                teams=("anyone", "other"),
+                rewards=((-1, 1) if i % 2 == 0 else (1, -1)),
+                deck_p0=_make_deck(1),
+                deck_p1=_make_deck(999),
+                n_decisions=3,
+            )))
+        vocab = _build_test_vocab([ep for _, ep in episodes])
+
+        out_dir = tmp_path / "unclustered"
+        out_dir.mkdir()
+        with open(out_dir / "vocab.json", "w") as f:
+            json.dump(vocab, f)
+        with open(out_dir / "archetypes.json", "w") as f:
+            json.dump({
+                "self_ids": self_ids, "opp_ids": opp_ids, "fixed_deck": [1] * 60,
+                "archetypes": [
+                    {"id": a.id, "representative": list(a.representative),
+                     "frequency": a.frequency, "n_members": len(getattr(a, "members", []))}
+                    for a in archetypes
+                ],
+            }, f)
+
+        summary = build_shards(
+            config=MineConfig(raw_dir=tmp_path / "raw", out_dir=out_dir),
+            episodes=episodes, vocab=vocab, archetypes_data=archetypes,
+            self_ids=self_ids, opp_ids=opp_ids, experts=None,
+        )
+
+        assert summary["total_samples"] > 0, "pass B dropped every unclustered row"
+        meta = pd.read_parquet(out_dir / "meta.parquet")
+        assert (meta["archetype_opp"] == -1).all()
+
+        checked = 0
+        for shard_name, group in meta.groupby("shard"):
+            data = np.load(out_dir / "shards" / shard_name)
+            bel = data["bel_arch"][group["row"].to_numpy()]
+            assert (bel == -1).all()
+            # The other belief targets are still marked valid -- abstaining on
+            # the archetype is the whole cost of keeping the row.  Their
+            # *contents* are not asserted here: this fixture writes no
+            # engine_card_features, so n_all_cards is 0 and the deck/hand
+            # histograms are empty for every test in this file, off-list or not.
+            assert data["bel_valid"][group["row"].to_numpy()].all()
+            checked += len(group)
+        assert checked == len(meta)
+
+    def test_skill_w_matches_the_team_leaderboard(self, tmp_path):
+        """``skill_w`` is this corpus's own leaderboard, not a constant.
+
+        Recomputed independently here: if ``build_shards`` ever writes a
+        placeholder or reuses a stale table, every downstream weight is wrong
+        and nothing else in the pipeline would notice.
+        """
+        from ptcg_mine.config import MineConfig
+        from ptcg_mine.stats import team_leaderboard, team_skill_weights
+
+        episodes, vocab, archetypes, self_ids, opp_ids, _ = self._setup_test_data(tmp_path)
+
+        out_dir = tmp_path / "output"
+        out_dir.mkdir()
+        with open(out_dir / "vocab.json", "w") as f:
+            json.dump(vocab, f)
+        with open(out_dir / "archetypes.json", "w") as f:
+            json.dump({
+                "self_ids": self_ids, "opp_ids": opp_ids, "fixed_deck": [1] * 60,
+                "archetypes": [
+                    {"id": a.id, "representative": list(a.representative),
+                     "frequency": a.frequency, "n_members": len(getattr(a, "members", []))}
+                    for a in archetypes
+                ],
+            }, f)
+
+        build_shards(
+            config=MineConfig(raw_dir=tmp_path / "raw", out_dir=out_dir),
+            episodes=episodes, vocab=vocab, archetypes_data=archetypes,
+            self_ids=self_ids, opp_ids=opp_ids, experts=None,
+        )
+        meta = pd.read_parquet(out_dir / "meta.parquet")
+
+        expected = team_skill_weights(team_leaderboard([ep for _, ep in episodes]))
+        checked = 0
+        for team, group in meta.groupby("team"):
+            assert group["skill_w"].iloc[0] == pytest.approx(expected[team])
+            checked += 1
+        assert checked > 1, "fixture must contain more than one team to be meaningful"
 
     def test_meta_columns_and_types(self, tmp_path):
         """meta.parquet has correct columns and reasonable values."""
@@ -1194,3 +1495,474 @@ class TestBuildShards:
 def test_opt_group_is_not_stored_as_fp16():
     from ptcg_il.shard_writer import _FP16_KEYS
     assert "opt_group" not in _FP16_KEYS, "opt_group is an index array, not a feature"
+
+
+# ============================================================
+# Tests: parallel pass B
+# ============================================================
+
+
+class TestParallelPassB:
+    """Pass B featurizes episodes across a process pool.
+
+    The pass is ~98% of build-shards' wall clock, and the only defensible way
+    to parallelise something whose output feeds every downstream stage is for
+    the parallel result to be *identical*, not merely equivalent -- `shard` and
+    `row` in meta.parquet are positions into files, so any reordering silently
+    repoints every training sample.
+    """
+
+    @staticmethod
+    def _corpus_on_disk(tmp_path, n_episodes):
+        """Write a synthetic corpus to raw/ and the artifacts each run needs."""
+        episodes, vocab, archetypes, self_ids, opp_ids, _ = (
+            TestBuildShards._setup_test_data(tmp_path, n_episodes=n_episodes)
+        )
+        raw_dir = tmp_path / "raw_corpus"
+        raw_dir.mkdir(parents=True)
+        for eid, ep in episodes:
+            (raw_dir / f"{eid}.json").write_text(json.dumps(ep))
+
+        def write_artifacts(out_dir):
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with open(out_dir / "vocab.json", "w") as f:
+                json.dump(vocab, f)
+            with open(out_dir / "archetypes.json", "w") as f:
+                json.dump(
+                    {
+                        "self_ids": self_ids,
+                        "opp_ids": opp_ids,
+                        "archetypes": [
+                            {
+                                "id": a.id,
+                                "representative": list(a.representative),
+                                "frequency": a.frequency,
+                                "n_members": len(getattr(a, "members", [])),
+                            }
+                            for a in archetypes
+                        ],
+                    },
+                    f,
+                )
+
+        return raw_dir, write_artifacts
+
+    def test_parallel_output_is_identical_to_serial(self, tmp_path, monkeypatch):
+        """Same shards, same rows, same meta -- byte for byte, not just in aggregate."""
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        raw_dir, write_artifacts = self._corpus_on_disk(tmp_path, n_episodes=40)
+        # The production threshold is 256 episodes; drop it so a fixture small
+        # enough to run in a test still takes the pool.
+        monkeypatch.setattr(shard_writer, "_PARALLEL_FEATURIZE_MIN_EPISODES", 1)
+
+        runs = {}
+        for tag, jobs in (("serial", 1), ("parallel", 4)):
+            out_dir = tmp_path / tag
+            write_artifacts(out_dir)
+            runs[tag] = build_shards(
+                config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                samples_per_shard=200,  # forces several flushes, so shard/row vary
+                jobs=jobs,
+            )
+
+        assert runs["serial"]["total_samples"] > 0, "fixture produced nothing; test is vacuous"
+        assert runs["serial"]["n_shards"] > 1, (
+            "fixture fits in one shard, so shard/row placement is never exercised"
+        )
+        for key in ("total_samples", "n_shards", "n_kept_games", "split_counts",
+                    "n_loaded", "n_invalid"):
+            assert runs["serial"][key] == runs["parallel"][key], f"summary differs on {key}"
+
+        meta_s = pd.read_parquet(tmp_path / "serial" / "meta.parquet")
+        meta_p = pd.read_parquet(tmp_path / "parallel" / "meta.parquet")
+        pd.testing.assert_frame_equal(meta_s, meta_p)
+
+        names_s = sorted(p.name for p in (tmp_path / "serial" / "shards").glob("*.npz"))
+        names_p = sorted(p.name for p in (tmp_path / "parallel" / "shards").glob("*.npz"))
+        assert names_s == names_p
+
+        n_compared = 0
+        for name in names_s:
+            a = np.load(tmp_path / "serial" / "shards" / name)
+            b = np.load(tmp_path / "parallel" / "shards" / name)
+            assert sorted(a.files) == sorted(b.files), f"{name}: key sets differ"
+            for k in a.files:
+                assert a[k].dtype == b[k].dtype, f"{name}:{k} dtype"
+                assert np.array_equal(a[k], b[k]), f"{name}:{k} values"
+                n_compared += 1
+        assert n_compared > 0, "no arrays compared; test is vacuous"
+
+    def test_imap_applies_backpressure(self, tmp_path):
+        """The feeder must not race ahead of the consumer.
+
+        `Pool.imap` buffers every result the consumer has not taken, and pass B's
+        workers outrun the parent that stacks and compresses their output -- so
+        without the semaphore the parent accumulates the whole corpus's samples.
+        On the real corpus that is ~125 GB, which presents as a systemd-oomd
+        kill of the terminal scope rather than a MemoryError.
+        """
+        from ptcg_il import shard_writer
+
+        n_tasks = 300
+        n_jobs = 2
+        window = shard_writer._FEATURIZE_INFLIGHT_PER_WORKER * n_jobs
+        pulled = []
+
+        class CountingTasks:
+            def __iter__(self):
+                for i in range(n_tasks):
+                    pulled.append(i)
+                    # Path that does not exist: the worker returns an empty
+                    # result, which is all this test needs.
+                    yield (str(tmp_path / f"missing_{i}.json"), [])
+
+        gen = shard_writer._imap_featurized(CountingTasks(), n_jobs, {})
+        try:
+            next(gen)  # take exactly one result
+            # The feeder may legitimately be one window ahead plus whatever is
+            # in flight; it must not have drained the whole task list.
+            assert len(pulled) <= window + 2 * n_jobs + 1, (
+                f"feeder pulled {len(pulled)} of {n_tasks} tasks after one result "
+                f"was consumed (window is {window}) — backpressure is not applied"
+            )
+        finally:
+            gen.close()
+
+        assert pulled, "no tasks were pulled; test is vacuous"
+
+    def test_abandoning_the_generator_does_not_hang(self, tmp_path):
+        """Closing the generator early must tear the pool down, not deadlock.
+
+        The pool's task handler blocks inside the backpressure semaphore, and
+        `Pool.terminate()` joins that thread — so a non-interruptible acquire
+        turns any early exit (an exception in the consumer, a `break`) into a
+        permanent hang instead of the error being raised.
+        """
+        import threading
+
+        from ptcg_il import shard_writer
+
+        tasks = [(str(tmp_path / f"missing_{i}.json"), []) for i in range(500)]
+        done = threading.Event()
+
+        def run():
+            gen = shard_writer._imap_featurized(tasks, 2, {})
+            next(gen)
+            gen.close()  # -> GeneratorExit -> finally -> pool.terminate()/join()
+            done.set()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout=60)
+        assert done.is_set(), "abandoning the pass-B generator deadlocked on pool teardown"
+
+
+# ============================================================
+# Pass A: selection folded into the scan workers
+# ============================================================
+
+
+class TestPassASelection:
+    """Selection runs inside the pass-A workers, not in the parent afterwards.
+
+    It is 300-cluster multiset Jaccard per player -- measured 39.8 s for 3000
+    episodes, ~12.3 min over the full corpus -- and it used to run serially in
+    the parent over projections the workers had already shipped back.  Folding
+    it in has to leave the keep decision *identical*, because `keep` is what
+    decides which rows exist at all.
+    """
+
+    def test_parallel_pass_a_selects_exactly_what_serial_does(self, tmp_path, monkeypatch):
+        """Same kept pairs, same shards, same meta -- pool or no pool.
+
+        `test_parallel_output_is_identical_to_serial` covers pass B but leaves
+        pass A serial in both arms (its fixture is under the 256-file pool
+        threshold), so without dropping that threshold here the parallel
+        selection path is never executed by any test.
+        """
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=40)
+        monkeypatch.setattr(shard_writer, "_PARALLEL_SCAN_MIN_FILES", 1)
+        monkeypatch.setattr(shard_writer, "_PARALLEL_FEATURIZE_MIN_EPISODES", 1)
+
+        runs = {}
+        for tag, jobs in (("serial", 1), ("parallel", 4)):
+            out_dir = tmp_path / f"passa_{tag}"
+            write_artifacts(out_dir)
+            runs[tag] = build_shards(
+                config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                samples_per_shard=200,
+                jobs=jobs,
+            )
+
+        assert runs["serial"]["n_kept_games"] > 0, "fixture kept nothing; test is vacuous"
+        for key in ("n_kept_games", "total_samples", "n_shards", "split_counts",
+                    "n_loaded", "n_invalid"):
+            assert runs["serial"][key] == runs["parallel"][key], f"summary differs on {key}"
+
+        meta_s = pd.read_parquet(tmp_path / "passa_serial" / "meta.parquet")
+        meta_p = pd.read_parquet(tmp_path / "passa_parallel" / "meta.parquet")
+        pd.testing.assert_frame_equal(meta_s, meta_p)
+
+    def test_streamed_leaderboard_matches_stats(self, tmp_path):
+        """The per-episode tally must reproduce `stats.team_leaderboard`.
+
+        The parent no longer holds the projections that function takes a list
+        of -- ~36 KB each, ~2.0 GiB over the 55k-episode corpus -- so it counts
+        games and wins as pass A streams instead.  Same numbers or the skill
+        weight silently changes for every row.
+        """
+        from ptcg_mine.episode import rewards, teams
+        from ptcg_mine.stats import team_leaderboard
+        from ptcg_il.shard_writer import _leaderboard_from_counts
+
+        episodes, _, _, _, _, _ = TestBuildShards._setup_test_data(
+            tmp_path, n_episodes=12)
+        eps = [ep for _, ep in episodes]
+
+        counts: dict[str, list[int]] = {}
+        for ep in eps:
+            t0, t1 = teams(ep)
+            r0, r1 = rewards(ep)
+            for team, r in ((t0, r0), (t1, r1)):
+                c = counts.setdefault(team, [0, 0])
+                c[0] += 1
+                if r == 1:
+                    c[1] += 1
+
+        streamed = _leaderboard_from_counts(counts)
+        assert streamed == team_leaderboard(eps)
+        assert len(streamed) > 1, "fixture has one team; test cannot separate them"
+        assert sum(v["games"] for v in streamed.values()) == 2 * len(eps)
+        assert any(v["wins"] for v in streamed.values()), "no wins recorded; test is vacuous"
+
+
+# ============================================================
+# meta.parquet is streamed, and the shard buffers are budgeted
+# ============================================================
+
+
+class TestWriterMemoryBounds:
+    """The two parent-side terms that decided whether a full build survives.
+
+    Measured over the 55k-episode corpus: `meta_rows` as a list of dicts was
+    781 B/row -> 2.67 GiB at 3.67M rows with no ceiling at all, and the three
+    shard buffers were 3 x 50000 x 17.2 KiB = 2.58 GiB.  Together with the
+    transient `np.stack` copy that is ~6.9 GiB in the parent while 240 GB of
+    raw JSON streams through page cache -- the pattern that gets the terminal
+    scope killed by systemd-oomd rather than raising MemoryError.
+    """
+
+    def test_meta_is_written_in_row_groups_not_one_frame(self, tmp_path, monkeypatch):
+        """Streaming is observable in the file: several row groups, not one.
+
+        This is the mutation-sensitive half -- reverting to "accumulate every
+        row, then build one DataFrame" yields exactly one row group.
+        """
+        import pyarrow.parquet as pq
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=12)
+        monkeypatch.setattr(shard_writer, "_META_FLUSH_ROWS", 5)
+
+        out_dir = tmp_path / "rowgroups"
+        write_artifacts(out_dir)
+        summary = build_shards(config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                               samples_per_shard=200, jobs=1)
+
+        assert summary["total_samples"] > 5, "fixture fits in one flush; test is vacuous"
+        pf = pq.ParquetFile(out_dir / "meta.parquet")
+        assert pf.num_row_groups > 1, (
+            f"{summary['total_samples']} rows at a 5-row flush produced "
+            f"{pf.num_row_groups} row group(s) -- meta is still accumulated in full"
+        )
+        assert pf.metadata.num_rows == summary["total_samples"]
+
+    def test_row_group_boundaries_do_not_change_meta_content(self, tmp_path, monkeypatch):
+        """Where the flushes land must not alter a single value, type or row order."""
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=12)
+
+        frames = {}
+        for tag, flush in (("many", 7), ("one", 10_000_000)):
+            monkeypatch.setattr(shard_writer, "_META_FLUSH_ROWS", flush)
+            out_dir = tmp_path / f"flush_{tag}"
+            write_artifacts(out_dir)
+            build_shards(config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                         samples_per_shard=200, jobs=1)
+            frames[tag] = pd.read_parquet(out_dir / "meta.parquet")
+
+        assert len(frames["many"]) > 7, "fixture fits in one flush; test is vacuous"
+        pd.testing.assert_frame_equal(frames["many"], frames["one"])
+        assert set(frames["one"].columns) == set(META_COLUMNS)
+
+    def test_meta_residency_is_flat_in_corpus_size(self, tmp_path, monkeypatch):
+        """Rows held in memory must stay bounded by the flush size, whatever n is.
+
+        Asserted on the writer's own high-water mark rather than on process
+        peak.  A whole-process `tracemalloc` bound cannot see this at test
+        scale: 60 vs 120 meta rows is 47 KB vs 94 KB against shard buffers and
+        one parsed episode, so an "accumulate everything" mutant survives it
+        while the real corpus it models is 2.67 GiB.  Measuring the term
+        directly is what makes the assertion sharp enough to mean anything.
+        """
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        flush = 10
+        monkeypatch.setattr(shard_writer, "_META_FLUSH_ROWS", flush)
+
+        real_add = shard_writer._MetaWriter.add
+        high_water: dict[int, int] = {}
+        current_n = {"n": 0}
+
+        def watched_add(self, row, split):
+            real_add(self, row, split)
+            n = current_n["n"]
+            high_water[n] = max(high_water.get(n, 0), len(self._pending))
+
+        monkeypatch.setattr(shard_writer._MetaWriter, "add", watched_add)
+
+        rows = {}
+        for n in (12, 24):
+            current_n["n"] = n
+            raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+                tmp_path / f"n{n}", n_episodes=n)
+            out_dir = tmp_path / f"n{n}" / "out"
+            write_artifacts(out_dir)
+            rows[n] = build_shards(
+                config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                samples_per_shard=20, jobs=1)["total_samples"]
+
+        assert rows[24] > rows[12] * 1.5, (
+            f"corpus did not grow enough to separate the hypotheses "
+            f"({rows[12]} -> {rows[24]} rows); test is vacuous"
+        )
+        assert rows[12] > flush, "fixture never fills one flush; test is vacuous"
+        for n in (12, 24):
+            assert high_water[n] <= flush, (
+                f"n={n}: held {high_water[n]} meta rows against a {flush}-row "
+                f"flush -- meta is accumulating again"
+            )
+        assert high_water[24] == high_water[12], (
+            f"rows held grew {high_water[12]} -> {high_water[24]} as the corpus "
+            f"doubled; meta residency must not scale with n"
+        )
+
+    def test_budget_bounds_the_three_buffers_plus_the_flush_copy(self):
+        """`samples_per_shard_for_budget` must respect the arithmetic it claims."""
+        import numpy as np
+        from ptcg_il.shard_writer import sample_nbytes, samples_per_shard_for_budget
+
+        sample = {f"k{i}": np.zeros((64, 8), dtype=np.float32) for i in range(20)}
+        resident, payload = sample_nbytes(sample)
+        assert resident > payload, "resident must include per-ndarray overhead"
+
+        for budget in (0.25, 1.0, 2.0, 8.0):
+            n = samples_per_shard_for_budget(budget, sample)
+            worst_case = n * (3 * resident + payload)
+            assert worst_case <= budget * 1024 ** 3, (
+                f"{budget} GiB budget -> {n} samples/shard = "
+                f"{worst_case / 1024 ** 3:.2f} GiB worst case"
+            )
+            # and it must not be uselessly conservative
+            assert (n + 1) * (3 * resident + payload) > budget * 1024 ** 3
+
+    def test_budget_never_returns_zero(self):
+        """A budget smaller than one sample still has to make progress."""
+        import numpy as np
+        from ptcg_il.shard_writer import samples_per_shard_for_budget
+
+        huge = {"k": np.zeros((1024, 1024), dtype=np.float64)}  # 8 MiB
+        assert samples_per_shard_for_budget(0.0001, huge) == 1
+
+    def test_smaller_budget_yields_more_shards(self, tmp_path):
+        """The knob has to actually move the shard layout, end to end."""
+        from ptcg_mine.config import MineConfig
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=16)
+
+        runs = {}
+        for tag, budget in (("small", 0.002), ("large", 0.05)):
+            out_dir = tmp_path / f"budget_{tag}"
+            write_artifacts(out_dir)
+            runs[tag] = build_shards(
+                config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                samples_per_shard=None, mem_budget_gb=budget, jobs=1)
+
+        assert runs["small"]["total_samples"] == runs["large"]["total_samples"] > 0
+        assert runs["small"]["n_shards"] > runs["large"]["n_shards"], (
+            f"budget had no effect on layout: {runs['small']['n_shards']} vs "
+            f"{runs['large']['n_shards']} shards"
+        )
+
+    def test_explicit_samples_per_shard_overrides_the_budget(self, tmp_path):
+        """Pinning the shard size must ignore the budget entirely, so an old
+        corpus stays reproducible."""
+        from ptcg_mine.config import MineConfig
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=16)
+        out_dir = tmp_path / "pinned"
+        write_artifacts(out_dir)
+
+        summary = build_shards(
+            config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+            samples_per_shard=20, mem_budget_gb=0.001, jobs=1)
+
+        meta = pd.read_parquet(out_dir / "meta.parquet")
+        assert summary["total_samples"] > 20, "fixture never fills a shard; test is vacuous"
+        assert meta.groupby("shard").size().max() == 20, (
+            "shard size did not follow the pin -- the 0.001 GiB budget would "
+            "have produced a much smaller shard"
+        )
+
+    def test_failed_build_leaves_no_readable_meta(self, tmp_path, monkeypatch):
+        """A half-streamed meta.parquet must not survive as a valid file.
+
+        Unlike the old build-it-all-then-write path, a streaming writer has
+        already committed row groups by the time something downstream raises --
+        and a meta that parses but names shards the run never flushed is worse
+        than no meta at all.
+        """
+        from ptcg_mine.config import MineConfig
+        from ptcg_il import shard_writer
+
+        raw_dir, write_artifacts = TestParallelPassB._corpus_on_disk(
+            tmp_path, n_episodes=12)
+        monkeypatch.setattr(shard_writer, "_META_FLUSH_ROWS", 5)
+
+        out_dir = tmp_path / "boom"
+        write_artifacts(out_dir)
+
+        real_write = shard_writer._write_shard
+        state = {"n": 0}
+
+        def exploding(split, idx, buffer, od):
+            state["n"] += 1
+            if state["n"] > 1:
+                raise RuntimeError("disk full")
+            return real_write(split, idx, buffer, od)
+
+        monkeypatch.setattr(shard_writer, "_write_shard", exploding)
+
+        with pytest.raises(RuntimeError, match="disk full"):
+            build_shards(config=MineConfig(raw_dir=raw_dir, out_dir=out_dir),
+                         samples_per_shard=50, jobs=1)
+
+        assert state["n"] > 1, "fixture never reached a second flush; test is vacuous"
+        meta_path = out_dir / "meta.parquet"
+        if meta_path.exists():
+            with pytest.raises(Exception):
+                pd.read_parquet(meta_path)

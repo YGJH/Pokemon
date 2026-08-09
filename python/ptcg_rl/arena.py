@@ -729,6 +729,10 @@ def main(argv: list[str] | None = None) -> int:
     engine_attack_features = (
         np.load(eaf_path, allow_pickle=True).item() if eaf_path.exists() else None
     )
+    evo_path = data_dir / "evolution_map.npy"
+    evolution_map = (
+        np.load(evo_path, allow_pickle=True).item() if evo_path.exists() else None
+    )
     if engine_card_features is None:
         logger.warning("no engine_card_features.npy in %s — every card gets zero "
                        "features and the whole arena measures noise", data_dir)
@@ -758,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
             policy, vocab, device=str(device), greedy=True, seed=seed,
             engine_card_features=engine_card_features,
             engine_attack_features=engine_attack_features,
+            evolution_map=evolution_map,
         )
 
     t_start = time.perf_counter()

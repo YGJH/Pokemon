@@ -15,7 +15,7 @@ from ptcg_il import cli
 from ptcg_mine import stamp
 
 
-def _args(tmp_path, force=False, samples_per_shard=50000):
+def _args(tmp_path, force=False, samples_per_shard=50000, mem_budget_gb=None):
     return argparse.Namespace(
         raw_dir=str(tmp_path / "raw"),
         out_dir=str(tmp_path / "data"),
@@ -23,6 +23,7 @@ def _args(tmp_path, force=False, samples_per_shard=50000):
         g_min=50,
         jaccard_thresh=0.90,
         samples_per_shard=samples_per_shard,
+        mem_budget_gb=mem_budget_gb,
         force=force,
     )
 
@@ -43,7 +44,8 @@ def corpus(tmp_path):
     return tmp_path
 
 
-def _stamp_it(tmp_path, samples_per_shard=50000, summary=None):
+def _stamp_it(tmp_path, samples_per_shard=50000, mem_budget_gb=None, summary=None):
+    from ptcg_il.shard_writer import DEFAULT_MEM_BUDGET_GB
     from ptcg_mine.config import MineConfig
 
     config = MineConfig(
@@ -58,7 +60,10 @@ def _stamp_it(tmp_path, samples_per_shard=50000, summary=None):
         raw_dir=config.raw_dir,
         data_dir=config.out_dir,
         params=stamp.params_from_config(
-            "shards", config, **{"samples-per-shard": samples_per_shard}
+            "shards", config,
+            **{"samples-per-shard": samples_per_shard,
+               "mem-budget-gb": (DEFAULT_MEM_BUDGET_GB if mem_budget_gb is None
+                                 else mem_budget_gb)},
         ),
         summary=summary or {"total_samples": 187068, "n_shards": 6,
                             "n_kept_games": 900, "n_loaded": 9910,
@@ -74,7 +79,7 @@ def spy(monkeypatch):
 
     calls = []
 
-    def fake(config, samples_per_shard=50000, jobs=None):
+    def fake(config, samples_per_shard=50000, mem_budget_gb=None, jobs=None):
         calls.append(samples_per_shard)
         return {"total_samples": 10, "n_shards": 1, "n_kept_games": 2,
                 "n_loaded": 3, "n_invalid": 0, "split_counts": {"train": 10},
@@ -124,6 +129,16 @@ def test_rebuilds_when_samples_per_shard_changed(corpus, spy):
     assert spy
 
 
+def test_rebuilds_when_mem_budget_changed(corpus, spy):
+    """The budget derives samples_per_shard, so it moves the shard boundaries
+    every `(shard, row)` pair in meta.parquet indexes into — exactly as an
+    explicit --samples-per-shard would."""
+    _stamp_it(corpus, samples_per_shard=None, mem_budget_gb=2.0)
+    assert cli.cmd_build_shards(
+        _args(corpus, samples_per_shard=None, mem_budget_gb=8.0)) == 0
+    assert spy
+
+
 def test_rebuilds_when_shards_deleted(corpus, spy):
     _stamp_it(corpus)
     (corpus / "data" / "shards" / "train-00000.npz").unlink()
@@ -146,7 +161,7 @@ def test_empty_build_is_not_stamped(corpus, monkeypatch):
 
     monkeypatch.setattr(
         shard_writer, "build_shards",
-        lambda config, samples_per_shard=50000, jobs=None: {
+        lambda config, samples_per_shard=50000, mem_budget_gb=None, jobs=None: {
             "total_samples": 0, "n_shards": 0, "n_kept_games": 0, "n_loaded": 0,
             "n_invalid": 0, "split_counts": {}, "meta_path": "meta.parquet"},
     )

@@ -107,13 +107,27 @@ def compute_sample_weights(
 ) -> np.ndarray:
     """Compute per-sample weights from meta.parquet columns (C.3 formula).
 
-    ``w = w_ctx[sel_ctx] * w_arch[archetype_self] * w_outcome``,
+    ``w = w_ctx[sel_ctx] * w_arch[archetype_self] * w_outcome * w_skill``,
     normalized so that ``mean(weights) ≈ 1.0`` over the split.
+
+    ``w_skill`` is the ``skill_w`` column — ``exp(20 * (wilson_lb - 0.5))`` of
+    the row's team, see :func:`ptcg_mine.stats.skill_weight`.  It is what
+    replaced the top-K expert filter, so on a corpus built without that filter
+    it is the *only* thing keeping weak players from being imitated equally.
+
+    A ``meta.parquet`` predating the column falls back to 1.0 with a warning
+    rather than raising, and that fallback is *correct* for it: every row in a
+    filtered corpus is an expert's, so uniform is what skill weighting would
+    have produced anyway.  The combination that would be wrong — an unfiltered
+    corpus read by code that ignores skill — cannot occur, since the column and
+    the filter removal ship in the same change and ``stamp.py`` fingerprints
+    both files.
 
     Parameters
     ----------
     meta : DataFrame
-        Must contain columns ``sel_ctx``, ``archetype_self``, ``won``.
+        Must contain columns ``sel_ctx``, ``archetype_self``, ``won``;
+        ``skill_w`` when built by a post-filter-removal ``build_shards``.
     alpha_ctx : float
         Exponent for rare-context balancing (0.5).
     alpha_arch : float
@@ -148,7 +162,18 @@ def compute_sample_weights(
     # Outcome weight
     w_out = np.where(won, 1.0, w_lost).astype(np.float64)
 
-    weights = w_ctx * w_arch * w_out
+    # Skill weight (see docstring for why a missing column is not fatal)
+    if "skill_w" in meta.columns:
+        w_skill = meta["skill_w"].to_numpy(dtype=np.float64)
+    else:
+        logger.warning(
+            "meta.parquet has no 'skill_w' column — treating every team as "
+            "equally skilled. Correct for an expert-filtered corpus, wrong for "
+            "one built by a current build_shards; rebuild shards if unsure."
+        )
+        w_skill = np.ones(n, dtype=np.float64)
+
+    weights = w_ctx * w_arch * w_out * w_skill
     weights /= weights.mean()  # normalize to mean ≈ 1.0
 
     return weights.astype(np.float32)

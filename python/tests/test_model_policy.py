@@ -450,3 +450,80 @@ def test_multiselect_ce_unchanged_when_every_group_is_a_singleton():
         multiselect_ce(policy, batch, group_marginal=False),
         atol=1e-5,
     )
+
+
+class TestHistoryGruIsGone:
+    """The cross-turn GRU was removed.
+
+    Nothing ever threaded a non-zero ``history_h`` into it, so with ``h = 0`` the
+    GRUCell reduced to ``(1-z) ⊙ tanh(Wx+b)`` — measured mean update gate 0.0146,
+    **69% of output dims tanh-saturated** (|n| > 0.99), CLS rms 1.31 → 0.96, and
+    per-dim corr(pre, post) ≈ −0.07.  Everything downstream of CLS (the value
+    head, and the pointer's CLS key/value) read only that squashed vector.
+    """
+
+    def test_module_and_parameters_are_absent(self):
+        p = Policy(D=32, heads=2, layers=1, ff=64)
+        assert not hasattr(p, "history_gru")
+        assert not [k for k in p.state_dict() if k.startswith("history_gru.")]
+
+    def test_cls_row_is_the_encoder_row_plus_belief(self):
+        """The CLS token must now pass through, not be squashed."""
+        import torch
+
+        p = Policy(D=32, heads=2, layers=1, ff=64).eval()
+        x = _make_synthetic_batch(B=3)
+        with torch.no_grad():
+            rows = p.embed(x)
+            h_enc = p.encoder(rows, x["tok_mask"])
+            belief = p.belief(x["log_feat"], x["log_mask"],
+                              log_card_feat=x.get("log_card_feat"))
+            h, _ = p._encode(x)
+        assert torch.allclose(h[:, 0, :], h_enc[:, 0, :] + belief, atol=1e-6)
+        # The non-CLS rows are untouched either way.
+        assert torch.allclose(h[:, 1:, :], h_enc[:, 1:, :], atol=1e-6)
+
+    def test_cls_is_not_tanh_bounded(self):
+        """The old path squashed every CLS dim into (-1, 1); this one does not."""
+        import torch
+
+        torch.manual_seed(0)
+        p = Policy(D=64, heads=4, layers=2, ff=128).eval()
+        x = _make_synthetic_batch(B=8)
+        with torch.no_grad():
+            h, _ = p._encode(x)
+        assert h[:, 0, :].abs().max() > 1.0, (
+            "CLS is still bounded by 1.0 — a tanh is back in the path"
+        )
+
+    def test_history_h_is_accepted_and_returned_unchanged(self):
+        """Callers across ptcg_rl still pass and unpack it."""
+        import torch
+
+        p = Policy(D=32, heads=2, layers=1, ff=64).eval()
+        x = _make_synthetic_batch(B=2)
+        hh = torch.randn(2, 32)
+        with torch.no_grad():
+            h, out = p._encode(x, hh)
+            logits, value, hist = p(x, hh)
+        assert torch.equal(out, hh)
+        assert logits.shape[0] == value.shape[0] == hist.shape[0] == 2
+
+    def test_stale_history_gru_weights_load_without_raising(self):
+        """Every pre-removal checkpoint carries these four parameters."""
+        import torch
+
+        from ptcg_il.model.policy import load_policy_state
+
+        p = Policy(D=32, heads=2, layers=1, ff=64)
+        sd = dict(p.state_dict())
+        sd["history_gru.weight_ih"] = torch.randn(96, 32)
+        sd["history_gru.weight_hh"] = torch.randn(96, 32)
+        sd["history_gru.bias_ih"] = torch.randn(96)
+        sd["history_gru.bias_hh"] = torch.randn(96)
+
+        load_policy_state(p, sd)  # must not raise
+
+        sd["genuinely_unknown.weight"] = torch.randn(4, 4)
+        with pytest.raises(RuntimeError):
+            load_policy_state(p, sd)

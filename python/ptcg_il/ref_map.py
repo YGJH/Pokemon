@@ -40,9 +40,15 @@ def build_ref_map(observation: dict) -> dict:
     """Build a reference-resolution map from an Observation dict.
 
     Returns a dict keyed by ``(area, playerIndex, index)`` whose values are
-    state-token row indices (1-based per A.1 fixed layout).  Also stores a
-    ``_card_ids`` sub-dict ``{(area, playerIndex, index): card_id}`` for
-    entities in non-tokenized zones.
+    state-token row indices (1-based per A.1 fixed layout).
+
+    It also carries one non-tuple key, ``"_serials"``: ``{serial: row}`` over
+    every in-play Pokémon of both players.  ``serial`` is unique within a match
+    (``AGENT_SPEC`` §2.1) and is the *only* field that distinguishes one
+    ``SKILL`` option from another — two copies of the same card in play share
+    ``cardId`` and differ solely by ``serial``.  Without this map those options
+    are byte-identical to the pointer head, which is what
+    :func:`ptcg_il.featurizer.option_groups` was merging them on.
 
     Parameters
     ----------
@@ -91,7 +97,45 @@ def build_ref_map(observation: dict) -> dict:
     if len(stadium) > 0:
         ref_map[(_STADIUM, -1, 0)] = _STADIUM_ROW
 
+    # --- serial -> token row, for every in-play Pokémon of both players ---
+    serials: dict[int, int] = {}
+    for pidx, base_active, base_bench in (
+        (your_index, _MY_ACTIVE, _MY_BENCH_START),
+        (opp_idx, _OPP_ACTIVE, _OPP_BENCH_START),
+    ):
+        player = state["players"][pidx]
+        active = player["active"]
+        if len(active) > 0 and active[0] is not None:
+            _put_serial(serials, active[0], base_active)
+        for i, poke in enumerate(player["bench"][:5]):
+            _put_serial(serials, poke, base_bench + i)
+    ref_map["_serials"] = serials
+
     return ref_map
+
+
+def _put_serial(serials: dict, poke, row: int) -> None:
+    """Record ``poke["serial"] -> row``, skipping entities that carry no serial.
+
+    A face-down Pokémon is ``None`` and an opponent's may omit the field; both
+    simply do not get an entry, so :func:`serial_row` returns -1 and the option
+    falls back to the null token exactly as it did before.
+    """
+    if not isinstance(poke, dict):
+        return
+    serial = poke.get("serial")
+    if isinstance(serial, int):
+        serials[serial] = row
+
+
+def serial_row(ref_map: dict, serial) -> int:
+    """State-token row of the in-play Pokémon with this ``serial``, or -1."""
+    if serial is None:
+        return -1
+    try:
+        return int(ref_map.get("_serials", {}).get(int(serial), -1))
+    except (TypeError, ValueError):
+        return -1
 
 
 def card_id_at(state: dict, area, player_idx, index, select_deck=None) -> int | None:

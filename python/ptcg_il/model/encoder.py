@@ -45,7 +45,6 @@ class Encoder(nn.Module):
         ff: int = 1024,
         dropout: float = 0.0,
     ):
-        dropout = 0.0
         super().__init__()
         layer = nn.TransformerEncoderLayer(
             d_model=D,

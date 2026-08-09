@@ -173,11 +173,17 @@ def _key(archetype: int | str | None) -> str:
     return str(archetype)
 
 
+def ensemble_key(archetype_self: int | None, n_members: int) -> str:
+    """The record key an ensemble of *n_members* is stored under."""
+    return f"ens-{n_members}-{_key(archetype_self)}"
+
+
 def record_ensemble_baseline(
     data_dir: str | Path,
     archetype_self: int | None,
     ckpt_paths: list[str],
     ensemble_metrics: dict[str, Any],
+    members: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Record ensemble eval scores, SHA-1-pinned to all member checkpoints.
 
@@ -185,6 +191,12 @@ def record_ensemble_baseline(
     member count and archetype, so two archetypes with the same ensemble size
     do not overwrite each other.
     Combinined SHA-1 ensures the gate detects when any member checkpoint changes.
+
+    *members*, when given, is the per-member score table from the same eval
+    (one entry per path, in ``ckpt_paths`` order, as built by
+    :func:`member_record`).  The ensemble eval already computes those numbers
+    per member and used to print and discard them; keeping them is what lets a
+    later ``--ensemble-top`` pick a subset without re-running anything.
     """
     data_dir = Path(data_dir)
 
@@ -193,7 +205,7 @@ def record_ensemble_baseline(
 
     # Key includes both member count AND archetype — two different archetypes
     # with the same ensemble size must not overwrite each other.
-    key = f"ens-{len(ckpt_paths)}-{_key(archetype_self)}"
+    key = ensemble_key(archetype_self, len(ckpt_paths))
     record: dict[str, Any] = {
         "type": "ensemble",
         "member_count": len(ckpt_paths),
@@ -206,8 +218,28 @@ def record_ensemble_baseline(
     record["recorded_at"] = datetime.now(timezone.utc).isoformat()
     if archetype_self is not None:
         record["archetype_self"] = archetype_self
+    if members is not None:
+        if len(members) != len(ckpt_paths):
+            raise ValueError(
+                f"members has {len(members)} entries for {len(ckpt_paths)} "
+                "checkpoints; the table is positional and a mismatch would "
+                "attribute one member's scores to another"
+            )
+        record["members"] = members
 
     all_records = load_baselines(data_dir)
+    # An existing selection belongs to this member set, not to this eval, so it
+    # survives a re-record of the metrics.  It is dropped when the member set
+    # changes, because its indices point into the old one.
+    prev = all_records.get(key)
+    if prev and prev.get("selection"):
+        if prev.get("member_paths") == record["member_paths"]:
+            record["selection"] = prev["selection"]
+        else:
+            logger.info(
+                "Dropping the recorded selection for %s: its member set changed",
+                key,
+            )
     all_records[key] = record
 
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -216,6 +248,83 @@ def record_ensemble_baseline(
         json.dump(all_records, f, indent=2, sort_keys=True)
         f.write("\n")
     logger.info("Ensemble baseline recorded to %s", path)
+    return record
+
+
+def member_record(ckpt_path: str | Path, metrics: dict[str, Any]) -> dict[str, Any]:
+    """One member's entry for an ensemble record's ``members`` table."""
+    entry: dict[str, Any] = {
+        "path": str(Path(ckpt_path).resolve()),
+        "ckpt_sha1": checkpoint_sha1(ckpt_path),
+    }
+    for out_key, metric_key in _RECORDED_METRICS.items():
+        if metric_key in metrics:
+            entry[out_key] = float(metrics[metric_key])
+    return entry
+
+
+def record_ensemble_selection(
+    data_dir: str | Path,
+    archetype_self: int | None,
+    ckpt_paths: list[str],
+    members: list[dict[str, Any]],
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge a member table and a subset ordering into the ensemble record.
+
+    Deliberately *not* part of :func:`record_ensemble_baseline`: the ordering is
+    fit on **val** and the ensemble metrics in that record are a **test** claim.
+    Writing both through one call would mean the only way to store the ordering
+    was to overwrite the held-out numbers with val ones under names the RL gate
+    reads as test — the same class of silent staleness the SHA pinning exists to
+    prevent.  So this touches ``members`` and ``selection`` and nothing else,
+    creating the record if the test eval has not run yet.
+
+    *selection* carries its own ``split`` for exactly that reason: a reader can
+    see which split chose the subset without inferring it from the file.
+    """
+    data_dir = Path(data_dir)
+    key = ensemble_key(archetype_self, len(ckpt_paths))
+    resolved = [str(Path(p).resolve()) for p in ckpt_paths]
+
+    all_records = load_baselines(data_dir)
+    record = all_records.get(key)
+    if record is None:
+        record = {
+            "type": "ensemble",
+            "member_count": len(ckpt_paths),
+            "member_paths": resolved,
+            "combined_sha1": _combined_sha1(ckpt_paths),
+        }
+        if archetype_self is not None:
+            record["archetype_self"] = archetype_self
+    elif record.get("member_paths") != resolved:
+        # Same size, different members: the stored metrics describe a different
+        # ensemble, and an order indexing into this member list would point at
+        # the wrong checkpoints.
+        record = {
+            "type": "ensemble",
+            "member_count": len(ckpt_paths),
+            "member_paths": resolved,
+            "combined_sha1": _combined_sha1(ckpt_paths),
+        }
+        if archetype_self is not None:
+            record["archetype_self"] = archetype_self
+        logger.warning(
+            "%s held a different member set; its ensemble metrics were dropped "
+            "rather than kept against members they do not describe", key,
+        )
+
+    record["members"] = members
+    record["selection"] = selection
+    all_records[key] = record
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = baselines_path(data_dir)
+    with open(path, "w") as f:
+        json.dump(all_records, f, indent=2, sort_keys=True)
+        f.write("\n")
+    logger.info("Ensemble selection recorded to %s under %s", path, key)
     return record
 
 

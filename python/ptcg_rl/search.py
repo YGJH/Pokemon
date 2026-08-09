@@ -484,6 +484,7 @@ def featurize_leaf(
     *,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> tuple[list[float], float]:
     """Featurize a leaf observation and run one forward pass.
 
@@ -508,7 +509,8 @@ def featurize_leaf(
     obs_dict = json.loads(obs_json)
     feats = featurize(obs_dict, vocab,
                       engine_card_features=engine_card_features,
-                      engine_attack_features=engine_attack_features)
+                      engine_attack_features=engine_attack_features,
+                      evolution_map=evolution_map)
 
     # Build batch of size 1
     batch = {}
@@ -816,6 +818,7 @@ def batch_evaluate_leaves(
     *,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> list[dict]:
     """Batch-featurize and GPU-forward a list of leaf dicts.
 
@@ -861,7 +864,8 @@ def batch_evaluate_leaves(
         obs_dict = json.loads(leaf["obs_json"])
         feats = featurize(obs_dict, vocab,
                           engine_card_features=engine_card_features,
-                          engine_attack_features=engine_attack_features)
+                          engine_attack_features=engine_attack_features,
+                          evolution_map=evolution_map)
         feat_list.append(feats)
     LEAF_PERF["t_featurize"] += _time.perf_counter() - _t0
     LEAF_PERF["n_leaves"] += len(leaves)
@@ -1048,6 +1052,7 @@ def mcts_distill_game(
     *,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> list[dict]:
     """Run one self-play game with MCTS distillation targets.
 
@@ -1112,6 +1117,7 @@ def mcts_distill_game(
                     fixed_deck, opp_decklist, config, device, seed,
                     engine_card_features=engine_card_features,
                     engine_attack_features=engine_attack_features,
+                    evolution_map=evolution_map,
                 )
 
             # ── Build enriched decision dicts ──────────────────────
@@ -1145,6 +1151,7 @@ def _run_mcts_on_decisions(
     *,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> dict[int, tuple]:
     """Run batched MCTS on tagged decisions, using the KNOWN opponent deck.
 
@@ -1196,6 +1203,7 @@ def _run_mcts_on_decisions(
                 leaves, policy, vocab, device,
                 engine_card_features=engine_card_features,
                 engine_attack_features=engine_attack_features,
+                evolution_map=evolution_map,
             )
             forest.expand_batch(expansions)
 

@@ -4,6 +4,7 @@ Creates small synthetic .npz shards + meta.parquet so tests are self-contained
 and do not require a full corpus.
 """
 
+import logging
 import tempfile
 from pathlib import Path
 
@@ -230,6 +231,57 @@ class TestComputeSampleWeights:
         # w_ctx[0] = (5/1)^0.5 ≈ 2.236
         # w_ctx[1] = (5/4)^0.5 ≈ 1.118
         assert weights[0] > weights[1]
+
+    def test_skill_weight_is_applied(self):
+        """``skill_w`` scales the row, all else equal.
+
+        This is the only thing standing between an unfiltered corpus and
+        imitating the median player, so it must survive into the final weight
+        rather than being computed and dropped.
+        """
+        meta = pd.DataFrame({
+            "sel_ctx": [0, 0],
+            "archetype_self": [0, 0],
+            "won": [True, True],
+            "skill_w": [4.0, 1.0],
+        })
+        weights = compute_sample_weights(meta)
+        assert np.isclose(weights[0] / weights[1], 4.0, rtol=1e-4)
+        assert np.allclose(weights.mean(), 1.0, atol=1e-5)
+
+    def test_skill_weight_composes_with_the_other_factors(self):
+        """A strong player's loss can still outweigh a weak player's win.
+
+        The factors multiply rather than one overriding another; a 10x skill
+        gap against ``w_lost=0.6`` is the case that pins the ordering.
+        """
+        meta = pd.DataFrame({
+            "sel_ctx": [0, 0],
+            "archetype_self": [0, 0],
+            "won": [False, True],
+            "skill_w": [10.0, 1.0],
+        })
+        weights = compute_sample_weights(meta, w_lost=0.6)
+        assert weights[0] > weights[1]
+        assert np.isclose(weights[0] / weights[1], 6.0, rtol=1e-4)
+
+    def test_missing_skill_column_falls_back_to_uniform_with_a_warning(self, caplog):
+        """A pre-skill-weight meta.parquet still trains, but says so.
+
+        Correct for a corpus that was expert-filtered -- every row is an
+        expert's, so uniform is what weighting would have produced -- but silent
+        is not acceptable, because the same silence on an unfiltered corpus
+        would mean imitating 0.500 play with no visible symptom.
+        """
+        meta = pd.DataFrame({
+            "sel_ctx": [0, 0],
+            "archetype_self": [0, 0],
+            "won": [True, True],
+        })
+        with caplog.at_level(logging.WARNING):
+            weights = compute_sample_weights(meta)
+        assert np.allclose(weights, 1.0, atol=1e-5)
+        assert any("skill_w" in r.message for r in caplog.records)
 
     def test_empty(self):
         """Empty meta returns empty weights."""

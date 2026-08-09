@@ -135,11 +135,21 @@ class OpponentDeckOracle:
         archetypes: dict,
         device: Any = None,
         arch_confidence: float = ARCH_CONFIDENCE,
+        data_dir: Any = None,
     ):
         self.policy = policy
         self.vocab = vocab
         self.device = device or str(next(policy.parameters()).device)
         self.arch_confidence = arch_confidence
+        # Engine feature tables for featurize().  Without them every card
+        # feature the belief heads read is zero — see PolicyAgent._tables.
+        from ptcg_il.featurizer import load_engine_tables
+
+        self.engine_tables = (
+            load_engine_tables(data_dir) if data_dir is not None
+            else {"engine_card_features": None, "engine_attack_features": None,
+                  "evolution_map": None}
+        )
 
         # index -> engine card id.  Derived from id_to_index when the artifact
         # does not carry the reverse map, because getting this wrong produces a
@@ -172,7 +182,7 @@ class OpponentDeckOracle:
 
         from ptcg_il.featurizer import featurize
 
-        feats = featurize(obs_dict, self.vocab)
+        feats = featurize(obs_dict, self.vocab, **self.engine_tables)
         # Same dtype coercion as live_eval._sample_to_batch: the embedding
         # tables index with int64 and the masks must stay bool, so letting
         # numpy's dtype through unchanged is not enough.

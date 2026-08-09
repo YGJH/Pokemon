@@ -203,6 +203,11 @@ _engine_card_features = np.load(
     os.path.join(DATA_DIR, "engine_card_features.npy"), allow_pickle=True).item()
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
+# Feeds hand_feat[3] (`can_evolve`), which is constant 0 without it.  Optional
+# so a bundle built before it was packaged still runs.
+_evolution_map_path = os.path.join(DATA_DIR, "evolution_map.npy")
+_evolution_map = (np.load(_evolution_map_path, allow_pickle=True).item()
+                  if os.path.exists(_evolution_map_path) else None)
 
 _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
 _cfg = _ckpt.get("config", {})
@@ -274,6 +279,7 @@ _opp_visible_cards: list[int] = []
 import model.search_infer as _si
 _si._engine_card_features = _engine_card_features
 _si._engine_attack_features = _engine_attack_features
+_si._evolution_map = _evolution_map
 
 
 def agent(obs_dict: dict) -> list[int]:
@@ -452,6 +458,11 @@ _engine_card_features = np.load(
     os.path.join(DATA_DIR, "engine_card_features.npy"), allow_pickle=True).item()
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
+# Feeds hand_feat[3] (`can_evolve`), which is constant 0 without it.  Optional
+# so a bundle built before it was packaged still runs.
+_evolution_map_path = os.path.join(DATA_DIR, "evolution_map.npy")
+_evolution_map = (np.load(_evolution_map_path, allow_pickle=True).item()
+                  if os.path.exists(_evolution_map_path) else None)
 
 # All-card feature matrix.  The belief heads own it, and Policy builds them
 # unconditionally, so it is still required to construct the module and load the
@@ -603,6 +614,7 @@ def agent(obs_dict: dict) -> list[int]:
             obs_dict, _vocab,
             engine_card_features=_engine_card_features,
             engine_attack_features=_engine_attack_features,
+            evolution_map=_evolution_map,
         )
         batch = _to_batch(feats)
         feat_max_count = int(feats.get("maxCount", max_count))
@@ -966,7 +978,7 @@ def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
     # (see scripts/build_submit.sh), so python/ has to be on the path too.
     sys.path.insert(0, str(src_dir / "python"))
     from cg.api import all_attack, all_card_data
-    from ptcg_mine.cards import card_static_row, attack_static_row
+    from ptcg_mine.cards import build_evolution_map, card_static_row, attack_static_row
 
     cards, attacks = all_card_data(), all_attack()
     # card.attacks holds attack *ids*, so the row builder needs the lookup to
@@ -978,6 +990,13 @@ def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
     np.save(dst_dir / "engine_attack_features.npy", attack_feats)
     print(f"  Built engine_card_features.npy ({len(card_feats)} cards)")
     print(f"  Built engine_attack_features.npy ({len(attack_feats)} attacks)")
+    # Built here rather than copied from data/ for the same reason as the two
+    # above: it must describe the *competition* engine's evolution lines, not
+    # whatever the corpus was mined against.  `hand_feat[3]` (`can_evolve`) is
+    # constant 0 without it.
+    evo = build_evolution_map(cards)
+    np.save(dst_dir / "evolution_map.npy", evo)
+    print(f"  Built evolution_map.npy ({len(evo)} evolution lines)")
 
 
 def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = None,

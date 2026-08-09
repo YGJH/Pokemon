@@ -135,6 +135,7 @@ class PolicyAgent:
         fixed_deck: list[int],
         *,
         device: str = "cpu",
+        data_dir: Any = None,
     ) -> None:
         from ptcg_il.featurizer import normalize_vocab
 
@@ -143,10 +144,53 @@ class PolicyAgent:
         self.vocab_full = normalize_vocab(vocab)
         self.fixed_deck = list(fixed_deck)
         self.device = device
+        # Path, not the loaded dicts: every job argument is pickled to a worker
+        # process (see the class docstring), and the card table alone is 1.1 MB.
+        # The tables are loaded on first use and dropped again by __getstate__.
+        self.data_dir = str(data_dir) if data_dir is not None else None
+        self._engine_tables: dict | None = None
 
         policy.eval()
         policy.to(device)
         self.policy = policy
+
+    def _tables(self) -> dict:
+        """The static tables ``featurize`` needs, loaded once per process.
+
+        Without these ``featurize`` returns **zeros** for every ``*_card_feat``
+        and ``opt_attack_feat`` tensor -- so the agent played with no card
+        identity, no attack identity, no KO-pressure block and no hand legality
+        flags, against a model trained with all of them.  It does not raise and
+        it does not look wrong from outside; it just quietly deletes most of the
+        observation.  ``data_dir=None`` keeps the old behaviour for callers that
+        genuinely have no artifacts, and says so once.
+        """
+        if self._engine_tables is None:
+            if self.data_dir is None:
+                if not getattr(type(self), "_warned_no_tables", False):
+                    logger.warning(
+                        "PolicyAgent built without data_dir: engine card/attack "
+                        "features are unavailable, so every card feature will be "
+                        "zero and the policy is running on a fraction of its "
+                        "training inputs. Pass data_dir to fix this."
+                    )
+                    type(self)._warned_no_tables = True
+                self._engine_tables = {
+                    "engine_card_features": None,
+                    "engine_attack_features": None,
+                    "evolution_map": None,
+                }
+            else:
+                from ptcg_il.featurizer import load_engine_tables
+
+                self._engine_tables = load_engine_tables(self.data_dir)
+        return self._engine_tables
+
+    def __getstate__(self) -> dict:
+        """Drop the loaded tables before pickling; the worker reloads them."""
+        state = self.__dict__.copy()
+        state["_engine_tables"] = None
+        return state
 
     def __call__(self, obs_dict: dict) -> list[int]:
         import torch
@@ -159,7 +203,8 @@ class PolicyAgent:
 
         # Featurize (action=None handled natively for inference mode)
         sample = featurize(
-            obs_dict, self.vocab_full, value_target=0.0, sample_weight=1.0)
+            obs_dict, self.vocab_full, value_target=0.0, sample_weight=1.0,
+            **self._tables())
 
         # Build batch of size 1
         batch = _sample_to_batch(sample, self.device)
@@ -204,12 +249,15 @@ def make_agent_from_policy(
     fixed_deck: list[int],
     *,
     device: str = "cpu",
+    data_dir: Any = None,
 ) -> Callable[[dict], list[int]]:
     """Wrap an EMA Policy as a picklable ``agent(obs_dict)`` callable.
 
-    Thin factory kept for API compatibility; see :class:`PolicyAgent`.
+    Thin factory kept for API compatibility; see :class:`PolicyAgent`.  Pass
+    *data_dir* (the mining output directory) so the agent can load the engine
+    feature tables — without it every card feature it sees is zero.
     """
-    return PolicyAgent(policy, vocab, fixed_deck, device=device)
+    return PolicyAgent(policy, vocab, fixed_deck, device=device, data_dir=data_dir)
 
 
 def _sample_to_batch(sample: dict[str, np.ndarray], device: str) -> dict:
@@ -902,18 +950,22 @@ class LiveEvaluator:
         vocab: dict,
         fixed_deck: list[int],
         n_workers: int | None = None,
+        data_dir: Any = None,
     ):
         self.policy = policy
         self.vocab = vocab
         self.fixed_deck = fixed_deck
         self.n_workers = n_workers or (os.cpu_count() or 4)
+        self.data_dir = data_dir
 
         # Extract id_to_index for OOV tracking in worker processes
         raw = vocab.get("id_to_index", {})
         self._vocab_id_to_index = {int(k): int(v) for k, v in raw.items()}
 
-        # Build the agent wrapper (CPU only — each process gets its own copy)
-        self._agent_fn = make_agent_from_policy(policy, vocab, fixed_deck, device="cpu")
+        # Build the agent wrapper (CPU only — each process gets its own copy).
+        # data_dir carries the engine feature tables; see PolicyAgent._tables.
+        self._agent_fn = make_agent_from_policy(
+            policy, vocab, fixed_deck, device="cpu", data_dir=data_dir)
 
     def eval_vs_opponent(
         self,

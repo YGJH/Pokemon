@@ -83,6 +83,11 @@ _engine_card_features = np.load(
     os.path.join(DATA_DIR, "engine_card_features.npy"), allow_pickle=True).item()
 _engine_attack_features = np.load(
     os.path.join(DATA_DIR, "engine_attack_features.npy"), allow_pickle=True).item()
+# Feeds hand_feat[3] (`can_evolve`), which is constant 0 without it.  Optional
+# so a bundle built before it was packaged still runs.
+_evolution_map_path = os.path.join(DATA_DIR, "evolution_map.npy")
+_evolution_map = (np.load(_evolution_map_path, allow_pickle=True).item()
+                  if os.path.exists(_evolution_map_path) else None)
 
 _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
 _cfg = _ckpt.get("config", {})
@@ -218,6 +223,7 @@ def agent(obs_dict: dict) -> list[int]:
             obs_dict, _vocab,
             engine_card_features=_engine_card_features,
             engine_attack_features=_engine_attack_features,
+            evolution_map=_evolution_map,
         )
         batch = _to_batch(feats)
         feat_max_count = int(feats.get("maxCount", max_count))

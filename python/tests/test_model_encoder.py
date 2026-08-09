@@ -133,3 +133,48 @@ class TestEncoder:
         assert layer.self_attn.embed_dim == 256
         assert layer.self_attn.num_heads == 8
         assert len(enc.enc.layers) == 4
+
+
+class TestDropoutArgumentIsHonoured:
+    """C3 — ``Encoder.__init__`` began with ``dropout = 0.0``, before
+    ``super().__init__()``, which made the constructor argument unreachable.
+    The model therefore trained with no dropout no matter what was configured.
+    """
+
+    def test_dropout_reaches_the_transformer_layers(self):
+        import torch.nn as nn
+
+        from ptcg_il.model.encoder import Encoder
+
+        enc = Encoder(D=32, heads=2, layers=2, ff=64, dropout=0.25)
+        rates = [m.p for m in enc.modules() if isinstance(m, nn.Dropout)]
+        assert rates, "no Dropout modules found — encoder shape changed"
+        assert all(r == 0.25 for r in rates), (
+            f"dropout argument did not reach the layers: {sorted(set(rates))}"
+        )
+
+    def test_default_is_still_zero(self):
+        import torch.nn as nn
+
+        from ptcg_il.model.encoder import Encoder
+
+        enc = Encoder(D=32, heads=2, layers=1, ff=64)
+        assert all(m.p == 0.0 for m in enc.modules() if isinstance(m, nn.Dropout))
+
+    def test_dropout_actually_perturbs_activations_in_train_mode(self):
+        """A rate that reaches the layers but is never applied is still dead."""
+        import torch
+
+        from ptcg_il.model.encoder import Encoder
+
+        torch.manual_seed(0)
+        enc = Encoder(D=32, heads=2, layers=2, ff=64, dropout=0.5).train()
+        rows = torch.randn(4, 46, 32)
+        mask = torch.ones(4, 46, dtype=torch.bool)
+        a, b = enc(rows, mask), enc(rows, mask)
+        assert not torch.allclose(a, b), "dropout is configured but has no effect"
+
+        enc.eval()
+        assert torch.allclose(enc(rows, mask), enc(rows, mask)), (
+            "eval mode must be deterministic"
+        )

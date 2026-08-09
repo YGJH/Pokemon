@@ -13,7 +13,7 @@ Raises ``ValueError`` if ``select is None`` (deck-selection steps are excluded
 
 import numpy as np
 
-from ptcg_il.ref_map import build_ref_map, card_id_at
+from ptcg_il.ref_map import build_ref_map, card_id_at, serial_row
 
 # ============================================================
 # Normalizers (A.2)
@@ -21,7 +21,22 @@ from ptcg_il.ref_map import build_ref_map, card_id_at
 HP_N = 400.0
 RETREAT_N = 4.0
 ATKDMG_N = 350.0
-ENERGY_N = 12.0
+#: Divisor for attached-energy counts.  Was 12.0 -- the number of energy *types*
+#: -- which is not a bound on any count and over-allocated the range badly: the
+#: measured maximum energies on one Pokemon is 7, so the busiest histogram bin
+#: only ever reached 0.58 and the per-bin std over 426 877 occupied slots was
+#: 0.02-0.045, against 0.37-0.41 for the binary flags sharing the same
+#: ``poke_mlp`` input.  Energy count is the quantity most decisions turn on and
+#: it was the weakest signal in the token.  8.0 covers the measured max with
+#: headroom and keeps the fixed-divisor scheme (no z-scoring, all-zero rows stay
+#: the PAD sentinel -- see the normalization note in TRANSFORMER_IL_SPEC A.2).
+#:
+#: ``_ko_pressure`` multiplies by this constant to recover raw counts, so the two
+#: stay consistent automatically.  Changing it *redefines* every existing shard
+#: and checkpoint: shards are rebuilt because ``ptcg_mine.stamp`` fingerprints
+#: this file, but checkpoints are not -- ``Policy.config["feat_dims"]`` records
+#: widths only, and this changes meaning at constant width.
+ENERGY_N = 8.0
 DECK_N = 60.0
 HAND_N = 30.0
 TURN_N = 50.0
@@ -81,6 +96,13 @@ CARD_TYPE_SUPPORTER = 3
 CARD_TYPE_STADIUM = 4
 CARD_TYPE_BASIC_ENERGY = 5
 CARD_TYPE_SPECIAL_ENERGY = 6
+
+#: ``cg.api.AreaType`` values this module dereferences by name.  Written as bare
+#: literals elsewhere in ``_build_option_tokens`` (``_ref(2, ...)`` for the
+#: hand); named here because ATTACK and RETREAT resolve the *Active* slot and
+#: reading area 5 (BENCH) instead would silently gather the wrong Pokemon.
+AREA_HAND = 2
+AREA_ACTIVE = 4
 
 # ============================================================
 # Enum sizes (A.1)
@@ -917,16 +939,43 @@ def _build_option_tokens(
                 _set_card(area, your_index, index)
 
         elif otype == 12:  # RETREAT
-            opt_src_idx[new_j] = 1  # my active (row 1)
+            # Resolved rather than hardcoded to 1: with no active in play the
+            # row does not exist, and pointing at it gathers a PAD token as if
+            # it were a real Pokemon.  Measured on 60 episodes, RETREAT never
+            # offers two options in one select and carries no fields beyond
+            # `type`, so there is nothing here to disambiguate -- this is a
+            # correctness fix, not a discrimination one.
+            opt_src_idx[new_j] = _ref(AREA_ACTIVE, your_index, 0)
+            _set_card(AREA_ACTIVE, your_index, 0)
 
         elif otype == 13:  # ATTACK
-            opt_src_idx[new_j] = 1  # my active (row 1)
+            # The attacker is always my active; resolve it so an absent active
+            # yields -1 (the null token) instead of a PAD row.
+            opt_src_idx[new_j] = _ref(AREA_ACTIVE, your_index, 0)
+            # Attack options carry *only* `attackId` and `type` (measured over
+            # 60 episodes: no area, no index, no cardId).  So the attacker's
+            # identity has to be dereferenced from the state; without it
+            # `card_enc` contributed exactly 0.0 to every attack option and four
+            # of the pointer's five additive base terms were byte-identical
+            # across the options.
+            #
+            # Note what this does *not* fix: two attacks of the same Pokemon
+            # still share src, tgt and card id, because `attackId` is the only
+            # field that differs between them.  Telling them apart remains the
+            # job of `opt_attack_feat` and the damage-preview scalars below.
+            _set_card(AREA_ACTIVE, your_index, 0)
             opt_attack_idx[new_j] = _raw_attack(opt.get("attackId"))
             # Some attacks target specific bench slots (snipe effects)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
                 opt_tgt_idx[new_j] = _ref(in_play_area, 1 - your_index, in_play_idx)
+            else:
+                # Default target is the defending Active.  The damage preview
+                # below already assumes slot 6 in this case, so leaving tgt at
+                # -1 pointed the query at the null token while the scalar
+                # described the opponent's Active.
+                opt_tgt_idx[new_j] = _ref(AREA_ACTIVE, 1 - your_index, 0)
             # Damage preview.  Target is the snipe slot when the option names
             # one, else the opponent's Active (poke slot 6).  opt_tgt_idx is a
             # state-token row index (1..12), so poke slot = row - 1.
@@ -966,7 +1015,19 @@ def _build_option_tokens(
             else:
                 _set_card(area, player_idx, index)
 
-        elif otype in (1, 2, 14, 15, 16):  # YES, NO, END, SKILL, SPECIAL_CONDITION
+        elif otype == 15:  # SKILL
+            # SKILL carries `cardId` *and* `serial`.  When two copies of the
+            # same card are in play they offer one option each, sharing cardId
+            # and differing only by serial -- measured: 17 of 17 multi-SKILL
+            # selects differ on `serial` and nothing else.  Resolving it to the
+            # owning Pokemon's token row is what makes those options separable
+            # at all; on cardId alone they were one `option_groups` class.
+            cid = opt.get("cardId")
+            if cid is not None:
+                opt_card_id[new_j] = _raw_card(cid)
+            opt_src_idx[new_j] = serial_row(ref_map, opt.get("serial"))
+
+        elif otype in (1, 2, 14, 16):  # YES, NO, END, SPECIAL_CONDITION
             # src = -1, tgt = -1 (constant-type options)
             cid = opt.get("cardId")
             if cid is not None:
@@ -1271,6 +1332,98 @@ def gather_static_feats(ids: np.ndarray, table: np.ndarray) -> np.ndarray:
     return out
 
 
+#: ``(id(engine_features), feat_dim) -> (engine_features, dense_table)``.
+#:
+#: :func:`featurize` gathers ~440 card/attack rows per call.  Doing that through
+#: :func:`_ids_to_feat` costs a Python ``np.ndindex`` loop -- measured 517
+#: iterations and **41% of featurize wall time** (0.062 s of 0.150 s over 300
+#: real observations) -- while :func:`gather_static_feats` does the same work as
+#: one fancy-index.  The catch is that the vectorised form needs the *dense*
+#: table, and rebuilding a 1268x212 array per call would cost more than it saves,
+#: so it is built once per feature dict and reused.
+#:
+#: The cached tuple holds a **strong reference** to the source dict on purpose:
+#: without it the dict could be collected and a later dict could be allocated at
+#: the same address, so ``id()`` would hit a table belonging to a different
+#: mapping.  The ``is`` re-check below makes that impossible rather than
+#: unlikely.  Callers hold these dicts for the process lifetime and there are
+#: only two of them (cards, attacks), so the cache stays at two entries.
+_STATIC_TABLE_CACHE: dict[tuple[int, int], tuple[dict, np.ndarray]] = {}
+
+
+def _static_table_for(engine_features: dict | None, feat_dim: int) -> np.ndarray | None:
+    """Dense table for *engine_features*, built once and memoized.  None passes through."""
+    if engine_features is None:
+        return None
+    key = (id(engine_features), feat_dim)
+    hit = _STATIC_TABLE_CACHE.get(key)
+    if hit is not None and hit[0] is engine_features:
+        return hit[1]
+    table = build_static_table(engine_features, feat_dim)
+    _STATIC_TABLE_CACHE[key] = (engine_features, table)
+    return table
+
+
+def _feat_gatherer(engine_features: dict | None, feat_dim: int):
+    """Return ``ids -> float32[*ids.shape, feat_dim]``, vectorised when possible.
+
+    Exactly equivalent to ``_ids_to_feat(ids, engine_features, feat_dim, None)``:
+    ids <= 0, ids past the table, and ids the engine has no features for all
+    gather zeros.  Kept as a factory so the table lookup happens once per
+    :func:`featurize` call rather than once per tensor.
+    """
+    table = _static_table_for(engine_features, feat_dim)
+    if table is None:
+        def gather(ids: np.ndarray) -> np.ndarray:
+            return np.zeros(np.shape(ids) + (feat_dim,), dtype=np.float32)
+        return gather
+
+    def gather(ids: np.ndarray) -> np.ndarray:
+        return gather_static_feats(ids, table)
+    return gather
+
+
+#: Filenames written by ``ptcg_mine.mine`` that :func:`featurize` consumes.
+ENGINE_CARD_FEATURES_FILE = "engine_card_features.npy"
+ENGINE_ATTACK_FEATURES_FILE = "engine_attack_features.npy"
+EVOLUTION_MAP_FILE = "evolution_map.npy"
+
+
+def load_engine_tables(data_dir) -> dict[str, dict | None]:
+    """Load the three static tables :func:`featurize` takes, from *data_dir*.
+
+    Returns ``{"engine_card_features", "engine_attack_features",
+    "evolution_map"}``, each ``None`` when its file is absent, so the result can
+    be splatted straight into :func:`featurize`.
+
+    This exists because every one of these was optional at the call site and the
+    inference paths simply never passed them.  ``featurize`` treats a missing
+    table as "no information" rather than an error -- which is right for the one
+    caller that genuinely has none, and silently catastrophic for the rest:
+    with ``engine_card_features=None`` every ``*_card_feat`` tensor is zeros, so
+    the model plays with no card identity at all while it was trained with full
+    identity.  Keeping the load in one function makes that hard to do by
+    accident again.
+    """
+    import pathlib
+
+    import numpy as np
+
+    d = pathlib.Path(data_dir)
+
+    def _load(name):
+        path = d / name
+        if not path.exists():
+            return None
+        return np.load(path, allow_pickle=True).item()
+
+    return {
+        "engine_card_features": _load(ENGINE_CARD_FEATURES_FILE),
+        "engine_attack_features": _load(ENGINE_ATTACK_FEATURES_FILE),
+        "evolution_map": _load(EVOLUTION_MAP_FILE),
+    }
+
+
 def featurize(
     obs_dict: dict,
     vocab: dict,
@@ -1330,6 +1483,11 @@ def featurize(
     # Build ref map for option resolution
     ref_map = build_ref_map(obs_dict)
 
+    # Vectorised gathers, bound once per call.  These replace per-tensor
+    # `_ids_to_feat` calls and are exactly equivalent — see `_feat_gatherer`.
+    _cfeat = _feat_gatherer(engine_card_features, F_CARD)
+    _afeat = _feat_gatherer(engine_attack_features, F_ATK)
+
     # --- State: card identity ---
     poke_card_id, poke_feat, poke_tool_ids, poke_energy_ids = _build_poke_tokens(
         state, your_index
@@ -1337,7 +1495,7 @@ def featurize(
     # Hoist the card-feature conversion early — _build_cls_features and
     # _build_option_tokens both need the same array, and the result dict
     # reuses it instead of calling _cfeat(poke_card_id) a second time.
-    poke_card_feat = _ids_to_feat(poke_card_id, engine_card_features, F_CARD, None)
+    poke_card_feat = _cfeat(poke_card_id)
     hand_card_id, hand_feat = _build_hand_tokens(
         state, your_index, engine_card_features, evolution_map,
     )
@@ -1387,11 +1545,9 @@ def featurize(
 
     # --- Assemble full dict (A.4) ---
     # ── Convert all card/attack IDs to feature vectors ─────────────────
-    # The ids above are raw *engine* ids, so no index_to_id hop: passing None
-    # makes _ids_to_feat look them up directly.  Every card the engine knows
-    # about therefore gets its real features, in-vocab or not.
-    _cfeat = lambda ids: _ids_to_feat(ids, engine_card_features, F_CARD, None)
-    _afeat = lambda ids: _ids_to_feat(ids, engine_attack_features, F_ATK, None)
+    # The ids above are raw *engine* ids and the gathers are keyed by them
+    # directly, so every card the engine knows about gets its real features,
+    # in-vocab or not.  (`_cfeat`/`_afeat` were bound at the top of the call.)
     opt_card_feat = _cfeat(opt_card_id)
     opt_attack_feat = _afeat(opt_attack_idx)
     opt_group = option_groups(

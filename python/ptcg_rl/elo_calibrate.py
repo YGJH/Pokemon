@@ -228,6 +228,7 @@ def _eval_pair(
     seed: int,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> tuple[int, int]:
     """Play *n_games* between model_a (our player) and model_b (opponent).
 
@@ -241,10 +242,12 @@ def _eval_pair(
 
     actor_a = PolicyActor(model_a, vocab, device=str(device), greedy=True, seed=seed,
                           engine_card_features=engine_card_features,
-                          engine_attack_features=engine_attack_features)
+                          engine_attack_features=engine_attack_features,
+                          evolution_map=evolution_map)
     actor_b = PolicyActor(model_b, vocab, device=str(device), greedy=True, seed=seed + 1,
                           engine_card_features=engine_card_features,
-                          engine_attack_features=engine_attack_features)
+                          engine_attack_features=engine_attack_features,
+                          evolution_map=evolution_map)
 
     wins, losses = 0, 0
     n_done = 0
@@ -333,6 +336,7 @@ def _eval_with_seats(
     device: torch.device, games: int, seed: int,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> tuple[int, int]:
     """Play *games* between *model_a* and *model_b*, balanced across seats.
 
@@ -355,6 +359,7 @@ def _eval_with_seats(
             per_seat, seed + seat,
             engine_card_features=engine_card_features,
             engine_attack_features=engine_attack_features,
+            evolution_map=evolution_map,
         )
         if seat == 0:
             wins_a += w      # a is our_player → w = a's wins
@@ -371,6 +376,7 @@ def _tournament_round_robin(
     games: int, seed: int, elo: EloTracker,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> None:
     """Round-robin: every model plays every other model.
 
@@ -416,6 +422,7 @@ def _tournament_round_robin(
                 games, pair_seed,
                 engine_card_features=engine_card_features,
                 engine_attack_features=engine_attack_features,
+                evolution_map=evolution_map,
             )
             pair_idx += 1
             elo.update(name_i, name_j, wins_i, losses_i)
@@ -441,6 +448,7 @@ def _tournament_reference(
     games: int, seed: int, elo: EloTracker,
     engine_card_features: dict | None = None,
     engine_attack_features: dict | None = None,
+    evolution_map: dict | None = None,
 ) -> None:
     """Reference mode: each non-reference model plays only ckpt-best."""
     # Find ckpt-best path
@@ -481,6 +489,7 @@ def _tournament_reference(
             games, seed + i * 10,
             engine_card_features=engine_card_features,
             engine_attack_features=engine_attack_features,
+            evolution_map=evolution_map,
         )
         wr = wins_for_model / max(wins_for_model + losses_for_model, 1)
         elo.update(name, "ckpt-best", wins_for_model, losses_for_model)
@@ -523,6 +532,10 @@ def main(argv: list[str] | None = None) -> int:
     if eaf_path.exists():
         engine_attack_features = np.load(eaf_path, allow_pickle=True).item()
         logger.info("Engine attack features loaded (%d attacks)", len(engine_attack_features))
+    evo_path = data_dir / "evolution_map.npy"
+    evolution_map = (
+        np.load(evo_path, allow_pickle=True).item() if evo_path.exists() else None
+    )
     if engine_card_features is None:
         logger.warning("No engine_card_features.npy — cards will get zero features!")
 
@@ -545,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir, device, args.games, args.seed, elo,
             engine_card_features=engine_card_features,
             engine_attack_features=engine_attack_features,
+            evolution_map=evolution_map,
         )
     else:
         _tournament_reference(
@@ -552,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             data_dir, device, args.games, args.seed, elo,
             engine_card_features=engine_card_features,
             engine_attack_features=engine_attack_features,
+            evolution_map=evolution_map,
         )
 
     # ── Save ────────────────────────────────────────────────────────────

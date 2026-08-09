@@ -382,3 +382,72 @@ class TestAgentsArePicklable:
         with ProcessPoolExecutor(max_workers=1) as ex:
             got = ex.submit(_call_deck_step, agent).result()
         assert got == list(range(60))
+
+
+class TestPolicyAgentLoadsEngineFeatures:
+    """A1 — ``PolicyAgent`` used to featurize with no engine tables at all.
+
+    ``featurize`` treats a missing table as "no information", so every
+    ``*_card_feat`` and ``opt_attack_feat`` tensor came out zeros: the agent
+    played with no card identity, no attack identity, no KO-pressure block and
+    no hand legality flags, against a model trained with all of them.  Nothing
+    raised and nothing looked wrong from outside.
+    """
+
+    @staticmethod
+    def _tiny_policy():
+        from ptcg_il.model.policy import Policy
+        return Policy(D=32, heads=2, layers=1, ff=64).eval()
+
+    @staticmethod
+    def _vocab():
+        return {"id_to_index": {"7": 2}, "attack_id_to_index": {"1": 2}}
+
+    def _agent(self, data_dir):
+        return make_agent_from_policy(
+            self._tiny_policy(), self._vocab(), list(range(60)), data_dir=data_dir)
+
+    def test_tables_are_loaded_from_data_dir(self, tmp_path):
+        import numpy as np
+
+        from ptcg_il.featurizer import F_ATK, F_CARD
+
+        np.save(tmp_path / "engine_card_features.npy",
+                {7: np.ones(F_CARD, dtype=np.float32)})
+        np.save(tmp_path / "engine_attack_features.npy",
+                {1: np.ones(F_ATK, dtype=np.float32)})
+        np.save(tmp_path / "evolution_map.npy", {7: [3]})
+
+        tables = self._agent(tmp_path)._tables()
+        assert tables["engine_card_features"] is not None
+        assert tables["engine_attack_features"] is not None
+        assert tables["evolution_map"] == {7: [3]}
+
+    def test_missing_data_dir_still_runs_but_yields_nothing(self):
+        """The old behaviour stays reachable — it just no longer happens silently."""
+        tables = self._agent(None)._tables()
+        assert set(tables) == {
+            "engine_card_features", "engine_attack_features", "evolution_map"}
+        assert all(v is None for v in tables.values())
+
+    def test_absent_files_do_not_raise(self, tmp_path):
+        tables = self._agent(tmp_path)._tables()
+        assert all(v is None for v in tables.values())
+
+    def test_tables_are_not_pickled_to_workers(self, tmp_path):
+        """Only the path travels; 1.1 MB of card table per job would not."""
+        import numpy as np
+
+        from ptcg_il.featurizer import F_CARD
+
+        np.save(tmp_path / "engine_card_features.npy",
+                {7: np.ones(F_CARD, dtype=np.float32)})
+        agent = self._agent(tmp_path)
+        agent._tables()                       # force the load
+        assert agent._engine_tables is not None
+
+        restored = pickle.loads(pickle.dumps(agent))
+        assert restored._engine_tables is None, "loaded tables were pickled"
+        assert restored.data_dir == str(tmp_path)
+        # ...and the worker rebuilds them on demand.
+        assert restored._tables()["engine_card_features"] is not None

@@ -23,7 +23,7 @@ python/checkpoints*/
 submission.tar.gz
 data/
 *.stdout
-
+nohup.out
 
 *.pyc
 *.tar.gz
