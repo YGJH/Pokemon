@@ -90,3 +90,43 @@ def ability_keyword_row(card) -> np.ndarray:
 def attack_keyword_row(attack) -> np.ndarray:
     """float32[K_EFFECT] over ``attack.text``."""
     return effect_keyword_row([getattr(attack, "text", "") or ""])
+
+
+# ============================================================
+# Draw-count parsing (for attack_static_row numerics)
+# ============================================================
+
+_DRAW_FIXED_PAT = re.compile(r"draw (\d+) (?:more )?card", re.IGNORECASE)
+_DRAW_TO_HAND_PAT = re.compile(
+    r"(?:draw cards until you have|you may draw cards until you have) (\d+) card",
+    re.IGNORECASE,
+)
+_DRAW_A_CARD_PAT = re.compile(r"draw a card", re.IGNORECASE)
+_DRAW_BOTH_PAT = re.compile(r"each player draws (\d+) card", re.IGNORECASE)
+
+
+def draw_fixed(attack) -> int:
+    """Explicit draw count from attack oracle text, or 0.
+
+    Matches ``draw 2 cards``, ``Draw a card.`` (implicit 1), and
+    ``each player draws N``.  Does *not* match draw-to-hand-size forms.
+    """
+    text = getattr(attack, "text", "") or ""
+    m = _DRAW_FIXED_PAT.search(text)
+    if m:
+        return int(m.group(1))
+    if _DRAW_A_CARD_PAT.search(text):
+        return 1
+    m = _DRAW_BOTH_PAT.search(text)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def draw_to_hand(attack) -> int:
+    """Target hand size in 'draw cards until you have N cards', or 0."""
+    text = getattr(attack, "text", "") or ""
+    m = _DRAW_TO_HAND_PAT.search(text)
+    if m:
+        return int(m.group(1))
+    return 0

@@ -42,19 +42,40 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from ptcg_il.featurizer import (
-    CARD_FEAT_SOURCES,
-    F_ATK,
-    F_CARD,
-    LOG_CARD_ID_COLUMN,
-    build_static_table,
-    gather_static_feats,
-)
+from ptcg_il.featurizer import CARD_FEAT_SOURCES
 
 logger = logging.getLogger(__name__)
 
 #: Subdirectory of ``shards/`` holding the decompressed, mmap-able copies.
 MMAP_CACHE_DIRNAME = ".mmap-cache"
+
+#: Subdirectory of ``shards/`` holding one archetype's rows, densely packed.
+#: One directory per (archetype, split) so the two datasets a training run
+#: builds never share a stamp.
+#:
+#: The split comes **first** on purpose.  ``meta["shard"]`` is filtered with
+#: ``str.startswith(split)`` and that prefix is the only thing separating the
+#: 80/10/10 episode split once rows are renamed — a dense shard whose name did
+#: not start with its split would leak val rows into a train dataset the next
+#: time anything re-filtered.  It is also why the directory is not dot-hidden:
+#: everything that scans ``shards/`` filters on ``*.npz``, so a visible
+#: directory costs nothing, and a leading dot would break the prefix.
+REPACK_DIRNAME_TEMPLATE = "{split}-repack-a{arch}"
+
+
+def repack_dirname(archetype_self: int, split: str) -> str:
+    """Directory name, under ``shards/``, of a deck's dense copy of *split*."""
+    return REPACK_DIRNAME_TEMPLATE.format(arch=int(archetype_self), split=split)
+
+
+# ``MADV_RANDOM`` on these mappings was tried and **rejected on measurement**.
+# It does what it claims — physical reads fall ~10x, 1585 -> 156 KiB/sample —
+# but it is slower in every paired comparison, because small synchronous random
+# reads are latency-bound on NVMe while default readahead pipelines.  At the
+# training configuration (B=1024, 8 workers, full epoch, cache evicted) it cost
+# 170.5 vs 168.8 ms/step sparse and 165.0 vs 163.2 ms/step repacked; single
+# threaded the gap is 4x.  The read-volume argument is real but the repack below
+# buys it far more cheaply, by shrinking the working set instead of the reads.
 
 # ============================================================
 # Constants from C.3 / C.10
@@ -66,7 +87,7 @@ W_LOST: float = 0.6
 # Keys that should stay on CPU as int64 (indices, masks, types)
 _INT_KEYS = frozenset({
     "tok_type", "tok_owner", "tok_zone",
-    "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_group",
+    "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_bench_idx", "opt_group",
     "sel_type", "sel_ctx",
     "action_idx", "minCount", "maxCount", "action_len", "stop_column",
     "log_len",
@@ -254,6 +275,204 @@ def build_mmap_cache(npz_path: Path, cache_root: Path) -> Path | None:
     return cache_dir
 
 
+# ============================================================
+# Per-archetype repack (locality)
+# ============================================================
+#
+# MADV_RANDOM fixes how much the kernel reads per fault; it does nothing about
+# how *scattered* the wanted rows are.  A specialist's rows are ~8% of the rows
+# of the ~126 shards they appear in, so a shuffled epoch's working set is the
+# entire split (44.7 GB traversed to consume 3.5 GB) and can never be cached.
+#
+# The rows themselves are a pure function of (shards, archetype filter), so they
+# can be copied once into dense shards where every row is wanted.  The copy is
+# written as bare ``.npy`` per key — not ``.npz`` — because the whole point is
+# that reading it costs a page fault and no decompression.
+
+
+def _repack_probe_keys(z) -> list[str]:
+    return sorted(z.files)
+
+
+def _gather_block(
+    shards_dir: Path,
+    keys: list[str],
+    names: np.ndarray,
+    rows: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Read the ``(shard, row)`` pairs in *names*/*rows* into dense arrays.
+
+    Output position ``i`` holds the row named by ``names[i]``/``rows[i]``, so
+    the block preserves meta order — which is what makes the rewritten
+    ``(shard, row)`` pair pure arithmetic on the meta index.
+
+    Reads are grouped by source shard and sorted by row within it: one open per
+    source shard, and one decompression per key.  Only a single source array is
+    materialised at a time, so peak memory is one key of one shard rather than
+    the shard.
+    """
+    m = len(names)
+    out: dict[str, np.ndarray] = {}
+    order = np.argsort(names, kind="stable")
+    sorted_names = names[order]
+    for shard_name in dict.fromkeys(sorted_names.tolist()):
+        dst = order[sorted_names == shard_name]
+        src = rows[dst]
+        within = np.argsort(src, kind="stable")
+        dst, src = dst[within], src[within]
+        with np.load(shards_dir / shard_name, allow_pickle=False) as z:
+            if _repack_probe_keys(z) != keys:
+                raise ValueError(
+                    f"shard {shard_name} has a different key set than the first "
+                    "shard of this split — the corpus mixes formats"
+                )
+            for key in keys:
+                arr = z[key]
+                if key not in out:
+                    out[key] = np.empty((m, *arr.shape[1:]), dtype=arr.dtype)
+                out[key][dst] = arr[src]
+                del arr
+    return out
+
+
+def _verify_block(
+    shards_dir: Path,
+    keys: list[str],
+    names: np.ndarray,
+    rows: np.ndarray,
+    block: dict[str, np.ndarray],
+    n_probe: int = 8,
+) -> None:
+    """Re-read a spread of rows from the source and demand exact equality.
+
+    The repack is a rearrange, so the only bug it can have is an index one —
+    and an index bug is invisible downstream: training just fits the wrong
+    labels.  Probing a bounded sample rather than the whole block keeps this
+    affordable (it re-decompresses every key of every shard it touches) while
+    still exercising the grouping, the within-shard sort and the destination
+    scatter.
+    """
+    m = len(names)
+    if m == 0:
+        return
+    probe = np.unique(np.linspace(0, m - 1, min(n_probe, m)).astype(np.int64))
+    for i in probe:
+        i = int(i)
+        with np.load(shards_dir / str(names[i]), allow_pickle=False) as z:
+            for key in keys:
+                if not np.array_equal(z[key][int(rows[i])], block[key][i]):
+                    raise ValueError(
+                        f"repack mismatch at {names[i]}:{rows[i]} key {key!r}"
+                    )
+
+
+def _repack_is_current(repack_dir: Path, expect: dict) -> dict | None:
+    """Return the recorded stamp when the dense copy is reusable, else None.
+
+    Freshness and completeness both matter, for the same reasons as the mmap
+    cache: card ids are vocab indices, so a dense copy of a rebuilt corpus is
+    silently mislabelled, and an interrupted build leaves a directory that
+    exists but is missing keys.
+    """
+    stamp_path = repack_dir / "_source.json"
+    if not stamp_path.is_file():
+        return None
+    try:
+        stamp = json.loads(stamp_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if any(stamp.get(k) != v for k, v in expect.items()):
+        return None
+    keys = set(stamp.get("keys") or ())
+    sps = stamp.get("samples_per_shard") or 0
+    shards = stamp.get("shards") or []
+    if not keys or sps <= 0:
+        return None
+    if len(shards) != -(-int(stamp["n_rows"]) // int(sps)):
+        return None
+    for name in shards:
+        shard_dir = repack_dir / name
+        if not shard_dir.is_dir():
+            return None
+        if {p.stem for p in shard_dir.glob("*.npy")} != keys:
+            return None
+    return stamp
+
+
+def build_repack(
+    shards_dir: Path,
+    meta: pd.DataFrame,
+    repack_dir: Path,
+    split: str,
+    stamp: dict,
+) -> dict | None:
+    """Copy *meta*'s rows out of the sparse shards into dense ``.npy`` shards.
+
+    Returns the completed stamp (the input plus ``samples_per_shard``, ``keys``
+    and ``shards``), or ``None`` when the copy could not be written — a
+    read-only or full corpus directory degrades to reading the originals rather
+    than failing training outright.
+
+    Rows per dense shard are inherited from the source shards rather than
+    chosen here: the corpus already sized them from ``--mem-budget-gb``, and
+    re-deriving would put a second, independently-stale constant in the loader.
+
+    The build goes to a temporary sibling and is renamed into place, so an
+    interrupted run never leaves a half-copy that looks valid.
+    """
+    src_names = meta["shard"].astype(str).to_numpy()
+    src_rows = meta["row"].to_numpy(dtype=np.int64)
+    n = len(meta)
+
+    tmp_dir = repack_dir.with_name(f"{repack_dir.name}.tmp-{os.getpid()}")
+    try:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True)
+
+        with np.load(shards_dir / str(src_names[0]), allow_pickle=False) as z:
+            keys = _repack_probe_keys(z)
+            if not keys:
+                raise ValueError(f"shard {src_names[0]} is empty")
+            samples_per_shard = int(z[keys[0]].shape[0])
+        if samples_per_shard <= 0:
+            raise ValueError(f"shard {src_names[0]} has no rows")
+
+        dense: list[str] = []
+        for start in range(0, n, samples_per_shard):
+            end = min(start + samples_per_shard, n)
+            name = f"{split}-{len(dense):05d}"
+            out_dir = tmp_dir / name
+            out_dir.mkdir()
+            block = _gather_block(
+                shards_dir, keys, src_names[start:end], src_rows[start:end]
+            )
+            if not dense:
+                _verify_block(
+                    shards_dir, keys, src_names[start:end], src_rows[start:end], block
+                )
+            for key, arr in block.items():
+                np.save(out_dir / f"{key}.npy", arr)
+            del block
+            dense.append(name)
+
+        stamp = dict(stamp, samples_per_shard=samples_per_shard, keys=keys, shards=dense)
+        (tmp_dir / "_source.json").write_text(json.dumps(stamp))
+        if repack_dir.exists():
+            shutil.rmtree(repack_dir)
+        os.replace(tmp_dir, repack_dir)
+    except (OSError, ValueError) as exc:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.warning(
+            "Cannot build the dense repack at %s (%s) — reading the archetype's "
+            "rows from the original shards instead. Expect a loader-bound "
+            "training step.",
+            repack_dir, exc,
+        )
+        return None
+    return stamp
+
+
 class ShardDataset(Dataset[dict[str, torch.Tensor]]):
     """Dataset over pre-featurized .npz shards, mmap'd for OS page-cache reuse.
 
@@ -301,20 +520,13 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
             ecf = np.load(ecf_path, allow_pickle=True).item()
             self.n_all_cards = max(ecf.keys()) + 1 if ecf else 0
 
-        # Dense static tables for rebuilding the *_card_feat tensors the shards
-        # no longer carry (CARD_FEAT_SOURCES).  A few MB each, built once in the
-        # parent so forked workers share the pages rather than each loading a
-        # copy.  A missing file yields an all-zero table, which is exactly what
-        # featurize produces when handed no engine features — so a corpus built
-        # without them keeps training on zeros instead of failing here.
-        eaf_path = data_dir / "engine_attack_features.npy"
-        eaf: dict = (
-            np.load(eaf_path, allow_pickle=True).item() if eaf_path.exists() else {}
-        )
-        self._static_tables = {
-            "card": build_static_table(ecf, F_CARD),
-            "attack": build_static_table(eaf, F_ATK),
-        }
+        # The dataset does *not* build the static card/attack tables.  It used
+        # to, to re-gather the ``*_card_feat`` tensors per sample; that gather
+        # now happens once per batch on the model's device
+        # (``Policy._gather_card_feats``), which is the whole point — the
+        # gathered tensors were 93% of a sample's bytes and never needed to
+        # cross the DataLoader queue.  Samples carry ids; ``Policy`` owns the
+        # tables.
 
         # Load meta
         meta_path = data_dir / "meta.parquet"
@@ -358,7 +570,117 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         self._shard_cache: dict[str, dict[str, np.ndarray]] = {}
         self._shards_dir = data_dir / "shards"
         self._mmap_dirs: dict[str, Path] = {}
-        self._prepare_mmap_cache()
+        self._repack_dir: Path | None = None
+
+        # A specialist reads a few percent of every shard it touches, so it gets
+        # a dense copy of just its rows.  That copy is read straight out of the
+        # .npz archives, which means the generalist mmap cache — the whole
+        # decompressed split, tens of GB — is never built for a specialist run.
+        if archetype_self is None or not self._prepare_repack(
+            archetype_self, meta_path
+        ):
+            self._prepare_mmap_cache()
+
+        self._drop_keys: frozenset[str] = frozenset()
+        self._check_card_id_coverage()
+
+    #: Keys the model gathers for itself, from the ids in ``CARD_FEAT_SOURCES``.
+    _DERIVED_FEAT_KEYS = frozenset(CARD_FEAT_SOURCES) | {"log_card_feat"}
+
+    def _check_card_id_coverage(self) -> None:
+        """Refuse a shard that has ``*_card_feat`` but not the id behind it.
+
+        Cards reach the model as ids now; ``Policy`` gathers the features from
+        its static tables.  A shard written before that (features stored, no
+        ids) has nothing for the gather to read, and **every layer downstream
+        tolerates the absence** — ``TokenEmbedder`` skips a missing feature key,
+        the pointer head would see zeros, and the run would train to convergence
+        having never seen a card.  There is no later point at which this becomes
+        visible, so it has to fail here, while the corpus is still named.
+
+        A shard carrying *both* is merely redundant: the ids win and the stored
+        features are dropped on read rather than shipped through the queue.
+        """
+        shard_name = str(self.meta.iloc[0]["shard"])
+        keys = set(self._open_shard(shard_name))
+
+        orphaned = sorted(
+            feat_key for feat_key, (id_key, _) in CARD_FEAT_SOURCES.items()
+            if feat_key in keys and id_key not in keys
+        )
+        if orphaned:
+            raise ValueError(
+                f"shard {shard_name} stores card features {orphaned} but not the "
+                "card ids behind them. This corpus predates on-device card "
+                "gathering and the model has no way to read it — rebuild shards "
+                "with `ptcg_il.cli build-shards`."
+            )
+        self._drop_keys = frozenset(self._DERIVED_FEAT_KEYS & keys)
+
+    def _prepare_repack(self, archetype_self: int, meta_path: Path) -> bool:
+        """Build or adopt this deck's dense shards.  False => use the originals.
+
+        Returning False rather than raising is the point: the repack is an
+        optimisation, and a corpus directory that cannot be written must still
+        train.
+        """
+        repack_dir = self._shards_dir / repack_dirname(archetype_self, self.split)
+        source_names = sorted(set(self.meta["shard"].astype(str)))
+        for name in source_names:
+            if not (self._shards_dir / name).exists():
+                raise FileNotFoundError(
+                    f"Shard file not found: {self._shards_dir / name}"
+                )
+
+        # meta.parquet is stamped alongside the shards because it, not the
+        # shards, decides *which* rows this deck owns.
+        expect = {
+            "archetype_self": int(archetype_self),
+            "split": self.split,
+            "n_rows": int(len(self.meta)),
+            "sources": {n: _cache_stamp(self._shards_dir / n) for n in source_names},
+            "meta": _cache_stamp(meta_path),
+        }
+
+        stamp = _repack_is_current(repack_dir, expect)
+        if stamp is None:
+            stamp = build_repack(
+                self._shards_dir, self.meta, repack_dir, self.split, expect
+            )
+            if stamp is None:
+                return False
+            logger.info(
+                "Repacked %d %s row(s) of archetype %d from %d sparse shard(s) "
+                "into %d dense shard(s) at %s (%.1f GB); reused on later runs.",
+                len(self.meta), self.split, archetype_self, len(source_names),
+                len(stamp["shards"]), repack_dir,
+                sum(p.stat().st_size for p in repack_dir.rglob("*.npy")) / 1e9,
+            )
+
+        self._adopt_repack(repack_dir, stamp)
+        return True
+
+    def _adopt_repack(self, repack_dir: Path, stamp: dict) -> None:
+        """Point ``self.meta`` at the dense shards.
+
+        The dense copy preserves meta order, so the new ``(shard, row)`` pair is
+        arithmetic on the row's position — nothing has to be read back to
+        recover it, which is what lets a cached repack skip touching the
+        originals entirely.
+        """
+        samples_per_shard = int(stamp["samples_per_shard"])
+        dirname = repack_dir.name
+        names: list[str] = stamp["shards"]
+        pos = np.arange(len(self.meta))
+        labels = np.array([f"{dirname}/{n}" for n in names], dtype=object)
+
+        self.meta = self.meta.copy()
+        self.meta["shard"] = labels[pos // samples_per_shard]
+        self.meta["row"] = pos % samples_per_shard
+
+        self._repack_dir = repack_dir
+        for name in names:
+            self._mmap_dirs[f"{dirname}/{name}"] = repack_dir / name
 
     def _prepare_mmap_cache(self) -> None:
         """Decompress this split's shards to mmap-able form, before forking.
@@ -402,9 +724,13 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
     def _open_shard(self, shard_name: str) -> dict[str, np.ndarray]:
         """Return the shard's arrays, mmap'd when a cache is available.
 
+        ``_mmap_dirs`` holds both flavours of ``.npy``-per-key directory — a
+        decompressed mmap cache and a dense repack — so there is one code path
+        for reading them.
+
         The fallback branch reads the compressed archive into RAM — correct,
-        but ~94x its on-disk size and per-worker.  It only runs when the cache
-        could not be written.
+        but ~94x its on-disk size and per-worker.  It only runs when neither
+        could be written.
         """
         if shard_name not in self._shard_cache:
             cache_dir = self._mmap_dirs.get(shard_name)
@@ -440,6 +766,8 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
 
         sample: dict[str, torch.Tensor] = {}
         for key in shard:
+            if key in self._drop_keys:
+                continue  # redundant with the ids; Policy gathers these
             arr = shard[key][sample_row]  # slice one row
             # Convert to torch tensor
             if key in _BOOL_KEYS:
@@ -465,39 +793,8 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
             float(row["sample_weight"]), dtype=torch.float32
         )
 
-        self._rebuild_card_feats(sample)
         self._densify_belief(sample)
         return sample
-
-    def _rebuild_card_feats(self, sample: dict[str, torch.Tensor]) -> None:
-        """Gather the ``*_card_feat`` tensors the shard stores ids for.
-
-        The model reads features, never ids (``model/embed.py``), so this has to
-        happen before the sample leaves the dataset — collate would work too,
-        but doing it here keeps every ShardDataset consumer (offline eval,
-        diagnose) on one path.
-
-        Ids are authoritative wherever they exist.  Shards written before the
-        format change carry the features directly and no ids at all; those keys
-        are left exactly as they were, so an old corpus trains unchanged.
-        """
-        for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
-            if id_key not in sample:
-                continue
-            ids = sample[id_key].numpy()
-            sample[feat_key] = torch.from_numpy(
-                gather_static_feats(ids, self._static_tables[kind])
-            )
-
-        # log_card_feat has no id key of its own — log_feat column 2 is the id.
-        # Keyed on log_card_feat's absence rather than log_feat's presence: a
-        # legacy shard has both, and its stored features are the ones its
-        # checkpoints were trained against.
-        if "log_card_feat" not in sample and "log_feat" in sample:
-            log_ids = sample["log_feat"][:, LOG_CARD_ID_COLUMN].long().numpy()
-            sample["log_card_feat"] = torch.from_numpy(
-                gather_static_feats(log_ids, self._static_tables["card"])
-            )
 
     def _densify_belief(self, sample: dict[str, torch.Tensor]) -> None:
         """Sparse belief labels -> normalised distributions over the vocab.

@@ -105,10 +105,13 @@ def _load_policy(ckpt_path: str, data_dir: Path, device: torch.device) -> Any | 
     """Load a policy from a checkpoint (pure-feature format).
 
     Returns None if the checkpoint is missing a ``config`` record.
-    Loads ``all_card_feat`` from the data directory for the belief heads.
+    Loads the engine static tables from the data directory: the policy gathers
+    every card's features from them on device, and the card one is also the
+    belief heads' scoring matrix.
     """
-    from ptcg_il.model.cards import F_CARD
-    from ptcg_il.model.policy import load_policy_state, policy_from_config
+    from ptcg_il.model.policy import (
+        load_policy_state, load_static_tables, policy_from_config,
+    )
     from ptcg_il.train.checkpoint import load_checkpoint
 
     ckpt = load_checkpoint(ckpt_path, device="cpu")
@@ -117,18 +120,10 @@ def _load_policy(ckpt_path: str, data_dir: Path, device: torch.device) -> Any | 
         logger.warning("  SKIP %s — no config record", Path(ckpt_path).name)
         return None
 
-    # Load all-card feature matrix for belief heads
-    all_card_feat = None
-    ecf_path = data_dir / "engine_card_features.npy"
-    if ecf_path.exists():
-        ecf = np.load(ecf_path, allow_pickle=True).item()
-        # Build [n_cards, F_CARD] matrix sorted by card id
-        max_id = max(ecf.keys()) if ecf else 0
-        all_card_feat = torch.zeros(max_id + 1, F_CARD)
-        for cid, feat in ecf.items():
-            all_card_feat[int(cid)] = torch.from_numpy(np.asarray(feat, dtype=np.float32))
+    all_card_feat, all_attack_feat = load_static_tables(data_dir)
 
-    policy = policy_from_config(config, all_card_feat=all_card_feat)
+    policy = policy_from_config(config, all_card_feat=all_card_feat,
+                                all_attack_feat=all_attack_feat)
     model_sd = policy.state_dict()
     ckpt_sd = ckpt["model_state_dict"]
     try:

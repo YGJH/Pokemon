@@ -440,12 +440,13 @@ def _policy_evaluate_leaf(
                       evolution_map=_evolution_map)
     batch = _dict_to_batch(feats, device)
 
-    # Mirror Policy.forward: _encode returns (h, history_h), and PointerHead
-    # needs (h, tok_mask, card_enc, x) and returns (logits, o).  The old call
+    # Mirror Policy.forward: _encode returns (x, h, history_h) -- the batch it
+    # returns carries the gathered *_card_feat tensors, and PointerHead needs
+    # them -- and returns (logits, o).  The old call
     # `policy.pointer(h, batch["opt_mask"])` predated the pure-feature pointer
     # and raised TypeError on every leaf.
     with _no_grad():
-        h, _history = policy._encode(batch)
+        batch, h, _history = policy._encode(batch)
         logits, _o = policy.pointer(h, batch["tok_mask"], policy.embed.card, batch)
         value = policy.value(h[:, 0])          # [B]
 

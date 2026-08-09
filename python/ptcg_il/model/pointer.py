@@ -92,7 +92,7 @@ class PointerHead(nn.Module):
             Shared card featurizer (for opt_card_feat embedding).
         x : dict
             Option tensors: opt_type [B,O], opt_src_idx [B,O], opt_tgt_idx [B,O],
-            opt_card_feat [B,O,F_CARD], opt_attack_feat [B,O,F_ATK],
+            opt_bench_idx [B,O], opt_card_feat [B,O,F_CARD], opt_attack_feat [B,O,F_ATK],
             opt_scalar [B,O,F_OPT], opt_mask bool [B,O].
         msgru_h : Tensor[B, D] or None
             Multi-select GRU hidden state.  When None (single-select),
@@ -113,11 +113,13 @@ class PointerHead(nn.Module):
 
         src = self.gather(h_aug, x["opt_src_idx"])                       # [B, O, D]
         tgt = self.gather(h_aug, x["opt_tgt_idx"])                       # [B, O, D]
+        bench = self.gather(h_aug, x["opt_bench_idx"])                   # [B, O, D]
 
         base = (
             self.opt_type_emb(x["opt_type"])
             + src
             + tgt
+            + bench
             + card_enc(x["opt_card_feat"])
             + self.attack(x["opt_attack_feat"])
         )  # [B, O, D]

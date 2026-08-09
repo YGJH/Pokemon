@@ -45,6 +45,39 @@ def current_feature_dims() -> dict[str, int]:
     return {k: int(getattr(_fz, k)) for k in FEATURE_DIM_KEYS}
 
 
+def load_static_tables(data_dir) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """``(card_table, attack_table)`` from the mining artifacts, as float32.
+
+    These are the dense ``[max_engine_id + 1, F_*]`` tables the model indexes to
+    turn a card id into its static features.  Rows for ids the engine has no
+    entry for stay zero, which is the same PAD sentinel the featurizer uses.
+
+    Either element is ``None`` when its artifact is absent or empty.  Callers
+    that then build a :class:`Policy` get one that raises on the first forward
+    rather than one that quietly scores every card as all-zeros.
+    """
+    from pathlib import Path
+
+    import numpy as np
+
+    from ptcg_il.featurizer import F_ATK, F_CARD, build_static_table
+
+    data_dir = Path(data_dir)
+    out: list[torch.Tensor | None] = []
+    for name, dim in (("engine_card_features.npy", F_CARD),
+                      ("engine_attack_features.npy", F_ATK)):
+        path = data_dir / name
+        if not path.exists():
+            out.append(None)
+            continue
+        raw = np.load(path, allow_pickle=True).item()
+        if not raw:
+            out.append(None)
+            continue
+        out.append(torch.from_numpy(build_static_table(raw, dim)).to(torch.float32))
+    return out[0], out[1]
+
+
 class Policy(nn.Module):
     """End-to-end imitation-learning policy: embed -> encode -> pointer + value.
 
@@ -81,6 +114,7 @@ class Policy(nn.Module):
         n_opp_arch: int = 0,
         n_all_cards: int = 0,
         all_card_feat: torch.Tensor | None = None,
+        all_attack_feat: torch.Tensor | None = None,
     ):
         super().__init__()
         self.embed = TokenEmbedder(D)
@@ -92,8 +126,6 @@ class Policy(nn.Module):
         self.belief.card_emb = self.embed.card  # share CardFeaturizer
         self.belief_heads = BeliefHeads(D, n_opp_arch, n_all_cards,
                                          card_emb=self.embed.card)
-        if all_card_feat is not None:
-            self.belief_heads.set_all_card_feat(all_card_feat)
         self.n_opp_arch = n_opp_arch
         self.D = D
         self.config: dict[str, int] = {
@@ -106,12 +138,115 @@ class Policy(nn.Module):
             "feat_dims": current_feature_dims(),
             "seed": 42,  # placeholder; set by caller after construction
         }
+        self.register_buffer("card_table", None, persistent=False)
+        self.register_buffer("attack_table", None, persistent=False)
+        self.set_static_tables(all_card_feat, all_attack_feat)
+
+    # ------------------------------------------------------------------
+    # Static card/attack tables
+    # ------------------------------------------------------------------
+    def set_static_tables(
+        self,
+        card_table: torch.Tensor | None,
+        attack_table: torch.Tensor | None,
+    ) -> None:
+        """Attach the dense tables the ``*_card_feat`` gather indexes.
+
+        Non-persistent on purpose.  They are a *derived artifact* — a pure
+        function of ``engine_card_features.npy`` — not learned state, so baking
+        them into every ``.pt`` would grow each checkpoint for something
+        reconstructible, and would let a checkpoint disagree with the corpus it
+        is evaluated against without anything noticing.  ``config`` records
+        their shapes instead, and :func:`policy_from_config` refuses a mismatch.
+
+        ``belief_heads`` gets the card table through the same call, so there is
+        one place a caller has to get right rather than two that can disagree.
+        """
+        self.card_table = None if card_table is None else card_table.to(torch.float32)
+        self.attack_table = (
+            None if attack_table is None else attack_table.to(torch.float32)
+        )
+        if card_table is not None:
+            self.belief_heads.set_all_card_feat(card_table)
+        shapes = {}
+        if self.card_table is not None:
+            shapes["card"] = list(self.card_table.shape)
+        if self.attack_table is not None:
+            shapes["attack"] = list(self.attack_table.shape)
+        if shapes:
+            self.config["static_table_shapes"] = shapes
+
+    def _table(self, kind: str) -> torch.Tensor:
+        table = self.card_table if kind == "card" else self.attack_table
+        if table is None:
+            raise RuntimeError(
+                f"Policy has no {kind} static table; cards cannot be featurized. "
+                "Build the policy with all_card_feat=/all_attack_feat= (see "
+                "ptcg_il.model.policy.load_static_tables) or call "
+                "set_static_tables(). Without them every card would embed as "
+                "all-zeros, which trains and evaluates without any error."
+            )
+        return table
+
+    @staticmethod
+    def _gather_rows(ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        """``table[ids]`` with the featurizer's out-of-range rule.
+
+        Exactly :func:`ptcg_il.featurizer.gather_static_feats` on device: PAD
+        (0), negative ids and ids past the end of *table* all yield **zeros**.
+        The clamp and the re-zero are a pair — clamping alone would hand an
+        unknown card some real card's stats, which no shape check can catch and
+        no loss curve would show.
+        """
+        valid = (ids > 0) & (ids < table.shape[0])
+        rows = table[torch.where(valid, ids, torch.zeros_like(ids))]
+        return rows * valid.unsqueeze(-1).to(rows.dtype)
+
+    def _gather_card_feats(self, x: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return *x* plus every ``*_card_feat`` tensor, gathered on device.
+
+        Returns a new dict; the batch belongs to the training loop and the
+        gathered tensors are large enough that leaking them back would defeat
+        the point of not shipping them through the DataLoader queue in the first
+        place.
+
+        A key already present in *x* is **recomputed, not preserved**: the whole
+        change is that there is one producer of these tensors.  A batch that
+        somehow still carried a stale ``poke_card_feat`` would otherwise take
+        precedence over the ids beside it.
+        """
+        from ptcg_il.featurizer import CARD_FEAT_SOURCES, LOG_CARD_ID_COLUMN
+
+        out = dict(x)
+        for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
+            ids = x.get(id_key)
+            if ids is None:
+                # poke_tool_ids / poke_energy_ids are absent from shards written
+                # before attachments were kept; TokenEmbedder already skips a
+                # missing feat key, so drop rather than gather a zero row.
+                out.pop(feat_key, None)
+                continue
+            out[feat_key] = self._gather_rows(ids.long(), self._table(kind))
+
+        log_feat = x.get("log_feat")
+        if log_feat is not None:
+            out["log_card_feat"] = self._gather_rows(
+                log_feat[..., LOG_CARD_ID_COLUMN].long(), self._table("card")
+            )
+        return out
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
-                ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Shared encode path: embed → encode → add belief to CLS.
+                ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Shared encode path: gather card features → embed → encode → belief.
 
-        Returns ``(h, history_h)`` where *h* has the belief-augmented CLS token.
+        Returns ``(x, h, history_h)`` where *h* has the belief-augmented CLS
+        token and *x* is the batch **with** the gathered ``*_card_feat``
+        tensors.  Every public entry point funnels through here, which is why
+        the gather lives here: ``forward``, ``belief_logits``,
+        ``forward_with_belief``, ``multiselect_ce`` and ``select_multi`` all get
+        it without five chances to forget.  The augmented dict is returned
+        because the pointer head, which runs *after* this call, reads
+        ``opt_card_feat`` and ``opt_attack_feat``.
 
         *history_h* is accepted and returned unchanged, for callers that still
         pass it.  It no longer does anything: the ``history_gru`` that consumed
@@ -127,6 +262,7 @@ class Policy(nn.Module):
         """
         B = x["tok_type"].shape[0]
         device = x["tok_type"].device
+        x = self._gather_card_feats(x)
         rows = self.embed(x)                                 # [B, L, D]
         h = self.encoder(rows, x["tok_mask"])                # [B, L, D]
 
@@ -146,7 +282,7 @@ class Policy(nn.Module):
         cls_token = h[:, 0, :] + belief                      # [B, D]
         h = torch.cat([cls_token.unsqueeze(1), h[:, 1:, :]], dim=1)  # [B, L, D]
 
-        return h, history_h
+        return x, h, history_h
 
     def forward(self, x: dict[str, torch.Tensor],
                 history_h: torch.Tensor | None = None
@@ -172,7 +308,7 @@ class Policy(nn.Module):
         history_h : Tensor[B, D]
             Updated cross-turn hidden state (detached).
         """
-        h, history_h = self._encode(x, history_h)
+        x, h, history_h = self._encode(x, history_h)
         logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)  # [B, O]
         value = self.value(h[:, 0])                           # [B]
         return logits, value, history_h.detach()
@@ -188,7 +324,7 @@ class Policy(nn.Module):
         MCTS planner needs *only* the belief and would otherwise pay for the
         pointer head on every determinization.
         """
-        h, _ = self._encode(x, history_h)
+        _x, h, _ = self._encode(x, history_h)
         return self.belief_heads(h[:, 0])
 
     def forward_with_belief(
@@ -199,7 +335,7 @@ class Policy(nn.Module):
         Returns ``(logits, value, history_h, belief)``.  Calling ``forward`` and
         ``belief_logits`` separately would run the transformer twice per step.
         """
-        h, history_h = self._encode(x, history_h)
+        x, h, history_h = self._encode(x, history_h)
         logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)
         value = self.value(h[:, 0])
         belief = self.belief_heads(h[:, 0])
@@ -339,7 +475,8 @@ def load_policy_state(
 
 
 def policy_from_config(config: dict,
-                       all_card_feat: torch.Tensor | None = None) -> Policy:
+                       all_card_feat: torch.Tensor | None = None,
+                       all_attack_feat: torch.Tensor | None = None) -> Policy:
     """Rebuild a :class:`Policy` from a checkpoint's ``config`` record.
 
     Supports both old configs (with ``V``/``A`` from the id_emb era) and new
@@ -374,6 +511,30 @@ def policy_from_config(config: dict,
                 "the featurizer generation that produced it."
             )
 
+    # The static tables are what a card id *means*.  Nothing about them is in
+    # the state dict — they are non-persistent — so a corpus re-mined with more
+    # engine cards loads a checkpoint without a murmur and silently shifts every
+    # id past the insertion point onto another card's stats.  Checkpoints from
+    # before this record carry no shapes and are let through, as with feat_dims.
+    recorded_tables = config.get("static_table_shapes")
+    if recorded_tables:
+        supplied = {"card": all_card_feat, "attack": all_attack_feat}
+        bad = []
+        for kind, want in recorded_tables.items():
+            have = supplied.get(kind)
+            if have is None:
+                continue  # absent tables raise at forward, with a fuller message
+            if list(have.shape) != list(want):
+                bad.append(f"{kind}: checkpoint {list(want)}, current {list(have.shape)}")
+        if bad:
+            raise ValueError(
+                "checkpoint was trained against a different static table "
+                f"({'; '.join(bad)}). The engine card/attack artifacts in this "
+                "data dir are not the ones that produced these weights, so card "
+                "ids no longer resolve to the same features. Point at the corpus "
+                "it was trained on, or retrain."
+            )
+
     return Policy(
         D=int(config["D"]),
         heads=int(config["heads"]),
@@ -382,6 +543,7 @@ def policy_from_config(config: dict,
         n_opp_arch=int(config.get("n_opp_arch", 0)),
         n_all_cards=int(config.get("n_all_cards", 0)),
         all_card_feat=all_card_feat,
+        all_attack_feat=all_attack_feat,
     )
 
 
@@ -417,7 +579,7 @@ def multiselect_ce(
     device = x["tok_type"].device
 
     # Encode once (history_h unused during independent-sample training)
-    h, _history_h = policy._encode(x)
+    x, h, _history_h = policy._encode(x)
 
     action_idx = x["action_idx"]                          # [B, O_MAX]
     action_len = x["action_len"]                          # [B]  int64
@@ -706,7 +868,7 @@ def select_multi(
     if hasattr(policy, 'select_multi'):
         return policy.select_multi(x, history_h)
 
-    h, _history_h = policy._encode(x, history_h)
+    x, h, _history_h = policy._encode(x, history_h)
     stop_col = x.get("stop_column")
     return _select_multi_raw(
         policy.pointer, h, x["tok_mask"], policy.embed.card, x,

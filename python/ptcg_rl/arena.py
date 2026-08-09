@@ -501,30 +501,22 @@ class ModelCache:
         self._all_card_feat: Any = ModelCache._NOT_LOADED
         self.n_loads = 0
 
-    def _card_feat(self) -> Any:
-        """The ``[n_cards, F_CARD]`` matrix the belief heads index into.
+    def _static_tables(self) -> Any:
+        """``(card_table, attack_table)`` — the policy gathers card features
+        from these on device, and the card one is also the belief heads' scoring
+        matrix.
 
         Cached behind a sentinel rather than ``None``: the cached value is a
-        tensor, and ``self._all_card_feat or None`` raises on one with more than
-        one element.
+        pair of tensors, and ``self._all_card_feat or None`` raises on one with
+        more than one element.
         """
         if self._all_card_feat is not self._NOT_LOADED:
             return self._all_card_feat
 
-        import torch
-        from ptcg_il.model.cards import F_CARD
+        from ptcg_il.model.policy import load_static_tables
 
-        path = self.data_dir / "engine_card_features.npy"
-        if not path.exists():
-            self._all_card_feat = None
-            return None
-        ecf = np.load(path, allow_pickle=True).item()
-        max_id = max(ecf.keys()) if ecf else 0
-        feat = torch.zeros(max_id + 1, F_CARD)
-        for cid, row in ecf.items():
-            feat[int(cid)] = torch.from_numpy(np.asarray(row, dtype=np.float32))
-        self._all_card_feat = feat
-        return feat
+        self._all_card_feat = load_static_tables(self.data_dir)
+        return self._all_card_feat
 
     def get(self, path: Path) -> Any:
         path = Path(path)
@@ -537,7 +529,9 @@ class ModelCache:
         from ptcg_il.model.policy import load_policy_state, policy_from_config
 
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        policy = policy_from_config(ckpt["config"], all_card_feat=self._card_feat())
+        card_table, attack_table = self._static_tables()
+        policy = policy_from_config(ckpt["config"], all_card_feat=card_table,
+                                    all_attack_feat=attack_table)
         load_policy_state(policy, ckpt["model_state_dict"])
         policy.eval()
         self.n_loads += 1

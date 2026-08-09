@@ -281,22 +281,11 @@ def _static_tables(data_dir: Path) -> dict:
     return out
 
 
-def _load_all_card_feat(data_dir: Path) -> torch.Tensor | None:
-    """Load [n_all_cards, F_CARD] feature matrix for BeliefHeads."""
-    from ptcg_il.model.cards import F_CARD
+def _load_static_tables(data_dir: Path):
+    """``(card_table, attack_table)`` — see ``ptcg_il.model.policy``."""
+    from ptcg_il.model.policy import load_static_tables
 
-    ecf_path = data_dir / "engine_card_features.npy"
-    if not ecf_path.exists():
-        return None
-    import numpy as _np
-    ecf = _np.load(ecf_path, allow_pickle=True).item()
-    if not ecf:
-        return None
-    max_id = max(ecf.keys())
-    all_feat = torch.zeros(max_id + 1, F_CARD)
-    for cid, feat in ecf.items():
-        all_feat[int(cid)] = torch.from_numpy(_np.asarray(feat, dtype=_np.float32))
-    return all_feat
+    return load_static_tables(data_dir)
 
 
 def _load_policy(ckpt_path: str, data_dir: Path, device: torch.device) -> Any:
@@ -326,9 +315,10 @@ def _load_policy_and_deck(
     if not config:
         raise ValueError(f"{ckpt_path} has no 'config' record")
 
-    all_card_feat = _load_all_card_feat(data_dir)
+    all_card_feat, all_attack_feat = _load_static_tables(data_dir)
 
-    policy = policy_from_config(config, all_card_feat=all_card_feat)
+    policy = policy_from_config(config, all_card_feat=all_card_feat,
+                                all_attack_feat=all_attack_feat)
     model_sd = policy.state_dict()
     ckpt_sd = ckpt["model_state_dict"]
     try:
@@ -387,8 +377,9 @@ def _load_frozen_anchor(ckpt_path: str, data_dir: Path, device: torch.device) ->
     ckpt = load_checkpoint(ckpt_path, device="cpu")
     config = ckpt.get("config") or {}
     config = dict(config)
-    all_card_feat = _load_all_card_feat(data_dir)
-    policy = policy_from_config(config, all_card_feat=all_card_feat)
+    all_card_feat, all_attack_feat = _load_static_tables(data_dir)
+    policy = policy_from_config(config, all_card_feat=all_card_feat,
+                                all_attack_feat=all_attack_feat)
     _load_lenient(policy, policy.state_dict(), ckpt["model_state_dict"])
     policy.to(device).eval()
     for p in policy.parameters():
@@ -1750,7 +1741,7 @@ def train_step(
     feat_list = [s["features"] for s in batch]
     tensor_batch = _collate_feat_list(feat_list, device)
 
-    h, _history_h = policy._encode(tensor_batch)
+    tensor_batch, h, _history_h = policy._encode(tensor_batch)
     logits, _ = policy.pointer(h, tensor_batch["tok_mask"],
                                 policy.embed.card, tensor_batch)
     values = policy.value(h[:, 0])  # [B]

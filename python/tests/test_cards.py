@@ -35,7 +35,7 @@ def test_load_engine_returns_cards_and_attacks(engine):
 def test_card_static_row_shape(engine, attacks_by_id):
     cards, _ = engine
     row = card_static_row(cards[0], attacks_by_id)
-    assert row.shape == (212,)  # 52 base + 29 ability kw + 2 counts + 3 attacks × 43
+    assert row.shape == (218,)  # 52 base + 29 ability kw + 2 counts + 3 attacks × 45
     assert row.dtype == np.float32
 
 
@@ -104,7 +104,7 @@ def test_card_static_row_known_card_basic_grass_energy(engine, attacks_by_id):
 def test_attack_static_row_shape(engine):
     _, attacks = engine
     row = attack_static_row(attacks[0])
-    assert row.shape == (43,)
+    assert row.shape == (45,)
     assert row.dtype == np.float32
 
 
@@ -187,9 +187,9 @@ def test_build_static_tables_shapes_and_pad_row(engine):
     expected_unknown = card_table[2:].mean(axis=0)
     np.testing.assert_allclose(card_table[1], expected_unknown, rtol=1e-5, atol=1e-6)
 
-    assert attack_table.shape[1] == 43
+    assert attack_table.shape[1] == 45
     assert attack_table.dtype == np.float32
-    np.testing.assert_array_equal(attack_table[0], np.zeros(43, dtype=np.float32))
+    np.testing.assert_array_equal(attack_table[0], np.zeros(45, dtype=np.float32))
     assert 0 not in attack_id_to_index.values()  # PAD row reserved, no attackId maps to it
     assert attack_table.shape[0] == len(attack_id_to_index) + 1
 

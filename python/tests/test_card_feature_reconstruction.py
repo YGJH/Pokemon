@@ -113,9 +113,17 @@ class TestGatherEquivalence:
 # ============================================================
 
 
-class TestFeaturizerEmitsIds:
-    def test_every_stored_feature_has_a_matching_id_key(self):
-        """Each ``*_card_feat`` must be reconstructible from a key in the dict."""
+class TestFeaturizerEmitsIdsAndNotFeatures:
+    """``featurize`` is not a producer of ``*_card_feat``. ``Policy`` is.
+
+    It still *computes* several of them internally — cls_feat's KO-pressure
+    block, opt_scalar's damage preview and ``option_groups`` all read them — so
+    the test that matters is about the returned dict, not about whether the
+    arrays exist somewhere in the call.
+    """
+
+    @pytest.fixture(scope="class")
+    def featurized(self):
         from tests.test_featurizer import (
             _build_test_vocab,
             _engine_attack_features,
@@ -128,53 +136,42 @@ class TestFeaturizerEmitsIds:
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
-        result = featurize(
+        return featurize(
             obs, vocab, action,
             engine_card_features=_engine_card_features(),
             engine_attack_features=_engine_attack_features(),
         )
 
-        tables = {
-            "card": build_static_table(_engine_card_features(), F_CARD),
-            "attack": build_static_table(_engine_attack_features(), F_ATK),
-        }
-
+    def test_every_id_is_emitted_and_no_feature_is(self, featurized):
         assert CARD_FEAT_SOURCES, "CARD_FEAT_SOURCES must not be empty"
         n_checked = 0
-        for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
-            assert feat_key in result, f"featurize dropped {feat_key}"
-            assert id_key in result, (
-                f"featurize must also return {id_key} -- the writer stores it "
-                f"in place of {feat_key}"
-            )
-            rebuilt = gather_static_feats(result[id_key], tables[kind])
-            assert np.array_equal(rebuilt, result[feat_key]), (
-                f"{feat_key} is not the table gather of {id_key}"
+        for feat_key, (id_key, _) in CARD_FEAT_SOURCES.items():
+            assert id_key in featurized, f"featurize must return {id_key}"
+            assert feat_key not in featurized, (
+                f"featurize must not return {feat_key} — the model gathers it "
+                "on device, and emitting it here puts 93% of a sample's bytes "
+                "back through the DataLoader queue"
             )
             n_checked += 1
         assert n_checked >= 8, f"only checked {n_checked} feature keys"
 
-    def test_log_card_feat_comes_from_log_feat_column_2(self):
-        """``log_card_feat`` needs no id key -- log_feat already carries it."""
-        from tests.test_featurizer import (
-            _build_test_vocab,
-            _engine_card_features,
-            _get_active_step,
-            _load_episode,
-        )
-        from ptcg_il.featurizer import featurize
+    def test_log_card_feat_is_not_emitted_but_its_ids_are(self, featurized):
+        """``log_feat`` column 2 is the id source; the gather happens on device."""
+        assert "log_card_feat" not in featurized
+        log_ids = featurized["log_feat"][:, 2].astype(np.int64)
+        assert log_ids.any(), "fixture must carry some log card ids"
 
-        ep = _load_episode()
-        vocab = _build_test_vocab(ep)
-        obs, action = _get_active_step(ep, 8, 0)
-        result = featurize(obs, vocab, action,
-                           engine_card_features=_engine_card_features())
+    def test_emitted_ids_still_resolve_to_real_features(self, featurized):
+        """Not vacuous: the ids must index the table to something nonzero.
+
+        A featurizer that emitted all-PAD ids would satisfy every assertion
+        above while giving the model nothing to gather.
+        """
+        from tests.test_featurizer import _engine_card_features
 
         table = build_static_table(_engine_card_features(), F_CARD)
-        rebuilt = gather_static_feats(
-            result["log_feat"][:, 2].astype(np.int64), table
-        )
-        assert np.array_equal(rebuilt, result["log_card_feat"])
+        gathered = gather_static_feats(featurized["poke_card_id"], table)
+        assert gathered.any(), "poke_card_id resolved to all zeros"
 
 
 # ============================================================
@@ -280,11 +277,60 @@ class TestWriterStoresIds:
 # ============================================================
 
 
-class TestDatasetRebuildsFeatures:
-    def test_features_match_the_table_gather(self, tmp_path, engine_tables):
+class TestDatasetPassesIdsThrough:
+    """The dataset hands the model ids; the gather happens on device.
+
+    It used to rebuild the features here, per sample, in a DataLoader worker.
+    That was 93% of a sample's bytes and 128 of 174 ms per training step, for a
+    lookup the model can do once per batch on the GPU it is already using.
+    """
+
+    def test_ids_are_present_and_features_are_not(self, tmp_path, engine_tables):
         cards, attacks = engine_tables
         rng = np.random.default_rng(3)
         samples = [_id_sample(rng, _ID_SHAPES) for _ in range(6)]
+        data_dir = _write_corpus(tmp_path, samples, cards, attacks)
+
+        ds = ShardDataset(data_dir, split="train")
+        n_checked = 0
+        for i in range(len(ds)):
+            item = ds[i]
+            for feat_key, (id_key, _) in CARD_FEAT_SOURCES.items():
+                assert id_key in item, f"{id_key} must reach the model"
+                assert feat_key not in item, (
+                    f"{feat_key} must not be materialised in the loader"
+                )
+                n_checked += 1
+        assert "log_card_feat" not in ds[0]
+        assert n_checked > 0
+
+    def test_ids_arrive_as_int64_and_unchanged(self, tmp_path, engine_tables):
+        """Shards store int32; the model indexes with int64, and values must survive."""
+        cards, attacks = engine_tables
+        rng = np.random.default_rng(5)
+        samples = [_id_sample(rng, _ID_SHAPES) for _ in range(3)]
+        data_dir = _write_corpus(tmp_path, samples, cards, attacks)
+
+        ds = ShardDataset(data_dir, split="train")
+        item, raw = ds[0], ds.get_raw(0)
+        for id_key in _ID_SHAPES:
+            assert item[id_key].dtype == torch.int64, id_key
+            np.testing.assert_array_equal(item[id_key].numpy(), raw[id_key])
+
+    def test_the_model_reproduces_what_the_loader_used_to_build(
+        self, tmp_path, engine_tables
+    ):
+        """End to end: ids out of the shard, features out of the Policy tables.
+
+        This is the equivalence that makes the change a refactor rather than a
+        retrain — the tensors the model sees must be the ones the dataset used
+        to hand it.
+        """
+        from ptcg_il.model.policy import Policy
+
+        cards, attacks = engine_tables
+        rng = np.random.default_rng(4)
+        samples = [_id_sample(rng, _ID_SHAPES) for _ in range(3)]
         data_dir = _write_corpus(tmp_path, samples, cards, attacks)
 
         ds = ShardDataset(data_dir, split="train")
@@ -292,48 +338,38 @@ class TestDatasetRebuildsFeatures:
             "card": build_static_table(cards, F_CARD),
             "attack": build_static_table(attacks, F_ATK),
         }
+        policy = Policy(
+            D=32, heads=2, layers=1, ff=64,
+            all_card_feat=torch.from_numpy(tables["card"]),
+            all_attack_feat=torch.from_numpy(tables["attack"]),
+        )
+
+        item = {k: v.unsqueeze(0) for k, v in ds[0].items()}
+        got = policy._gather_card_feats(item)
+        raw = ds.get_raw(0)
 
         n_nonzero = 0
-        for i in range(len(ds)):
-            item = ds[i]
-            raw = ds.get_raw(i)
-            for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
-                assert feat_key in item, f"{feat_key} was not rebuilt"
-                want = gather_static_feats(raw[id_key].astype(np.int64), tables[kind])
-                assert np.array_equal(item[feat_key].numpy(), want), feat_key
-                n_nonzero += int(np.count_nonzero(want) > 0)
+        for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
+            want = gather_static_feats(raw[id_key].astype(np.int64), tables[kind])
+            np.testing.assert_array_equal(got[feat_key][0].numpy(), want, feat_key)
+            assert got[feat_key].dtype == torch.float32, feat_key
+            n_nonzero += int(np.count_nonzero(want) > 0)
+        assert n_nonzero > 0, "every gathered feature was zero — test is vacuous"
 
-        # Guards against the whole assertion passing on all-zero tensors.
-        assert n_nonzero > 0, "every rebuilt feature was zero — test is vacuous"
-
-    def test_log_card_feat_rebuilt_from_log_feat(self, tmp_path, engine_tables):
-        cards, attacks = engine_tables
-        rng = np.random.default_rng(4)
-        samples = [_id_sample(rng, _ID_SHAPES) for _ in range(3)]
-        data_dir = _write_corpus(tmp_path, samples, cards, attacks)
-
-        ds = ShardDataset(data_dir, split="train")
-        table = build_static_table(cards, F_CARD)
-        item, raw = ds[0], ds.get_raw(0)
-        want = gather_static_feats(raw["log_feat"][:, 2].astype(np.int64), table)
-
-        assert np.array_equal(item["log_card_feat"].numpy(), want)
-        assert want.any(), "log_card_feat rebuilt to all zeros — test is vacuous"
-
-    def test_rebuilt_features_are_float32(self, tmp_path, engine_tables):
-        cards, attacks = engine_tables
-        rng = np.random.default_rng(5)
-        data_dir = _write_corpus(
-            tmp_path, [_id_sample(rng, _ID_SHAPES)], cards, attacks
+        want_log = gather_static_feats(
+            raw["log_feat"][:, 2].astype(np.int64), tables["card"]
         )
-        item = ShardDataset(data_dir, split="train")[0]
-        for feat_key in CARD_FEAT_SOURCES:
-            assert item[feat_key].dtype == torch.float32, feat_key
+        np.testing.assert_array_equal(got["log_card_feat"][0].numpy(), want_log)
+        assert want_log.any(), "log_card_feat gathered to all zeros — test is vacuous"
 
-    def test_legacy_shards_with_stored_features_are_left_alone(
-        self, tmp_path, engine_tables
-    ):
-        """A shard predating the change carries features and no ids."""
+    def test_legacy_shards_with_stored_features_raise(self, tmp_path, engine_tables):
+        """A shard predating the id format carries features and no ids.
+
+        Nothing downstream can detect this on its own: the model would gather
+        from absent ids, ``TokenEmbedder`` tolerates a missing feature key, and
+        the run would train to convergence on cards it never saw.  Refuse at
+        construction, where the corpus is still identifiable.
+        """
         cards, attacks = engine_tables
         rng = np.random.default_rng(6)
         sample = _id_sample(rng, _ID_SHAPES)
@@ -343,17 +379,28 @@ class TestDatasetRebuildsFeatures:
             ).astype(np.float16)
             for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items()
         }
-        # log_card_feat has no id key, so it is the one feature a legacy shard
-        # can still be clobbered on: log_feat is present either way.
         stored["log_card_feat"] = rng.standard_normal((32, F_CARD)).astype(np.float16)
         for id_key in _ID_SHAPES:  # legacy shards have no id keys at all
             sample.pop(id_key)
         sample.update(stored)
 
         data_dir = _write_corpus(tmp_path, [sample], cards, attacks)
+        with pytest.raises(ValueError, match="rebuild shards"):
+            ShardDataset(data_dir, split="train")
+
+    def test_a_shard_carrying_both_drops_the_redundant_features(
+        self, tmp_path, engine_tables
+    ):
+        """Ids are authoritative, so stored features are dead weight, not an error."""
+        cards, attacks = engine_tables
+        rng = np.random.default_rng(8)
+        sample = _id_sample(rng, _ID_SHAPES)
+        sample["poke_card_feat"] = rng.standard_normal(
+            (*_ID_SHAPES["poke_card_id"], F_CARD)
+        ).astype(np.float16)
+
+        data_dir = _write_corpus(tmp_path, [sample], cards, attacks)
         item = ShardDataset(data_dir, split="train")[0]
 
-        for feat_key in stored:
-            assert np.allclose(
-                item[feat_key].numpy(), stored[feat_key].astype(np.float32)
-            ), f"{feat_key} was overwritten instead of used as stored"
+        assert "poke_card_feat" not in item
+        assert "poke_card_id" in item

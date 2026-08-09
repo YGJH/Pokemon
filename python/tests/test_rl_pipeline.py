@@ -20,6 +20,7 @@ from ptcg_il.baselines import (
     load_baselines,
     record_baseline,
 )
+from tests.test_model_policy import make_policy, make_static_tables
 
 pd = pytest.importorskip("pandas")
 
@@ -196,7 +197,9 @@ class TestCheckpointConfig:
         from ptcg_il.model.policy import current_feature_dims
 
         p = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
-        # No V/A: cards are static features, so there is no vocab width to record.
+        # No V/A: cards are static features, so there is no vocab width to
+        # record.  No static_table_shapes either: this policy was built without
+        # tables, and the key appears only once they are attached.
         arch = {k: v for k, v in p.config.items() if k != "feat_dims"}
         assert arch == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
                         "n_opp_arch": 6, "n_all_cards": 0, "seed": 42}
@@ -209,8 +212,10 @@ class TestCheckpointConfig:
         pytest.importorskip("torch")
         from ptcg_il.model.policy import Policy, load_policy_state, policy_from_config
 
-        original = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
-        rebuilt = policy_from_config(original.config)
+        original = make_policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
+        card, atk = make_static_tables()
+        rebuilt = policy_from_config(original.config, all_card_feat=card,
+                                     all_attack_feat=atk)
         # A strict-enough load: only belief keys may be missing, and here none are.
         assert load_policy_state(rebuilt, original.state_dict()) == []
 

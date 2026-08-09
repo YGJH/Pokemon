@@ -748,12 +748,19 @@ def _featurize_player(eid: str, ep: dict, p: int, won: bool,
         # it is derived from meta.parquet columns at training time (C.3).
         sample.pop("sample_weight", None)
 
-        # Nor are the *_card_feat tensors: ShardDataset re-gathers them
-        # from the ids that stay behind.  featurize still computes them —
-        # option_groups needs opt_card_feat/opt_attack_feat to decide
-        # opt_group, which *is* stored.
-        for key in _DERIVED_KEYS:
-            sample.pop(key, None)
+        # Nor are the *_card_feat tensors.  featurize no longer emits them at
+        # all — Policy gathers them on device from the ids that stay behind —
+        # so this is a guard, not a filter.  It is worth keeping as an assert
+        # rather than a silent pop: these keys were 93% of a sample's bytes and
+        # 47 GB of the train split, and a future edit that put them back in the
+        # featurizer's output would restore all of that with no other symptom.
+        leaked = _DERIVED_KEYS.intersection(sample)
+        if leaked:
+            raise AssertionError(
+                f"featurize emitted derived card features {sorted(leaked)}; they "
+                "are gathered on device from ids and must not be stored — see "
+                "ptcg_il.featurizer.CARD_FEAT_SOURCES"
+            )
 
         out.append((
             {

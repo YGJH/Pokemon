@@ -527,7 +527,7 @@ def featurize_leaf(
         batch[k] = t.to(device)
 
     with torch.no_grad():
-        h, _history_h = policy._encode(batch)
+        batch, h, _history_h = policy._encode(batch)
         logits, _ = policy.pointer(h, batch["tok_mask"],
                                     policy.embed.card, batch)
         value = policy.value(h[:, 0, :])
@@ -1280,7 +1280,7 @@ def replay_buffer_train_step(
     batch = _collate_feat_list(feat_list, device)
 
     # Forward
-    h, _hh = policy._encode(batch)
+    batch, h, _hh = policy._encode(batch)
     logits, _ = policy.pointer(h, batch["tok_mask"],
                                 policy.embed.card, batch)
     values = policy.value(h[:, 0])  # [B]

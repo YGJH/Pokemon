@@ -29,10 +29,16 @@ from ptcg_il.featurizer import (
     STOP_OPT_TYPE,
     T_MAX,
     F_CARD,
-    featurize,
     option_groups,
 )
 from ptcg_il.ref_map import card_id_at
+
+# ``featurize`` emits card *ids*; ``Policy`` gathers the ``*_card_feat`` rows on
+# device.  These tests are about the identity those features carry, so they use
+# the same wrapper ``test_featurizer`` does: real featurizer, plus the model's
+# gather.  The featurizer's own key set is pinned in
+# ``test_card_feature_reconstruction.py``.
+from tests.test_featurizer import featurize
 
 SAMPLE_PATH = (
     Path(__file__).resolve().parents[2]

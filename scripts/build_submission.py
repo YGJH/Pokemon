@@ -233,12 +233,30 @@ _all_card_feat = torch.zeros(_max_cid + 1, _card_feat_dim)
 for _cid, _feat in _engine_card_features.items():
     _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
+# Same table for attacks, and it is not optional.  `featurize` emits attack
+# *ids* (`opt_attack_idx`) and `Policy._gather_card_feats` turns them back into
+# features from this table on every forward, so a policy without it constructs,
+# loads every weight and then raises on the first real decision.
+_max_aid = max(_engine_attack_features.keys()) if _engine_attack_features else 0
+_attack_row_dim = int(np.asarray(next(iter(_engine_attack_features.values()))).shape[-1]
+                     ) if _engine_attack_features else 0
+_attack_feat_dim = int(_cfg.get("feat_dims", {}).get("F_ATK", _attack_row_dim))
+if _engine_attack_features and _attack_feat_dim != _attack_row_dim:
+    raise SystemExit(
+        f"attack feature width mismatch: the checkpoint was trained at F_ATK="
+        f"{_attack_feat_dim}, engine_attack_features.npy has {_attack_row_dim}-wide "
+        "rows. Rebuild the submission against the checkpoint's own featurizer.")
+_all_attack_feat = torch.zeros(_max_aid + 1, _attack_feat_dim)
+for _aid, _feat in _engine_attack_features.items():
+    _all_attack_feat[int(_aid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
+
 _model = Policy(
     D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
     layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
     n_opp_arch=_cfg.get("n_opp_arch", 1),
     n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
     all_card_feat=_all_card_feat,
+    all_attack_feat=_all_attack_feat,
 )
 _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
 if _missing:
@@ -499,12 +517,32 @@ _all_card_feat = torch.zeros(_max_cid + 1, _card_feat_dim)
 for _cid, _feat in _engine_card_features.items():
     _all_card_feat[int(_cid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
+# Same table for attacks, and it is not optional.  `featurize` emits attack
+# *ids* (`opt_attack_idx`) and `Policy._gather_card_feats` turns them back into
+# features from this table on every forward, so a policy without it constructs,
+# loads every weight and then raises on the first real decision — which `agent`
+# catches, warns about, and answers with the first legal option for the rest of
+# the game.
+_max_aid = max(_engine_attack_features.keys()) if _engine_attack_features else 0
+_attack_row_dim = int(np.asarray(next(iter(_engine_attack_features.values()))).shape[-1]
+                     ) if _engine_attack_features else 0
+_attack_feat_dim = int(_cfg.get("feat_dims", {}).get("F_ATK", _attack_row_dim))
+if _engine_attack_features and _attack_feat_dim != _attack_row_dim:
+    raise SystemExit(
+        f"attack feature width mismatch: the checkpoint was trained at F_ATK="
+        f"{_attack_feat_dim}, engine_attack_features.npy has {_attack_row_dim}-wide "
+        "rows. Rebuild the submission against the checkpoint's own featurizer.")
+_all_attack_feat = torch.zeros(_max_aid + 1, _attack_feat_dim)
+for _aid, _feat in _engine_attack_features.items():
+    _all_attack_feat[int(_aid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
+
 # ── Ensemble detection ────────────────────────────────────────────────────
 if os.path.exists(_ENSEMBLE_MANIFEST):
     from model.ensemble import EnsemblePolicy
     _manifest = json.loads(open(_ENSEMBLE_MANIFEST).read())
     _member_paths = [os.path.join(DATA_DIR, m) for m in _manifest["members"]]
-    _model = EnsemblePolicy.from_checkpoints(_member_paths, _all_card_feat, device=_device)
+    _model = EnsemblePolicy.from_checkpoints(
+        _member_paths, _all_card_feat, _all_attack_feat, device=_device)
 else:
     _model = Policy(
         D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
@@ -512,6 +550,7 @@ else:
         n_opp_arch=_cfg.get("n_opp_arch", 1),
         n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
         all_card_feat=_all_card_feat,
+        all_attack_feat=_all_attack_feat,
     )
     _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
     if _missing:
@@ -609,32 +648,36 @@ def agent(obs_dict: dict) -> list[int]:
     min_count = int(select.get("minCount", 1) or 0)
     max_count = int(select.get("maxCount", 1) or 0)
 
-    try:
-        feats = featurize(
-            obs_dict, _vocab,
-            engine_card_features=_engine_card_features,
-            engine_attack_features=_engine_attack_features,
-            evolution_map=_evolution_map,
-        )
-        batch = _to_batch(feats)
-        feat_max_count = int(feats.get("maxCount", max_count))
+    # Deliberately unguarded.  A featurizer or shape failure here is not a bad
+    # position, it is a bundle that cannot play at all: a static table that was
+    # never attached, a renamed key, a checkpoint whose widths moved.  The
+    # handler that used to catch it printed one line and answered every
+    # subsequent decision with the first `minCount` legal options, which is
+    # indistinguishable downstream from a policy that simply plays badly — so a
+    # dead agent survived whole experiments and its win rate was read as a
+    # result.  Failing the run is the cheaper outcome by a wide margin.
+    feats = featurize(
+        obs_dict, _vocab,
+        engine_card_features=_engine_card_features,
+        engine_attack_features=_engine_attack_features,
+        evolution_map=_evolution_map,
+    )
+    batch = _to_batch(feats)
+    feat_max_count = int(feats.get("maxCount", max_count))
 
-        with torch.no_grad():
-            if feat_max_count == 1:
-                logits, _value, _hist = _model(batch)
-                logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-                indices = [int(logits.argmax(dim=-1)[0].item())]
-            else:
-                chosen = select_multi(_model, batch)
-                # -1 pads beyond maxCount, -2 marks the STOP pick.
-                indices = [int(p) for p in chosen[0].tolist() if p >= 0]
-    except Exception as e:
-        # A featurizer or shape failure must not forfeit the game outright;
-        # the first minCount legal options at least keep play going.
-        print(f"[agent] WARNING: greedy inference failed ({type(e).__name__}: {e})"
-              f" — falling back to the first {min_count} option(s)")
-        indices = []
+    with torch.no_grad():
+        if feat_max_count == 1:
+            logits, _value, _hist = _model(batch)
+            logits = logits.masked_fill(~batch["opt_mask"], -1e9)
+            indices = [int(logits.argmax(dim=-1)[0].item())]
+        else:
+            chosen = select_multi(_model, batch)
+            # -1 pads beyond maxCount, -2 marks the STOP pick.
+            indices = [int(p) for p in chosen[0].tolist() if p >= 0]
 
+    # Still clamped: this guards the model's *output* (a duplicate, an
+    # out-of-range index, more picks than maxCount), which is a legal answer to
+    # give badly, not a broken bundle.
     return _legal(indices, n_options, min_count, max_count)
 '''
 

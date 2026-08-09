@@ -1016,9 +1016,9 @@ def test_train_step_weights_the_clone_term_by_advantage():
 
 def _tiny_policy(seed: int = 0, D: int = 64):
     import torch
-    from ptcg_il.model.policy import Policy
+    from tests.test_model_policy import make_policy
     torch.manual_seed(seed)
-    p = Policy(D=D, heads=4, layers=1, ff=128)
+    p = make_policy(D=D, heads=4, layers=1, ff=128)
     p.train()
     return p
 
@@ -1032,7 +1032,7 @@ def _tiny_batch(n: int = 4, with_mcts: bool = False, seed: int = 0):
     through ``_collate_feat_list``.
     """
     import torch
-    from tests.test_model_policy import _make_synthetic_batch
+    from tests.test_model_policy import _make_synthetic_batch, make_policy
 
     torch.manual_seed(seed)
     x = _make_synthetic_batch(n, max_count=1)

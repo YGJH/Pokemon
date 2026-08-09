@@ -269,7 +269,7 @@ class PolicyActor:
         autocast = torch.autocast("cuda", dtype=torch.bfloat16) if self.bf16 else _NullCtx()
         with torch.no_grad(), autocast:
             # Encode once for both the pointer AR loop and the value head.
-            h, _history = self.policy._encode(batch)
+            batch, h, _history = self.policy._encode(batch)
             picks, logp, _entropy = sample_action(
                 self.policy, batch,
                 temperature=self.temperature,

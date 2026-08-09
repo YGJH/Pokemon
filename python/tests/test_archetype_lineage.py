@@ -32,6 +32,7 @@ from ptcg_mine.archetype import (
     cluster_decks,
     load_archetypes_json,
 )
+from tests.test_model_policy import make_policy
 
 # Four mutually dissimilar 60-card decks (multiset Jaccard 0 pairwise).
 DECK_A = tuple([1] * 30 + [2] * 30)
@@ -403,7 +404,7 @@ def test_an_explicit_baseline_is_fingerprinted_by_content(tmp_path):
 def _policy(n_opp_arch: int):
     from ptcg_il.model.policy import Policy
 
-    return Policy(D=32, heads=2, layers=1, ff=64,
+    return make_policy(D=32, heads=2, layers=1, ff=64,
                   n_opp_arch=n_opp_arch, n_all_cards=40)
 
 

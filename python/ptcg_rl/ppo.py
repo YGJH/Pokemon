@@ -148,7 +148,7 @@ def ppo_losses(
     check_canary: bool = False,
 ) -> tuple[torch.Tensor, PPOStats]:
     """One minibatch's total loss and its diagnostics."""
-    h, _history = policy._encode(batch)
+    batch, h, _history = policy._encode(batch)
     logp, entropy = recompute_logp(policy, batch, encoded=h)
 
     # --- Clipped surrogate on the joint sequence ---
@@ -240,7 +240,7 @@ def search_distillation_loss(
     import numpy as np
 
     device = next(policy.parameters()).device
-    h, _history_h = policy._encode(batch)
+    batch, h, _history_h = policy._encode(batch)
     logits, _ = policy.pointer(h, batch["tok_mask"],
                                 policy.embed.card, batch)
     value = policy.value(h[:, 0])  # [B, 1]

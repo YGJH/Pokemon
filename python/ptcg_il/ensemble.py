@@ -39,6 +39,7 @@ class EnsemblePolicy(nn.Module):
         cls,
         paths: list[str],
         all_card_feat: torch.Tensor | None = None,
+        all_attack_feat: torch.Tensor | None = None,
         device: str = "cpu",
     ) -> EnsemblePolicy:
         """Build an EnsemblePolicy from a list of checkpoint paths.
@@ -83,7 +84,8 @@ class EnsemblePolicy(nn.Module):
 
             # Build policy from checkpoint's own config
             cfg = ckpt.get("config") or {}
-            member = policy_from_config(cfg, all_card_feat=all_card_feat)
+            member = policy_from_config(cfg, all_card_feat=all_card_feat,
+                                        all_attack_feat=all_attack_feat)
             load_policy_state(member, state_dict)
             member.to(device)
             member.eval()
@@ -202,10 +204,15 @@ class EnsemblePolicy(nn.Module):
         # Pre-encode each member
         pointers: list = []
         h_list: list[torch.Tensor] = []
+        xs: list[dict] = []
         for member in self.members:
-            h_i, _hist_i = member._encode(x, history_h)
+            x_i, h_i, _hist_i = member._encode(x, history_h)
             pointers.append(member.pointer)
             h_list.append(h_i)
+            xs.append(x_i)
+        # Members share one corpus and therefore one static table, so every
+        # x_i is the same gather; the pointer call below takes the first.
+        x = xs[0]
 
         stop_col = x.get("stop_column")
         return _select_multi_raw(

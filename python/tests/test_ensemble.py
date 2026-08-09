@@ -11,14 +11,30 @@ from ptcg_il.ensemble import EnsemblePolicy
 from ptcg_il.model.policy import Policy, select_multi
 
 # Reuse the synthetic batch builder from test_model_policy
-from tests.test_model_policy import _make_synthetic_batch
+from tests.test_model_policy import (
+    _make_synthetic_batch, make_policy, make_static_tables,
+)
+
+
+def _from_checkpoints(paths, **kw):
+    """``EnsemblePolicy.from_checkpoints`` with the fixtures' static tables.
+
+    Members are saved by ``make_policy``, which attaches those tables, so the
+    card matrix is in their state dicts; rebuilding without it makes
+    ``belief_heads.all_card_feat`` an unexpected key.
+    """
+    card, atk = make_static_tables()
+    kw.setdefault("all_card_feat", card)
+    kw.setdefault("all_attack_feat", atk)
+    return EnsemblePolicy.from_checkpoints(paths, **kw)
+
 
 
 def _make_member(D=256, heads=8, layers=4, ff=1024, seed=0):
     """Build a Policy with a specific seed for deterministic comparison."""
     torch.manual_seed(seed)
     from ptcg_il.model import init_weights
-    policy = Policy(D=D, heads=heads, layers=layers, ff=ff)
+    policy = make_policy(D=D, heads=heads, layers=layers, ff=ff)
     init_weights(policy)
     return policy
 
@@ -72,7 +88,7 @@ class TestEnsemblePolicyConstruction:
                 "deck": deck,
             }, path1)
 
-            ensemble = EnsemblePolicy.from_checkpoints(
+            ensemble = _from_checkpoints(
                 [str(path0), str(path1)],
             )
             assert len(ensemble.members) == 2
@@ -102,7 +118,7 @@ class TestEnsemblePolicyConstruction:
                 "deck": deck,
             }, path)
 
-            ensemble = EnsemblePolicy.from_checkpoints([str(path)])
+            ensemble = _from_checkpoints([str(path)])
             # Check a real weight (not the zero-initialised bias first in order)
             loaded = ensemble.members[0].embed.card.mlp[0].weight
             original = m0.embed.card.mlp[0].weight
@@ -131,7 +147,7 @@ class TestEnsemblePolicyConstruction:
             }, path1)
 
             with pytest.raises(ValueError, match="decklist differs"):
-                EnsemblePolicy.from_checkpoints([str(path0), str(path1)])
+                _from_checkpoints([str(path0), str(path1)])
 
     def test_missing_both_state_dicts_raises(self):
         """Checkpoint with neither EMA shadow nor model_state_dict raises."""
@@ -139,12 +155,12 @@ class TestEnsemblePolicyConstruction:
             path = Path(tmp) / "empty.pt"
             torch.save({"config": {"D": 256, "heads": 8, "layers": 4, "ff": 1024}}, path)
             with pytest.raises(KeyError, match="missing both"):
-                EnsemblePolicy.from_checkpoints([str(path)])
+                _from_checkpoints([str(path)])
 
     def test_empty_paths_raises(self):
         """Zero paths raises ValueError."""
         with pytest.raises(ValueError, match="at least one"):
-            EnsemblePolicy.from_checkpoints([])
+            _from_checkpoints([])
 
 
 class TestEnsemblePolicyForward:

@@ -109,11 +109,23 @@ def save_checkpoint(
         # from tensor shapes.  ``Policy`` records these itself at construction;
         # anything else (a test double, say) simply gets an empty dict.
         "config": dict(getattr(policy, "config", {})),
+        # Which optimizer wrote ``optimizer_state_dict``.  AdamW keeps two
+        # moments per parameter and Muon keeps one momentum buffer for the trunk,
+        # so the two state dicts are not interchangeable — and
+        # ``Optimizer.load_state_dict`` matches groups by position, so a
+        # mismatch can load quietly rather than raise.  ``train`` refuses on this
+        # field; see ``require_matching_optimizer``.
+        "optimizer": _optimizer_kind(optimizer),
     }
     ckpt[DECK_KEY] = deck
 
     torch.save(ckpt, path)
     return path
+
+
+def _optimizer_kind(optimizer: torch.optim.Optimizer) -> str:
+    """``"muon"`` or ``"adamw"`` — the name the ``--optimizer`` flag uses."""
+    return "muon" if type(optimizer).__name__ == "Muon" else "adamw"
 
 
 def _cpu_state_dict(sd: dict) -> dict:

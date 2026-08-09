@@ -48,6 +48,24 @@ EMA_DECAY: float = 0.999
 LAMBDA_V: float = 0.5
 WEIGHT_DECAY: float = 0.01
 BETAS: tuple[float, float] = (0.9, 0.95)
+
+#: Peak LR for the orthogonalized (Muon) parameter group.  Deliberately a
+#: separate constant from PEAK_LR: an orthogonalized update's magnitude is set
+#: by the matrix shape, not by the gradient, so the two groups live on different
+#: scales and this value does not follow PEAK_LR when that is tuned.
+#:
+#: Swept on archetype 25, 5000 steps, B=1024, seed 42, scored on the best
+#: ``val/top1_nontrivial`` reached (the metric that selects ``ckpt-best``):
+#:
+#:   0.003 -> 0.6654 | 0.007 -> 0.6679 | **0.015 -> 0.6697** | 0.03 -> 0.6454 |
+#:   0.05 -> 0.6010  (AdamW baseline 0.6420)
+#:
+#: The optimum is interior to the grid and the curve falls off on both sides, so
+#: this is a peak rather than an edge.  Re-sweep if the model width, batch size
+#: or corpus changes — none of those leave an orthogonalized update's scale
+#: alone.
+MUON_LR: float = 0.015
+MUON_MOMENTUM: float = 0.95
 LOG_EVERY: int = 50
 VAL_EVERY: int = 1000
 CKPT_EVERY: int = 2000
@@ -150,46 +168,224 @@ def target_group_mask(
     return (opt_group == g) & mask & (opt_group >= 0)
 
 
+#: Smallest out-features a 2D parameter may have and still be orthogonalized.
+#:
+#: The partition is on ``p.size(-2)`` (out-features for an ``nn.Linear`` weight)
+#: rather than on ``min(shape)``, because those disagree on exactly the cases
+#: that matter.  ``embed.hand_mlp.0.weight`` is ``[256, 7]`` — a real 7->256 map
+#: whose seven singular values are worth flattening, and whose narrowness the
+#: aspect-ratio scale factor already accounts for.  ``arch_head.2.weight`` is
+#: ``[9, 256]`` — nine logits, where "orthogonalize" means "rescale the head".
+#: A ``min(shape)`` threshold cannot separate 7 from 9; out-features separates
+#: 256 from 9 with room to spare.
+#:
+#: This is a guard as much as a rule: a head added later is caught by it instead
+#: of being silently orthogonalized.
+MIN_MUON_OUT_FEATURES: int = 16
+
+
+def stacked_slice_counts(policy: nn.Module) -> dict[int, int]:
+    """``id(param) -> number of independent maps concatenated inside it``.
+
+    Two module types in this model fuse several linear maps into one tensor on
+    the output axis, and on the D=256/8-layer configuration they are **28.6% of
+    all parameters**:
+
+    * ``nn.MultiheadAttention.in_proj_weight`` — ``[3D, D]``, i.e. Q, K and V
+      (9 of them, 19.8%);
+    * ``nn.GRU`` / ``nn.GRUCell`` ``weight_ih*`` / ``weight_hh*`` — ``[3H, *]``,
+      i.e. the reset, update and new gates (4 of them, 8.8%).
+
+    Orthogonalizing such a tensor whole is not what Muon means: the stack has
+    rank at most its width, so Newton-Schulz flattens a *joint* spectrum and the
+    three blocks stop being independently conditioned.  Detection is by module
+    type rather than by shape, because ``[768, 256]`` is only "three stacked
+    maps" by virtue of what owns it — a plain ``nn.Linear`` of the same shape is
+    one map and must not be split.
+    """
+    counts: dict[int, int] = {}
+    for m in policy.modules():
+        if isinstance(m, nn.MultiheadAttention):
+            if getattr(m, "in_proj_weight", None) is not None:
+                counts[id(m.in_proj_weight)] = 3
+        elif isinstance(m, (nn.GRU, nn.GRUCell)):
+            for n, p in m.named_parameters(recurse=False):
+                if n.startswith(("weight_ih", "weight_hh")):
+                    counts[id(p)] = 3
+        elif isinstance(m, (nn.LSTM, nn.LSTMCell)):
+            for n, p in m.named_parameters(recurse=False):
+                if n.startswith(("weight_ih", "weight_hh")):
+                    counts[id(p)] = 4
+    return counts
+
+
+def partition_parameters(policy: nn.Module) -> dict[str, list[nn.Parameter]]:
+    """Split parameters into ``muon`` / ``adamw_decay`` / ``adamw_no_decay``.
+
+    Muon takes 2D parameters that are genuine linear maps.  Everything else
+    stays on AdamW: ``nn.Embedding`` tables (rows are lookups, not a map), 1D
+    biases and norm gains (no spectrum), and output heads (see
+    :data:`MIN_MUON_OUT_FEATURES`).
+
+    Every parameter lands in exactly one list.  That is not automatic here —
+    one ``CardEncoder`` is aliased into ``pointer.card``, ``belief.card_emb``
+    and ``belief_heads``, so the same tensors are reachable under several names
+    — and a tensor in two groups would be updated twice per step.  Dedup is by
+    ``id``, not by name.
+    """
+    embedding_ids = {
+        id(p) for m in policy.modules() if isinstance(m, nn.Embedding)
+        for p in m.parameters()
+    }
+
+    groups: dict[str, list[nn.Parameter]] = {
+        "muon": [], "adamw_decay": [], "adamw_no_decay": [],
+    }
+    seen: set[int] = set()
+    for n, p in policy.named_parameters():
+        if not p.requires_grad or id(p) in seen:
+            continue
+        seen.add(id(p))
+
+        eligible = (
+            p.ndim == 2
+            and id(p) not in embedding_ids
+            and p.size(-2) >= MIN_MUON_OUT_FEATURES
+        )
+        if eligible:
+            groups["muon"].append(p)
+        elif _no_decay(n, p):
+            groups["adamw_no_decay"].append(p)
+        else:
+            groups["adamw_decay"].append(p)
+    return groups
+
+
 def create_optimizer(
     policy: nn.Module,
     peak_lr: float = PEAK_LR,
     weight_decay: float = WEIGHT_DECAY,
     betas: tuple[float, float] = BETAS,
-) -> AdamW:
-    """Build AdamW with per-param no-decay set (C.5).
+    optimizer: str = "adamw",
+    muon_lr: float = MUON_LR,
+    muon_momentum: float = MUON_MOMENTUM,
+) -> torch.optim.Optimizer:
+    """Build the optimizer with the per-param no-decay set (C.5).
+
+    ``optimizer="adamw"`` (default) is the original two-group AdamW and is the
+    baseline every Muon result is measured against, so it is left byte-for-byte
+    as it was.
+
+    ``optimizer="muon"`` puts the trunk matrices on orthogonalized momentum and
+    everything else on AdamW, inside a single :class:`~ptcg_il.train.muon.Muon`
+    object — one optimizer means one ``LambdaLR``, one state dict and no changes
+    to ``train_step`` or the resume path.  The two halves get **independent base
+    learning rates**: an orthogonalized update's size is set by the matrix shape
+    rather than by the gradient, so ``muon_lr`` does not transfer from
+    ``peak_lr`` and is swept separately.  The schedule scales both.
 
     Parameters
     ----------
     policy : nn.Module
         The Policy module.
     peak_lr : float
-        Peak learning rate.
+        Peak learning rate for the AdamW parameters.
     weight_decay : float
         Weight decay for decay-eligible params.
     betas : tuple
         AdamW beta coefficients.
-
-    Returns
-    -------
-    AdamW optimizer.
+    optimizer : str
+        ``"adamw"`` or ``"muon"``.
+    muon_lr : float
+        Peak learning rate for the orthogonalized group.
+    muon_momentum : float
+        Momentum for the orthogonalized group.
     """
-    decay_params = []
-    no_decay_params = []
+    if optimizer not in ("adamw", "muon"):
+        raise ValueError(
+            f"unknown optimizer {optimizer!r}; expected 'adamw' or 'muon'"
+        )
 
-    for n, p in policy.named_parameters():
-        if not p.requires_grad:
-            continue
-        if _no_decay(n, p):
-            no_decay_params.append(p)
-        else:
-            decay_params.append(p)
+    if optimizer == "adamw":
+        decay_params = []
+        no_decay_params = []
 
-    param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
+        for n, p in policy.named_parameters():
+            if not p.requires_grad:
+                continue
+            if _no_decay(n, p):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+        param_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        return AdamW(param_groups, lr=peak_lr, betas=betas)
+
+    from ptcg_il.train.muon import Muon
+
+    groups = partition_parameters(policy)
+    slices = stacked_slice_counts(policy)
+
+    # One Muon group per distinct slice count.  They share a learning rate and
+    # differ only in how the update is carved up before orthogonalization.
+    by_split: dict[int, list[nn.Parameter]] = {}
+    for p in groups["muon"]:
+        by_split.setdefault(slices.get(id(p), 1), []).append(p)
+
+    muon_groups = [
+        {"params": ps, "use_muon": True, "lr": muon_lr,
+         "weight_decay": weight_decay, "momentum": muon_momentum, "split": n}
+        for n, ps in sorted(by_split.items())
     ]
 
-    return AdamW(param_groups, lr=peak_lr, betas=betas)
+    n_muon = sum(p.numel() for p in groups["muon"])
+    n_total = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+    n_stacked = sum(p.numel() for n, ps in by_split.items() if n > 1 for p in ps)
+    logger.info(
+        "Muon: %d/%d parameters (%.1f%%) on orthogonalized momentum at lr=%.4g "
+        "(%.1f%% of them in stacked QKV/GRU tensors, split per map); the rest on "
+        "AdamW at lr=%.4g",
+        n_muon, n_total, 100.0 * n_muon / max(n_total, 1), muon_lr,
+        100.0 * n_stacked / max(n_muon, 1), peak_lr,
+    )
+
+    return Muon(
+        muon_groups + [
+            {"params": groups["adamw_decay"], "use_muon": False,
+             "lr": peak_lr, "weight_decay": weight_decay, "betas": betas},
+            {"params": groups["adamw_no_decay"], "use_muon": False,
+             "lr": peak_lr, "weight_decay": 0.0, "betas": betas},
+        ],
+        lr=peak_lr,
+        betas=betas,
+    )
+
+
+def require_matching_optimizer(ckpt: dict, optimizer: str) -> None:
+    """Refuse to resume a checkpoint whose optimizer state is a different shape.
+
+    Muon's trunk groups keep a single ``momentum_buffer``; AdamW keeps
+    ``exp_avg``/``exp_avg_sq`` for everything.  ``Optimizer.load_state_dict``
+    pairs groups by *position*, so the failure is not reliably an exception —
+    with the group counts lined up it can load AdamW moments into slots a Muon
+    step never reads, and the run continues from what looks like a resumed
+    state and is really a cold optimizer.
+
+    A checkpoint written before this field existed is treated as AdamW, which is
+    what every checkpoint on disk was written by.
+    """
+    was = ckpt.get("optimizer", "adamw")
+    if was != optimizer:
+        raise ValueError(
+            f"checkpoint was trained with --optimizer {was}, this run uses "
+            f"--optimizer {optimizer}. Optimizer state cannot be carried across "
+            f"the two: pass --optimizer {was} to continue the run, or start a "
+            f"fresh one (drop --resume) to change optimizer."
+        )
 
 
 def create_schedule(
@@ -514,6 +710,8 @@ def train(
     ckpt_every: int = CKPT_EVERY,
     # Data
     num_workers: int = 8,
+    optimizer_name: str = "adamw",
+    muon_lr: float = MUON_LR,
     grad_accum: int = 1,
     archetype_self: int | None = None,
     # Precision
@@ -704,7 +902,10 @@ def train(
     # boundaries, so the cosine horizon is measured in *optimizer* steps —
     # passing total_steps here would leave the decay unfinished (and never
     # reach min_lr) whenever grad_accum > 1.
-    optimizer = create_optimizer(policy, peak_lr, weight_decay, betas)
+    optimizer = create_optimizer(
+        policy, peak_lr, weight_decay, betas,
+        optimizer=optimizer_name, muon_lr=muon_lr,
+    )
     scheduler = create_schedule(optimizer, opt_steps, warmup, peak_lr, min_lr)
 
     # EMA
@@ -729,6 +930,7 @@ def train(
                 "Checkpoint predates the belief heads; %d belief parameters "
                 "start from scratch.", len(stale),
             )
+        require_matching_optimizer(ckpt, optimizer_name)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         ema.load_state_dict(ckpt["ema_state_dict"], model=policy)

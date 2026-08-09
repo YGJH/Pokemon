@@ -183,7 +183,7 @@ def measure(policy, loader, device, max_batches: int | None = None) -> CriticDia
         if max_batches is not None and i >= max_batches:
             break
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        h, _ = policy._encode(batch)
+        _x, h, _ = policy._encode(batch)
         cls = h[:, 0]
         value = policy.value(cls).float()
         preds.extend(value.cpu().tolist())
@@ -286,10 +286,10 @@ def repair(
                 # The trunk runs under no_grad: it skips the backward pass
                 # through the transformer, which is the whole cost here.
                 with torch.no_grad():
-                    h, _ = policy._encode(batch)
+                    batch, h, _ = policy._encode(batch)
                 cls = h[:, 0].detach()
             else:
-                h, _ = policy._encode(batch)
+                batch, h, _ = policy._encode(batch)
                 cls = h[:, 0]
 
             value = policy.value(cls).float()

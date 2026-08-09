@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 ABLATION_GROUPS: dict[str, tuple[str, ...]] = {
     "option card identity": ("opt_card_id",),
     "option type": ("opt_type",),
-    "option target refs": ("opt_src_idx", "opt_tgt_idx"),
+    "option target refs": ("opt_src_idx", "opt_tgt_idx", "opt_bench_idx"),
     "option scalars": ("opt_scalar",),
     "option attack": ("opt_attack_idx",),
     "board pokemon identity": ("poke_card_id",),
@@ -112,7 +112,7 @@ def state_fingerprint(batch: dict[str, np.ndarray], i: int) -> bytes:
     h = hashlib.blake2b(digest_size=16)
     for key in (
         "tok_type", "poke_card_id", "hand_card_id", "opt_type", "opt_card_id",
-        "opt_src_idx", "opt_tgt_idx", "opt_mask", "sel_type", "sel_ctx",
+        "opt_src_idx", "opt_tgt_idx", "opt_bench_idx", "opt_mask", "sel_type", "sel_ctx",
         "minCount", "maxCount", "stadium_card_id",
     ):
         v = batch.get(key)
@@ -369,7 +369,9 @@ def run_diagnosis(
     import torch
     from torch.utils.data import DataLoader
 
-    from ptcg_il.model.policy import load_policy_state, policy_from_config
+    from ptcg_il.model.policy import (
+        load_policy_state, load_static_tables, policy_from_config,
+    )
     from ptcg_il.train.checkpoint import load_checkpoint
     from ptcg_il.train.dataset import ShardDataset, collate_fn
 
@@ -383,7 +385,9 @@ def run_diagnosis(
             f"{ckpt_path} has no 'config' record — retrain with the current "
             f"pipeline so the architecture does not have to be guessed."
         )
-    policy = policy_from_config(config)
+    card_table, attack_table = load_static_tables(data_dir)
+    policy = policy_from_config(config, all_card_feat=card_table,
+                                all_attack_feat=attack_table)
     load_policy_state(policy, ckpt["model_state_dict"])
     policy.to(dev).eval()
 

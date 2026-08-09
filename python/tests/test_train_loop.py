@@ -32,6 +32,7 @@ from ptcg_il.train.loop import (
     create_schedule,
     train_step,
 )
+from tests.test_model_policy import N_TEST_CARDS, make_policy
 
 # ============================================================
 # Tiny model factory
@@ -54,7 +55,7 @@ def _deck_record(cards: int = 60) -> dict:
 
 def _tiny_policy() -> Policy:
     """Create a tiny Policy (D=32, layers=1) for fast tests."""
-    return Policy(D=32, heads=4, layers=1, ff=64)
+    return make_policy(D=32, heads=4, layers=1, ff=64)
 
 
 # ============================================================
@@ -73,14 +74,15 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
     L_LOG_MAX, LOG_FEAT_DIM = 32, 6
 
     return {
-        # State — card identity, as static features (no id embeddings)
-        "poke_card_feat": np.zeros((P_MAX, F_CARD), dtype=np.float32),
-        "hand_card_feat": np.zeros((H_MAX, F_CARD), dtype=np.float32),
-        "stadium_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
-        "context_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
-        "effect_card_feat": np.zeros((1, F_CARD), dtype=np.float32),
-        "discard_card_feat": np.zeros((SUM, D_MAX, F_CARD), dtype=np.float32),
-        "prize_card_feat": np.zeros((SUM, PZ_MAX, F_CARD), dtype=np.float32),
+        # State — card identity, as ids into the engine static tables.  Shards
+        # store ids; Policy gathers the *_card_feat rows on device.
+        "poke_card_id": np.zeros(P_MAX, dtype=np.int64),
+        "hand_card_id": np.zeros(H_MAX, dtype=np.int64),
+        "stadium_card_id": np.zeros(1, dtype=np.int64),
+        "context_card_id": np.zeros(1, dtype=np.int64),
+        "effect_card_id": np.zeros(1, dtype=np.int64),
+        "discard_ids": np.zeros((SUM, D_MAX), dtype=np.int64),
+        "prize_ids": np.zeros((SUM, PZ_MAX), dtype=np.int64),
         # State — dense features
         "cls_feat": np.random.randn(F_GLOBAL).astype(np.float32) * 0.1,
         "poke_feat": np.random.randn(P_MAX, F_POKE).astype(np.float32) * 0.1,
@@ -97,8 +99,9 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
         "opt_type": np.zeros(O_MAX, dtype=np.int64),
         "opt_src_idx": np.full(O_MAX, -1, dtype=np.int64),
         "opt_tgt_idx": np.full(O_MAX, -1, dtype=np.int64),
-        "opt_card_feat": np.zeros((O_MAX, F_CARD), dtype=np.float32),
-        "opt_attack_feat": np.zeros((O_MAX, F_ATK), dtype=np.float32),
+        "opt_bench_idx": np.full(O_MAX, -1, dtype=np.int64),
+        "opt_card_id": np.zeros(O_MAX, dtype=np.int64),
+        "opt_attack_idx": np.zeros(O_MAX, dtype=np.int64),
         "opt_scalar": np.zeros((O_MAX, F_OPT), dtype=np.float32),
         "opt_mask": np.zeros(O_MAX, dtype=bool),
         "opt_group": np.full(O_MAX, -1, dtype=np.int64),
@@ -116,7 +119,6 @@ def _synthetic_shard_sample() -> dict[str, np.ndarray]:
         "log_feat": np.zeros((L_LOG_MAX, LOG_FEAT_DIM), dtype=np.float32),
         "log_mask": np.zeros(L_LOG_MAX, dtype=bool),
         "log_len": np.array(0, dtype=np.int64),
-        "log_card_feat": np.zeros((L_LOG_MAX, F_CARD), dtype=np.float32),
     }
 
 
@@ -159,10 +161,11 @@ def _configure_sample(
     s["sel_type"] = np.array(min(sel_ctx, 10), dtype=np.int64)
     s["value_target"] = np.array(1.0 if won else -1.0, dtype=np.float32)
 
-    # The card MLP needs non-zero features for the tokens that are in play;
-    # an all-zero row is PAD and embeds to ~zero.
-    s["poke_card_feat"][:10] = np.random.randn(10, F_CARD).astype(np.float32) * 0.1
-    s["hand_card_feat"][:5] = np.random.randn(5, F_CARD).astype(np.float32) * 0.1
+    # The card MLP needs non-zero features for the tokens that are in play, and
+    # id 0 is PAD -- it gathers an all-zero row and embeds to ~zero.  Ids stay
+    # inside the test tables' range so the gather never falls back to zeros.
+    s["poke_card_id"][:10] = np.random.randint(1, N_TEST_CARDS, 10)
+    s["hand_card_id"][:5] = np.random.randint(1, N_TEST_CARDS, 5)
 
     return s
 

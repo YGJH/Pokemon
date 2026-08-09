@@ -49,6 +49,7 @@ _POINTER_KEYS = (
     "opt_type",
     "opt_src_idx",
     "opt_tgt_idx",
+    "opt_bench_idx",
     "opt_card_feat",
     "opt_attack_feat",
     "opt_scalar",
@@ -194,7 +195,9 @@ def recompute_logp(
     history_h : Tensor[B, D] or None
         Cross-turn GRU state.
     encoded : Tensor[B, L, D] or None
-        A state already run through :meth:`Policy._encode`.  Callers that also
+        A state already run through :meth:`Policy._encode`.  Pass the batch
+        that call *returned* as *x*: it carries the gathered option features
+        this function subsets.  Callers that also
         need the value head — the PPO update and the rollout actor both do —
         should encode once and pass it here; otherwise the transformer runs
         twice per batch, doubling the cost of every update.
@@ -214,7 +217,13 @@ def recompute_logp(
 
     B = x["tok_type"].shape[0]
     device = x["tok_type"].device
-    h = encoded if encoded is not None else policy._encode(x, history_h)[0]
+    # `_encode` returns the batch *with* the gathered `*_card_feat` tensors,
+    # which `_POINTER_KEYS` below subsets; when the caller pre-encoded, it has
+    # already been handed that dict and passes it in as `x`.
+    if encoded is None:
+        x, h, _history_h = policy._encode(x, history_h)
+    else:
+        h = encoded
     picked_mask, min_count, stop_column = _ar_state(x)
 
     msgru_h = torch.zeros(B, policy.D, device=device, dtype=torch.float32)
@@ -312,7 +321,13 @@ def sample_action(
 
     B = x["tok_type"].shape[0]
     device = x["tok_type"].device
-    h = encoded if encoded is not None else policy._encode(x, history_h)[0]
+    # `_encode` returns the batch *with* the gathered `*_card_feat` tensors,
+    # which `_POINTER_KEYS` below subsets; when the caller pre-encoded, it has
+    # already been handed that dict and passes it in as `x`.
+    if encoded is None:
+        x, h, _history_h = policy._encode(x, history_h)
+    else:
+        h = encoded
     picked_mask, min_count, stop_column = _ar_state(x)
     max_count = x["maxCount"]
 

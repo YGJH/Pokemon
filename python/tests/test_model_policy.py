@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM
+from ptcg_il.featurizer import E_MAX, F_GLOBAL, F_HAND, F_OPT, F_POKE, F_SUM, T_MAX
 from ptcg_il.model.cards import F_ATK, F_CARD
 from ptcg_il.model.embed import L_STATE, P_MAX, H_MAX, SUM
 from ptcg_il.model.pointer import O_MAX
@@ -13,26 +13,69 @@ D = 256
 D_MAX = 60
 PZ_MAX = 6
 
+#: Card/attack table sizes for the synthetic fixtures.  Every id below is drawn
+#: from ``[0, N_*_CARDS)`` so the model's gather never has to clamp — a fixture
+#: that emitted out-of-range ids would silently feed zeros and make the tests
+#: that check "features reach the logits" pass for the wrong reason.
+N_TEST_CARDS = 64
+N_TEST_ATTACKS = 24
 
-def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Tensor]:
+
+def make_static_tables(
+    n_cards: int = N_TEST_CARDS, n_attacks: int = N_TEST_ATTACKS, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic dense card/attack tables with row 0 zeroed (PAD)."""
+    g = torch.Generator().manual_seed(seed)
+    card = torch.randn(n_cards, F_CARD, generator=g)
+    atk = torch.randn(n_attacks, F_ATK, generator=g)
+    card[0] = 0.0
+    atk[0] = 0.0
+    return card, atk
+
+
+def make_policy(**kw) -> Policy:
+    """``Policy`` with static tables attached.
+
+    Cards reach the model only through these tables now, so a bare ``make_policy()``
+    raises on the first forward.  Tests construct through here so that the
+    failure they see is the one they are testing.
+    """
+    card, atk = make_static_tables()
+    kw.setdefault("all_card_feat", card)
+    kw.setdefault("all_attack_feat", atk)
+    kw.setdefault("n_all_cards", card.shape[0])
+    return Policy(**kw)
+
+
+def _make_synthetic_batch(
+    B: int = 2, max_count: int = 1, n_cards: int = N_TEST_CARDS,
+    n_attacks: int = N_TEST_ATTACKS,
+) -> dict[str, torch.Tensor]:
     """Build a synthetic featurizer dict.
 
-    Cards enter the model as static feature vectors (``*_card_feat``), not as
-    vocab indices — there are no learned id embeddings to feed.
+    Cards enter the model as *ids* into the static tables; ``Policy`` gathers
+    the ``*_card_feat`` rows on device.  The featurizer emits exactly these id
+    keys and no feature keys, so a fixture carrying features would be testing an
+    input shape that can no longer occur.
     """
     O = O_MAX
     L = L_STATE
 
+    def ids(*shape, n=n_cards):
+        return torch.randint(1, n, shape)
+
     x = {
-        # State — card identity, as static features
-        "poke_card_feat": torch.randn(B, P_MAX, F_CARD),
-        "hand_card_feat": torch.randn(B, H_MAX, F_CARD),
-        "stadium_card_feat": torch.randn(B, 1, F_CARD),
-        "context_card_feat": torch.randn(B, 1, F_CARD),
-        "effect_card_feat": torch.randn(B, 1, F_CARD),
-        "discard_card_feat": torch.randn(B, SUM, D_MAX, F_CARD),
+        # State — card identity, as ids into the card table
+        "poke_card_id": ids(B, P_MAX),
+        "poke_tool_ids": ids(B, P_MAX, T_MAX),
+        "poke_energy_ids": ids(B, P_MAX, E_MAX),
+        "hand_card_id": ids(B, H_MAX),
+        "stadium_card_id": ids(B, 1),
+        "context_card_id": ids(B, 1),
+        "effect_card_id": ids(B, 1),
+        "discard_ids": ids(B, SUM, D_MAX),
         "discard_mask": torch.ones(B, SUM, D_MAX, dtype=torch.bool),
-        "prize_card_feat": torch.zeros(B, SUM, PZ_MAX, F_CARD),
+        "prize_ids": torch.zeros(B, SUM, PZ_MAX, dtype=torch.long),
         # State — dense features
         # Widths come from ptcg_il.featurizer, never literals: a featurizer edit
         # otherwise leaves this fixture building batches the model cannot accept,
@@ -52,8 +95,9 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "opt_type": torch.randint(0, 18, (B, O)),  # 17 types + STOP=17
         "opt_src_idx": torch.randint(-1, L, (B, O)),
         "opt_tgt_idx": torch.randint(-1, L, (B, O)),
-        "opt_card_feat": torch.randn(B, O, F_CARD),
-        "opt_attack_feat": torch.randn(B, O, F_ATK),
+        "opt_bench_idx": torch.full((B, O), -1, dtype=torch.long),
+        "opt_card_id": ids(B, O),
+        "opt_attack_idx": ids(B, O, n=n_attacks),
         "opt_scalar": torch.randn(B, O, F_OPT),
         "opt_mask": torch.ones(B, O, dtype=torch.bool),
         "opt_group": torch.full((B, O), -1, dtype=torch.long),
@@ -71,12 +115,13 @@ def _make_synthetic_batch(B: int = 2, max_count: int = 1) -> dict[str, torch.Ten
         "log_feat": torch.zeros(B, 32, 6),
         "log_mask": torch.zeros(B, 32, dtype=torch.bool),
         "log_len": torch.zeros(B, dtype=torch.long),
-        "log_card_feat": torch.zeros(B, 32, F_CARD),
     }
 
     # First 8 options valid (leave room for STOP if needed)
     x["opt_mask"][:, 8:] = False
-    x["opt_group"][:, :8] = 0  # single group containing all valid options
+    # Each valid option gets its own group so group-marginal CE
+    # degenerates to standard CE (each group has exactly one member).
+    x["opt_group"][:, :8] = torch.arange(8)
     if max_count > 1:
         # Set up STOP column at position 7 (last valid option slot)
         x["stop_column"][:] = 7
@@ -91,7 +136,7 @@ class TestPolicy:
 
     def test_forward_shapes_single(self):
         """Single-select forward returns correct shapes."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(4, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (4,))
         logits, value, _hist = policy(x)
@@ -100,7 +145,7 @@ class TestPolicy:
 
     def test_value_range(self):
         """Value is in (-1, 1) due to tanh."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(4)
         _, value, _hist = policy(x)
@@ -109,7 +154,7 @@ class TestPolicy:
 
     def test_logits_masked(self):
         """Padding options logits are -1e9."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(2, max_count=1)
         logits, _val, _hist = policy(x)
@@ -118,7 +163,7 @@ class TestPolicy:
 
     def test_gradient_flow(self):
         """All parameters receive gradients (except msgru which runs in multi-select loop)."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(2, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (2,))
         logits, value, _hist = policy(x)
@@ -133,12 +178,12 @@ class TestPolicy:
 
     def test_pointer_card_bound(self):
         """Pointer.card is the same object as embed.card."""
-        policy = Policy()
+        policy = make_policy()
         assert policy.pointer.card is policy.embed.card
 
     def test_single_select_cross_entropy(self):
         """CE loss computed on single-select output is finite."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(4, max_count=1)
         x["action_idx"][:, 0] = torch.randint(0, 8, (4,))
         logits, value, _hist = policy(x)
@@ -149,7 +194,7 @@ class TestPolicy:
 
     def test_different_actions_different_loss(self):
         """CE should penalize wrong predictions differently than correct ones."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(2, max_count=1)
         logits, _val, _hist = policy(x)
@@ -171,7 +216,7 @@ class TestPolicy:
 
     def test_no_nan_inf(self):
         """Output should not contain NaN or Inf."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(4)
         logits, value, _hist = policy(x)
@@ -186,7 +231,7 @@ class TestMultiSelectCE:
 
     def test_output_is_finite(self):
         """CE output is finite (including STOP supervision)."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(2, max_count=3)
         stop_col = int(x["stop_column"][0].item())
         # Set unique valid action picks + STOP target
@@ -203,7 +248,7 @@ class TestMultiSelectCE:
 
     def test_gradient_flow(self):
         """Gradients flow through embed/encoder/pointer (not value) in multi-select path."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(2, max_count=2)
         stop_col = int(x["stop_column"][0].item())
         for b in range(2):
@@ -224,7 +269,7 @@ class TestMultiSelectCE:
 
     def test_variable_action_len(self):
         """Handles samples with different pick counts in batch (incl STOP)."""
-        policy = Policy()
+        policy = make_policy()
         B = 4
         x = _make_synthetic_batch(B, max_count=3)
         stop_col = int(x["stop_column"][0].item())
@@ -242,7 +287,7 @@ class TestMultiSelectCE:
 
     def test_no_gradient_leak_between_picks(self):
         """Each pick's CE uses the updated GRU state (not picked_ctx sum)."""
-        policy = Policy()
+        policy = make_policy()
         x = _make_synthetic_batch(2, max_count=2)
         stop_col = int(x["stop_column"][0].item())
         x["action_idx"][:, 0] = torch.tensor([0, 0])
@@ -259,7 +304,7 @@ class TestSelectMulti:
 
     def test_output_shape(self):
         """Output is [B, maxC]."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(2, max_count=3)
         x["maxCount"] = torch.full((2,), 3, dtype=torch.long)
@@ -269,7 +314,7 @@ class TestSelectMulti:
 
     def test_all_distinct(self):
         """All chosen indices are distinct (no repeats, ignoring STOP)."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(8, max_count=4)
         x["maxCount"] = torch.full((8,), 4, dtype=torch.long)
@@ -281,7 +326,7 @@ class TestSelectMulti:
 
     def test_no_out_of_range(self):
         """All regular picks are within valid option range."""
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(4, max_count=3)
         x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
@@ -300,20 +345,20 @@ class TestSelectMulti:
         from ptcg_il.model.policy import _select_multi_raw
 
         torch.manual_seed(42)
-        policy = Policy()
+        policy = make_policy()
         policy.eval()
         x = _make_synthetic_batch(4, max_count=3)
         x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
         x["minCount"] = torch.full((4,), 1, dtype=torch.long)
 
-        h, _hist = policy._encode(x)
+        x, h, _hist = policy._encode(x)
         single = _select_multi_raw(
             policy.pointer, h, x["tok_mask"], policy.embed.card, x,
             minC=x["minCount"], maxC=x["maxCount"],
             stop_column=x["stop_column"],
         )
 
-        h2, _hist2 = policy._encode(x)
+        x, h2, _hist2 = policy._encode(x)
         ensemble = _select_multi_raw(
             policy.pointer, h2, x["tok_mask"], policy.embed.card, x,
             minC=x["minCount"], maxC=x["maxCount"],
@@ -383,7 +428,7 @@ class TestMultiSelectCEScale:
         """Label smoothing adds at most eps * (mean surprisal over valid
         options).  At init that is well under 1 nat per pick."""
         torch.manual_seed(0)
-        policy = Policy()
+        policy = make_policy()
         x = self._batch()
         plain = multiselect_ce(policy, x, label_smoothing=0.0)
         smoothed = multiselect_ce(policy, x, label_smoothing=0.05)
@@ -395,7 +440,7 @@ class TestMultiSelectCEScale:
     def test_ce_is_on_a_plausible_scale_at_init(self):
         """An untrained pointer over O options costs ~log(O) nats per pick."""
         torch.manual_seed(0)
-        policy = Policy()
+        policy = make_policy()
         ce = multiselect_ce(policy, self._batch(max_count=3))
         assert (ce < 100).all(), f"CE at init should be a few nats per pick, got {ce.tolist()}"
 
@@ -403,7 +448,7 @@ class TestMultiSelectCEScale:
         """min_count only decides *when* STOP becomes legal.  Raising it must
         not change the loss scale — the suppressed column simply drops out."""
         torch.manual_seed(0)
-        policy = Policy()
+        policy = make_policy()
         free = multiselect_ce(policy, self._batch(min_count=0))
         forced = multiselect_ce(policy, self._batch(min_count=2))
         assert (forced < free + 10.0).all(), (
@@ -414,7 +459,7 @@ class TestMultiSelectCEScale:
 def test_multiselect_ce_marginalises_over_duplicate_options():
     """A batch whose first two options are identical must cost less under
     group-marginal CE than under plain CE, and the gap must be positive."""
-    policy = Policy(D=32, heads=4, layers=1, ff=64)
+    policy = make_policy(D=32, heads=4, layers=1, ff=64)
     batch = _make_synthetic_batch(B=2, max_count=3)
     # Set valid action targets: row 0 picks options 0 then 1; row 1 picks option 2
     batch["action_idx"][0, 0] = 0
@@ -443,7 +488,7 @@ def test_multiselect_ce_marginalises_over_duplicate_options():
 
 
 def test_multiselect_ce_unchanged_when_every_group_is_a_singleton():
-    policy = Policy(D=32, heads=4, layers=1, ff=64)
+    policy = make_policy(D=32, heads=4, layers=1, ff=64)
     batch = _make_synthetic_batch(B=2, max_count=3)   # all-distinct opt_group after Task 2
     assert torch.allclose(
         multiselect_ce(policy, batch, group_marginal=True),
@@ -463,7 +508,7 @@ class TestHistoryGruIsGone:
     """
 
     def test_module_and_parameters_are_absent(self):
-        p = Policy(D=32, heads=2, layers=1, ff=64)
+        p = make_policy(D=32, heads=2, layers=1, ff=64)
         assert not hasattr(p, "history_gru")
         assert not [k for k in p.state_dict() if k.startswith("history_gru.")]
 
@@ -471,14 +516,17 @@ class TestHistoryGruIsGone:
         """The CLS token must now pass through, not be squashed."""
         import torch
 
-        p = Policy(D=32, heads=2, layers=1, ff=64).eval()
+        p = make_policy(D=32, heads=2, layers=1, ff=64).eval()
         x = _make_synthetic_batch(B=3)
         with torch.no_grad():
-            rows = p.embed(x)
-            h_enc = p.encoder(rows, x["tok_mask"])
-            belief = p.belief(x["log_feat"], x["log_mask"],
-                              log_card_feat=x.get("log_card_feat"))
-            h, _ = p._encode(x)
+            # embed/belief read the gathered features; _encode does the gather,
+            # so a hand-rolled comparison has to do it too.
+            xg = p._gather_card_feats(x)
+            rows = p.embed(xg)
+            h_enc = p.encoder(rows, xg["tok_mask"])
+            belief = p.belief(xg["log_feat"], xg["log_mask"],
+                              log_card_feat=xg.get("log_card_feat"))
+            _x, h, _ = p._encode(x)
         assert torch.allclose(h[:, 0, :], h_enc[:, 0, :] + belief, atol=1e-6)
         # The non-CLS rows are untouched either way.
         assert torch.allclose(h[:, 1:, :], h_enc[:, 1:, :], atol=1e-6)
@@ -488,10 +536,10 @@ class TestHistoryGruIsGone:
         import torch
 
         torch.manual_seed(0)
-        p = Policy(D=64, heads=4, layers=2, ff=128).eval()
+        p = make_policy(D=64, heads=4, layers=2, ff=128).eval()
         x = _make_synthetic_batch(B=8)
         with torch.no_grad():
-            h, _ = p._encode(x)
+            _x, h, _ = p._encode(x)
         assert h[:, 0, :].abs().max() > 1.0, (
             "CLS is still bounded by 1.0 — a tanh is back in the path"
         )
@@ -500,11 +548,11 @@ class TestHistoryGruIsGone:
         """Callers across ptcg_rl still pass and unpack it."""
         import torch
 
-        p = Policy(D=32, heads=2, layers=1, ff=64).eval()
+        p = make_policy(D=32, heads=2, layers=1, ff=64).eval()
         x = _make_synthetic_batch(B=2)
         hh = torch.randn(2, 32)
         with torch.no_grad():
-            h, out = p._encode(x, hh)
+            _x, h, out = p._encode(x, hh)
             logits, value, hist = p(x, hh)
         assert torch.equal(out, hh)
         assert logits.shape[0] == value.shape[0] == hist.shape[0] == 2
@@ -515,7 +563,7 @@ class TestHistoryGruIsGone:
 
         from ptcg_il.model.policy import load_policy_state
 
-        p = Policy(D=32, heads=2, layers=1, ff=64)
+        p = make_policy(D=32, heads=2, layers=1, ff=64)
         sd = dict(p.state_dict())
         sd["history_gru.weight_ih"] = torch.randn(96, 32)
         sd["history_gru.weight_hh"] = torch.randn(96, 32)

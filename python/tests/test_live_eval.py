@@ -35,6 +35,7 @@ from ptcg_il.live_eval import (
     search_planner_agent,
     wilson_interval,
 )
+from tests.test_model_policy import make_policy
 
 
 def _call_deck_step(agent):
@@ -397,7 +398,7 @@ class TestPolicyAgentLoadsEngineFeatures:
     @staticmethod
     def _tiny_policy():
         from ptcg_il.model.policy import Policy
-        return Policy(D=32, heads=2, layers=1, ff=64).eval()
+        return make_policy(D=32, heads=2, layers=1, ff=64).eval()
 
     @staticmethod
     def _vocab():

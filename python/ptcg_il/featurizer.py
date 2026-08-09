@@ -45,6 +45,7 @@ PRIZE_N = 6.0
 BENCH_N = 8.0
 ATKCOST_N = 5.0
 DMGCTR_N = 20.0
+DRAW_N = 10.0
 
 # ============================================================
 # Capacities (A.1)
@@ -72,13 +73,13 @@ LOG_FEAT_DIM = 6 # log_type, player_rel, card_id, area_from, area_to, scalar
 # ============================================================
 # Feature dims (A.1)
 # ============================================================
-F_CARD = 212  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 43
-F_ATK = 43    # 14 numeric + 29 attack keywords
+F_CARD = 218  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 45
+F_ATK = 45    # 16 numeric + 29 attack keywords
 F_POKE = 26
 F_HAND = 7
 F_SUM = 11
 F_GLOBAL = 97
-F_OPT = 8
+F_OPT = 13
 
 # Columns 9:12 of a card static row are (basic, stage1, stage2) — see
 # ``ptcg_mine.cards.card_static_row``.  Named here rather than written as a
@@ -103,6 +104,7 @@ CARD_TYPE_SPECIAL_ENERGY = 6
 #: reading area 5 (BENCH) instead would silently gather the wrong Pokemon.
 AREA_HAND = 2
 AREA_ACTIVE = 4
+AREA_BENCH = 5
 
 # ============================================================
 # Enum sizes (A.1)
@@ -371,6 +373,74 @@ def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
         _onehot_index(defender[_CARD_RESISTANCE]),
     )
     return min(dmg / tgt_hp, 2.0)
+
+
+def _best_bench_damage_ratio(
+    poke_card_feat: np.ndarray,
+    opp_active_card_feat: np.ndarray,
+) -> tuple[float, int]:
+    """Best damage ratio any bench Pokemon can achieve vs the opponent's Active.
+
+    Reads attack blocks from bench slots (1..5) and opponent Active HP from
+    ``opp_active_card_feat[0]`` (slot 6).  Returns ``(best_ratio, best_slot)``
+    where *best_slot* is the 0-based bench position (0..4).
+
+    Damage is read from the static table columns
+    ``CARD_ATTACK_BLOCK_START + ai * F_ATK`` (the attack's static damage, col 0
+    of the attack block).  These are normalised by ATKDMG_N (350.0).
+
+    Pure-Python arithmetic on purpose — bench is ≤5 slots × 3 attacks = 15 reads,
+    and this runs on the RL rollout path.
+    """
+    best_ratio = 0.0
+    best_slot = 0
+    opp_hp = float(opp_active_card_feat[0]) * 400.0 + 10.0
+    if opp_hp <= 10.0:
+        return 0.0, 0
+    atk_start = int(CARD_ATTACK_BLOCK_START)
+    atk_stride = int(F_ATK)
+    for bench_pos in range(1, 6):
+        row = poke_card_feat[bench_pos]
+        hp = float(row[0]) * 400.0
+        if hp <= 0:
+            continue
+        for ai in range(3):
+            dmg_norm = float(row[atk_start + ai * atk_stride])
+            dmg = dmg_norm * ATKDMG_N
+            if dmg <= 0:
+                continue
+            ratio = dmg / opp_hp
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_slot = bench_pos - 1
+    return best_ratio, best_slot
+
+
+def _best_bench_hp_ratio(
+    poke_card_feat: np.ndarray,
+    active_card_feat: np.ndarray,
+) -> tuple[float, int]:
+    """Best HP ratio of bench Pokemon vs active.  Clipped to [0, 1].
+
+    Returns ``(best_ratio, best_slot)`` — *best_slot* is the 0-based bench
+    position for tie-breaking ``opt_bench_idx``.
+    """
+    active_hp = float(active_card_feat[0]) * 400.0
+    if active_hp <= 0:
+        return 0.0, 0
+    best_ratio = 0.0
+    best_slot = 0
+    for bench_pos in range(1, 6):
+        hp = float(poke_card_feat[bench_pos][0]) * 400.0
+        if hp <= 0:
+            continue
+        ratio = hp / active_hp
+        if ratio > 1.0:
+            ratio = 1.0
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_slot = bench_pos - 1
+    return best_ratio, best_slot
 
 
 def _attached_ids(cards, capacity: int) -> np.ndarray:
@@ -794,7 +864,7 @@ def _build_option_tokens(
     after the regular options so the model can learn when to stop picking.
     *stop_column* is the index of that column (or -1 for single-select).
 
-    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id,
+    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_bench_idx, opt_card_id,
              opt_attack_idx, opt_scalar, opt_mask, index_remap, stop_column).
     """
     options = select["option"]
@@ -842,6 +912,29 @@ def _build_option_tokens(
     opt_attack_idx = np.zeros(O_MAX, dtype=np.int64)
     opt_scalar = np.zeros((O_MAX, F_OPT), dtype=np.float32)
     opt_mask = np.zeros(O_MAX, dtype=bool)
+    opt_bench_idx = np.full(O_MAX, -1, dtype=np.int64)
+
+    # Compute bench promotion candidates when at least one RETREAT option exists.
+    # RETREAT never offers two options in one select (measured over 60 episodes),
+    # so the same values apply to every RETREAT option.
+    _has_retreat = any(int(options[i]["type"]) == 12 for i in indices_to_keep)
+    if _has_retreat:
+        _bench_best_dmg, _bench_best_dmg_slot = _best_bench_damage_ratio(
+            poke_card_feat, poke_card_feat[6],  # slot 6 = opponent Active
+        )
+        _bench_best_hp, _bench_best_hp_slot = _best_bench_hp_ratio(
+            poke_card_feat, poke_card_feat[0],  # slot 0 = my Active
+        )
+        # Prefer the highest-damage bench slot for opt_bench_idx
+        _bench_idx_slot = _bench_best_dmg_slot if _bench_best_dmg > 0 else _bench_best_hp_slot
+        _my_attached_energy = float(np.asarray(poke_feat[0][3:15], dtype=np.float64).sum()) * ENERGY_N
+        _retreat_cost = float(poke_card_feat[0, 1]) * RETREAT_N
+    else:
+        _bench_best_dmg = 0.0
+        _bench_best_hp = 0.0
+        _bench_idx_slot = 0
+        _my_attached_energy = 0.0
+        _retreat_cost = 0.0
 
     for new_j, old_j in enumerate(indices_to_keep):
         opt = options[old_j]
@@ -939,14 +1032,15 @@ def _build_option_tokens(
                 _set_card(area, your_index, index)
 
         elif otype == 12:  # RETREAT
-            # Resolved rather than hardcoded to 1: with no active in play the
-            # row does not exist, and pointing at it gathers a PAD token as if
-            # it were a real Pokemon.  Measured on 60 episodes, RETREAT never
-            # offers two options in one select and carries no fields beyond
-            # `type`, so there is nothing here to disambiguate -- this is a
-            # correctness fix, not a discrimination one.
             opt_src_idx[new_j] = _ref(AREA_ACTIVE, your_index, 0)
             _set_card(AREA_ACTIVE, your_index, 0)
+            # Point at the best bench slot for promotion visibility
+            bench_row = _ref(AREA_BENCH, your_index, _bench_idx_slot)
+            opt_bench_idx[new_j] = bench_row if bench_row != -1 else -1
+            # Retreat affordability: (attached energy - retreat cost) / RETREAT_N
+            opt_scalar[new_j, 10] = _clip_norm(_my_attached_energy - _retreat_cost, RETREAT_N)
+            opt_scalar[new_j, 11] = min(_bench_best_dmg, 2.0)
+            opt_scalar[new_j, 12] = _bench_best_hp
 
         elif otype == 13:  # ATTACK
             # The attacker is always my active; resolve it so an absent active
@@ -986,6 +1080,20 @@ def _build_option_tokens(
             )
             opt_scalar[new_j, 6] = ratio
             opt_scalar[new_j, 7] = 1.0 if ratio >= 1.0 else 0.0
+            # Deck-out risk from drawing (dim 8) and zero-damage flag (dim 9)
+            aid = opt.get("attackId")
+            if engine_attack_features is not None and aid is not None:
+                atk_feat = engine_attack_features.get(int(aid))
+                if atk_feat is not None:
+                    # draw_fixed / draw_to_hand are at cols 14, 15 (normalised by DRAW_N)
+                    draw_fixed_val = float(atk_feat[14]) * DRAW_N
+                    draw_to_hand_val = float(atk_feat[15]) * DRAW_N
+                    my_hand = int(state["players"][your_index].get("handCount", 0))
+                    draw_est = draw_fixed_val + max(0, draw_to_hand_val - my_hand)
+                    deck_count = max(int(state["players"][your_index].get("deckCount", 0)), 1)
+                    opt_scalar[new_j, 8] = min(draw_est / deck_count, 1.0)
+                    # Zero-damage: damage col is 0, normalised by ATKDMG_N
+                    opt_scalar[new_j, 9] = 1.0 if float(atk_feat[0]) == 0.0 else 0.0
 
         elif otype == 3:  # CARD
             area = opt.get("area")
@@ -1051,6 +1159,7 @@ def _build_option_tokens(
         opt_type,
         opt_src_idx,
         opt_tgt_idx,
+        opt_bench_idx,
         opt_card_id,
         opt_attack_idx,
         opt_scalar,
@@ -1064,6 +1173,7 @@ def option_groups(
     opt_type: np.ndarray,
     opt_src_idx: np.ndarray,
     opt_tgt_idx: np.ndarray,
+    opt_bench_idx: np.ndarray,
     opt_card_feat: np.ndarray,
     opt_attack_feat: np.ndarray,
     opt_scalar: np.ndarray,
@@ -1072,12 +1182,13 @@ def option_groups(
     """Equivalence classes over option slots: same id == identical model input.
 
     The pointer head reads exactly ``opt_type``, the gathered rows named by
-    ``opt_src_idx``/``opt_tgt_idx``, ``opt_card_feat``, ``opt_attack_feat`` and
-    ``opt_scalar`` (``model/pointer.py:117-130``).  Two options agreeing on all
-    of them produce the same logit by construction, so a label that names one
-    of them and not the other asks for a distinction the network cannot make.
-    Measured on ``train-00000``: 10.0% of options and 15.6% of samples contain
-    such a pair, and 13.9% of samples have a label that splits one.
+    ``opt_src_idx``/``opt_tgt_idx``/``opt_bench_idx``, ``opt_card_feat``,
+    ``opt_attack_feat`` and ``opt_scalar`` (``model/pointer.py:117-130``).
+    Two options agreeing on all of them produce the same logit by construction,
+    so a label that names one of them and not the other asks for a distinction
+    the network cannot make.  Measured on ``train-00000``: 10.0% of options
+    and 15.6% of samples contain such a pair, and 13.9% of samples have a
+    label that splits one.
 
     Card and attack features are compared **at fp32**, because that is the
     precision the model reads: shards store the ids (``CARD_FEAT_SOURCES``) and
@@ -1097,7 +1208,8 @@ def option_groups(
         return groups
 
     ints = np.stack(
-        [opt_type[valid], opt_src_idx[valid], opt_tgt_idx[valid]], axis=1
+        [opt_type[valid], opt_src_idx[valid], opt_tgt_idx[valid],
+         opt_bench_idx[valid]], axis=1
     ).astype(np.int64)
     feats = np.concatenate(
         [
@@ -1522,6 +1634,7 @@ def featurize(
         opt_type,
         opt_src_idx,
         opt_tgt_idx,
+        opt_bench_idx,
         opt_card_id,
         opt_attack_idx,
         opt_scalar,
@@ -1551,24 +1664,11 @@ def featurize(
     opt_card_feat = _cfeat(opt_card_id)
     opt_attack_feat = _afeat(opt_attack_idx)
     opt_group = option_groups(
-        opt_type, opt_src_idx, opt_tgt_idx,
+        opt_type, opt_src_idx, opt_tgt_idx, opt_bench_idx,
         opt_card_feat, opt_attack_feat, opt_scalar, opt_mask,
     )
     result = {
-        # State — card features (float32, not int64 ids)
-        "poke_card_feat": poke_card_feat,
-        # Attached Tools / Energy cards, per Pokémon slot.  Pooled into the
-        # Pokémon token by TokenEmbedder, the same way the discard pile is
-        # pooled into the summary token.
-        "poke_tool_feat": _cfeat(poke_tool_ids),
-        "poke_energy_feat": _cfeat(poke_energy_ids),
-        "hand_card_feat": _cfeat(hand_card_id),
-        "stadium_card_feat": _cfeat(stadium_card_id),
-        "context_card_feat": _cfeat(context_card_id),
-        "effect_card_feat": _cfeat(effect_card_id),
-        "discard_card_feat": _cfeat(discard_ids),
         "discard_mask": discard_mask,
-        "prize_card_feat": _cfeat(prize_ids),
         # State — dense features
         "poke_feat": poke_feat,
         "hand_feat": hand_feat,
@@ -1584,8 +1684,7 @@ def featurize(
         "opt_type": opt_type,
         "opt_src_idx": opt_src_idx,
         "opt_tgt_idx": opt_tgt_idx,
-        "opt_card_feat": opt_card_feat,
-        "opt_attack_feat": opt_attack_feat,
+        "opt_bench_idx": opt_bench_idx,
         "opt_scalar": opt_scalar,
         "opt_mask": opt_mask,
         "opt_group": opt_group,
@@ -1603,14 +1702,23 @@ def featurize(
         "log_feat": log_feat,
         "log_mask": log_mask,
         "log_len": log_len,
-        # log_feat is per-sample [L_LOG_MAX, LOG_FEAT_DIM]; column 2 is the
-        # card vocab index (belief.py does the batched [:, :, 2] equivalent).
-        "log_card_feat": _cfeat(log_feat[:, LOG_CARD_ID_COLUMN].astype(np.int64)),
-        # Raw ids behind every *_card_feat above.  The model never reads these
-        # -- it consumes the features -- but the shard writer stores them
-        # *instead of* the features (see CARD_FEAT_SOURCES) and ShardDataset
-        # re-gathers on read.  diagnose.py reads them too, to report PAD and
-        # UNKNOWN rates that a materialised feature row cannot distinguish.
+        # Card and attack ids.  These are what the model consumes: it gathers
+        # the ``*_card_feat`` rows itself, on device, from the static tables
+        # (``Policy._gather_card_feats``, keyed by CARD_FEAT_SOURCES).  This
+        # function does *not* emit the gathered features, deliberately —
+        # materialising them here made a sample 416 KiB instead of 29.6 KiB, of
+        # which 93% was a redeliverable lookup into a 1.1 MB table, and shipping
+        # that through the DataLoader queue cost 128 of 174 ms per training
+        # step.  ``log_card_feat`` is gathered from ``log_feat``'s card-id
+        # column and likewise not emitted.
+        #
+        # Several of the feature arrays are still built *locally* above, because
+        # cls_feat's KO-pressure block, opt_scalar's damage preview and
+        # ``option_groups`` all read them.  Those are inputs to other features,
+        # not outputs.
+        #
+        # diagnose.py reads the ids to report PAD and UNKNOWN rates, which a
+        # materialised feature row cannot distinguish.
         "poke_card_id": poke_card_id,
         "poke_tool_ids": poke_tool_ids,
         "poke_energy_ids": poke_energy_ids,

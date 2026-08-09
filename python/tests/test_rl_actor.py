@@ -28,7 +28,7 @@ from ptcg_rl.actor import (  # noqa: E402
     sample_action,
 )
 
-from tests.test_model_policy import _make_synthetic_batch  # noqa: E402
+from tests.test_model_policy import _make_synthetic_batch, make_policy  # noqa: E402
 
 from ptcg_il.model.pointer import O_MAX  # noqa: E402
 
@@ -45,7 +45,7 @@ def _tiny_policy(D: int = 64) -> Policy:
     vectors, so the only shape that matters here is *D*.
     """
     torch.manual_seed(0)
-    p = Policy(D=D, heads=4, layers=1, ff=128)
+    p = make_policy(D=D, heads=4, layers=1, ff=128)
     p.eval()
     return p
 

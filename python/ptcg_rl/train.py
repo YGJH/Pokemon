@@ -187,15 +187,15 @@ def _load_policies(args: argparse.Namespace, device):
     except ValueError as e:
         raise SystemExit(str(e)) from e
 
-    # Pure-feature model: there is no vocab width to reconcile and no static
-    # card/attack tables to inject.  The one card-derived tensor the policy
-    # still needs is the belief heads' [n_all_cards, F_CARD] matrix, built from
-    # engine_card_features.npy — without it BeliefHeads.forward raises.
+    # Pure-feature model: there is no vocab width to reconcile.  The policy does
+    # need the engine static tables — it gathers every card's features from them
+    # on device, and the card one doubles as the belief heads' scoring matrix.
     config = dict(config)
-    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+    all_card_feat, all_attack_feat = _load_static_tables(Path(args.data_dir))
 
     def _load_one(sd: dict) -> Any:
-        p = policy_from_config(config, all_card_feat=all_card_feat)
+        p = policy_from_config(config, all_card_feat=all_card_feat,
+                               all_attack_feat=all_attack_feat)
         try:
             load_policy_state(p, sd)
         except RuntimeError:
@@ -215,29 +215,11 @@ def _load_policies(args: argparse.Namespace, device):
     return policy, reference, ckpt
 
 
-def _load_all_card_feat(data_dir: Path) -> Any:
-    """``[n_all_cards, F_CARD]`` static features for every engine card.
+def _load_static_tables(data_dir: Path) -> Any:
+    """``(card_table, attack_table)`` — see ``ptcg_il.model.policy``."""
+    from ptcg_il.model.policy import load_static_tables
 
-    Indexed by raw engine card id, so row 0 and any gap stay zero (PAD).
-    Mirrors ``ptcg_il.cli._load_all_card_feat`` — the belief heads score against
-    every card the engine knows about, not against a vocab slice.
-    """
-    import numpy as np
-    import torch
-
-    from ptcg_il.featurizer import F_CARD
-
-    ecf_path = Path(data_dir) / "engine_card_features.npy"
-    if not ecf_path.exists():
-        return None
-    ecf = np.load(ecf_path, allow_pickle=True).item()
-    if not ecf:
-        return None
-    max_id = max(int(cid) for cid in ecf)
-    all_feat = torch.zeros(max_id + 1, F_CARD)
-    for cid, feat in ecf.items():
-        all_feat[int(cid)] = torch.from_numpy(np.asarray(feat, dtype=np.float32))
-    return all_feat
+    return load_static_tables(data_dir)
 
 
 def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> int:
@@ -523,7 +505,7 @@ def run_r2(args, cfg, policy, reference, device, *, wb=None) -> dict[str, Any]:
                             mb_ref["action_len"] = torch.as_tensor(batch.action_len[start:end]).to(device)
                             
                             # 進行推論
-                            h_ref, _ = reference._encode(mb_ref)
+                            mb_ref, h_ref, _ = reference._encode(mb_ref)
                             lp_ref, _ = recompute_logp(reference, mb_ref, encoded=h_ref)
                             
                             # 算完先放回 CPU 或留在 GPU 皆可，這裡統一把 Tensor 收集起來

@@ -203,9 +203,13 @@ def check_reference_roundtrip(
     """Verify ``opt_src_idx`` names the state row holding the option's own card.
 
     The featurizer writes an option's source as a state-token row (A.1) and its
-    card features by dereferencing the same location.  Those are two separate
-    code paths — ``ref_map.build_ref_map`` for the row, the state-token builders
-    for the row's contents — so comparing them catches an off-by-one in either.
+    card id by dereferencing the same location.  Those are two separate code
+    paths — ``ref_map.build_ref_map`` for the row, the state-token builders for
+    the row's contents — so comparing them catches an off-by-one in either.
+
+    The comparison is on the stored *ids*, which is both what the shards carry
+    and the sharper test: two different cards with identical static features
+    would compare equal as feature rows and hide a genuine mis-reference.
 
     This reads only the shard.  The previous implementation wanted raw
     observations in ``data/observations/``, which nothing has ever written, and
@@ -235,17 +239,17 @@ def check_reference_roundtrip(
             data = np.load(sf, allow_pickle=False)
         except OSError:
             continue
-        needed = ("opt_src_idx", "opt_card_feat", "opt_mask",
-                  "poke_card_feat", "hand_card_feat", "stadium_card_feat")
+        needed = ("opt_src_idx", "opt_card_id", "opt_mask",
+                  "poke_card_id", "hand_card_id", "stadium_card_id")
         if any(k not in data for k in needed):
             continue
 
         opt_src = data["opt_src_idx"]
-        opt_card = data["opt_card_feat"]
+        opt_card = data["opt_card_id"]
         opt_mask = data["opt_mask"]
-        poke = data["poke_card_feat"]
-        hand = data["hand_card_feat"]
-        stadium = data["stadium_card_feat"]
+        poke = data["poke_card_id"]
+        hand = data["hand_card_id"]
+        stadium = data["stadium_card_id"]
 
         for s in range(opt_src.shape[0]):
             for o in np.flatnonzero(opt_mask[s]):
@@ -263,7 +267,8 @@ def check_reference_roundtrip(
                     continue
 
                 card_row = opt_card[s, o]
-                if not card_row.any() or not state_row.any():
+                # PAD is id 0 -- the same sentinel an all-zero feature row was.
+                if not np.any(card_row) or not np.any(state_row):
                     n_pad += 1
                     continue
 
@@ -437,15 +442,18 @@ def check_attachment_collision(
     ``opt_src_idx`` AND their card's static features (truly indistinguishable to
     the pointer).
 
-    The card half of the comparison is the ``opt_card_feat`` row, not a vocab id:
-    the pointer head consumes the feature vector, so two options whose features
-    match *are* the same input to it even when the underlying card ids differ.
+    The card half of the comparison is the ``opt_card_id``.  The pointer head
+    consumes the *features* that id gathers, so keying on the id is marginally
+    conservative — two distinct ids with identical static features are equally
+    indistinguishable to the pointer and are not counted here.  The group-based
+    pass below is the one that sees those, since ``opt_group`` was computed from
+    the features themselves.
 
     Returns ``n_collision_options``, ``collision_share``, ``n_options_total``.
     """
     shard_dir = Path(shard_dir)
     # We only need to check attachment-type options.
-    # Walk shard files, reading opt_type, opt_src_idx, opt_card_feat.
+    # Walk shard files, reading opt_type, opt_src_idx, opt_card_id.
     n_collision = 0
     n_total_attachment_options = 0
     samples_checked = 0
@@ -466,7 +474,7 @@ def check_attachment_collision(
         # Need at least opt_mask and opt_type for either pass.
         if "opt_type" not in data or "opt_mask" not in data:
             continue
-        has_legacy = "opt_card_feat" in data and "opt_src_idx" in data
+        has_legacy = "opt_card_id" in data and "opt_src_idx" in data
         has_group = "opt_group" in data
         if not has_legacy and not has_group:
             continue
@@ -476,8 +484,8 @@ def check_attachment_collision(
 
         # --- Legacy pass: (src, card_feat) key, attachment types only ---
         if has_legacy and (max_samples is None or samples_checked < max_samples):
-            opt_src = data["opt_src_idx"]     # [S, O_MAX]
-            opt_card = data["opt_card_feat"]  # [S, O_MAX, F_CARD]
+            opt_src = data["opt_src_idx"]   # [S, O_MAX]
+            opt_card = data["opt_card_id"]  # [S, O_MAX]
 
             # Attachment OptionTypes: CARD(3), TOOL_CARD(4), ENERGY_CARD(5), ENERGY(6)
             att_mask = np.isin(opt_type, [3, 4, 5, 6]) & opt_mask
@@ -490,8 +498,7 @@ def check_attachment_collision(
                 # options.  Feature rows are float arrays, so key them by bytes.
                 pairs = list(zip(
                     opt_src[s][row_mask].tolist(),
-                    [np.ascontiguousarray(row).tobytes()
-                     for row in opt_card[s][row_mask]],
+                    opt_card[s][row_mask].tolist(),
                 ))
                 # Count how many unique pairs vs total
                 n_total_attachment_options += len(pairs)

@@ -2,13 +2,14 @@
 
 Layout is exact Appendix A.3 (feature slices) / A.2 (normalizers) of
 TRANSFORMER_IL_SPEC.md:
-  card_static_row[94]  = base[52] + 3 × attack_static_row[14]
+  card_static_row[218] = base[52] + 3 × attack_static_row[45]
   base[52]             = [hp/HP_N, retreat/RETREAT_N, cardType-onehot(7),
                           stage-onehot(3), energyType-onehot(12),
                           weakness-onehot(12), resistance-onehot(12),
                           [ex, megaEx, tera, aceSpec](4)]
-  attack_static_row[14] = [damage/ATKDMG_N, energy-cost histogram(12)/ATKCOST_N,
-                           len(energies)/ATKCOST_N]
+  attack_static_row[45] = [damage/ATKDMG_N, energy-cost histogram(12)/ATKCOST_N,
+                           len(energies)/ATKCOST_N,
+                           draw_fixed/DRAW_N, draw_to_hand/DRAW_N]
 
 Engine access: `all_card_data()` / `all_attack()` live in the bundled `cg`
 package at pokemon-tcg-ai-battle/sample_submission/sample_submission/cg;
@@ -24,21 +25,22 @@ HP_N = 400.0
 RETREAT_N = 4.0
 ATKDMG_N = 350.0
 ATKCOST_N = 5.0
+DRAW_N = 10.0
 
 N_CARDTYPE = 7
 N_ENERGY = 12
 
 from ptcg_il.featurizer import F_ATK, F_CARD
-from ptcg_mine.keywords import K_EFFECT, ability_keyword_row, attack_keyword_row
+from ptcg_mine.keywords import K_EFFECT, ability_keyword_row, attack_keyword_row, draw_fixed, draw_to_hand
 
 # ptcg_il.featurizer owns the dims but cannot import K_EFFECT (it is vendored
 # into the Kaggle bundle, where ptcg_mine does not exist).  Assert agreement
 # here instead: appending a keyword without bumping the featurizer would
 # otherwise emit a row of the old width, which every downstream shape check
 # accepts until the first forward pass.
-assert F_ATK == 14 + K_EFFECT, (
+assert F_ATK == 16 + K_EFFECT, (
     f"F_ATK={F_ATK} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
-    f"in ptcg_mine.keywords (expected {14 + K_EFFECT})"
+    f"in ptcg_mine.keywords (expected {16 + K_EFFECT})"
 )
 assert F_CARD == 52 + K_EFFECT + 2 + 3 * F_ATK, (
     f"F_CARD={F_CARD} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
@@ -80,14 +82,14 @@ def _onehot(index: int | None, size: int) -> np.ndarray:
 
 
 def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
-    """float32[94] static feature row for a CardData.
+    """float32[218] static feature row for a CardData.
 
-    Layout: 52 base features + 3 attacks × 14 (damage, energy cost, cost count).
+    Layout: 52 base features + ability keywords + 2 counts + 3 attacks × 45.
     Attacks beyond the card's actual attacks are zero-padded.
 
     ``card.attacks`` holds attack *ids*, not Attack objects, so *attacks_by_id*
     (``{attackId: Attack}``) is required to resolve them.  It is a required
-    argument on purpose: defaulting it to ``{}`` would silently emit a 94-dim
+    argument on purpose: defaulting it to ``{}`` would silently emit a 218-dim
     row whose attack half is all zeros, which no assertion downstream catches.
     """
     row = np.zeros(F_CARD, dtype=np.float32)
@@ -118,16 +120,10 @@ def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
 
 
 def attack_static_row(attack) -> np.ndarray:
-    """float32[14] static feature row for an Attack, per Appendix A.3.
+    """float32[45] static feature row for an Attack.
 
-    The energy-cost histogram is divided by ``ATKCOST_N``, matching the
-    ``count/ENERGY_N`` treatment the featurizer already gives the *attached*
-    energy histogram in ``poke_feat[3:15]``.  Spec A.3 originally wrote this
-    histogram with no divisor while A.1 divided the other one, which left raw
-    counts up to 5.0 sitting in 36 of the 94 card-feature dims next to
-    everything else in [0, 1].  ``ATKCOST_N`` rather than ``ENERGY_N`` because
-    a cost is bounded by its own total, which ``row[13]`` already normalizes
-    the same way -- the two halves of the cost then share one scale.
+    Layout: damage, energy-cost histogram(12), total-cost-count,
+    draw_fixed, draw_to_hand, then K_EFFECT keyword flags (16:45).
     """
     row = np.zeros(F_ATK, dtype=np.float32)
     row[0] = attack.damage / ATKDMG_N
@@ -137,22 +133,22 @@ def attack_static_row(attack) -> np.ndarray:
         hist[int(e)] += 1.0
     row[1:13] = hist / ATKCOST_N
     row[13] = len(attack.energies) / ATKCOST_N
-    # Effect keywords from the attack's oracle text (14:43).  Living here rather
-    # than only in card_static_row is deliberate: opt_attack_feat is built from
-    # this row, so ATTACK options gain their effect text for free -- the decision
-    # where text matters most.
-    row[14:14 + K_EFFECT] = attack_keyword_row(attack)
+    # Draw counts (14:16) — normalised by DRAW_N per the fixed-divisor scheme
+    row[14] = draw_fixed(attack) / DRAW_N
+    row[15] = draw_to_hand(attack) / DRAW_N
+    # Effect keywords from the attack's oracle text (16:45).
+    row[16:16 + K_EFFECT] = attack_keyword_row(attack)
     return row
 
 
 def build_static_tables(vocab: dict, card_data: list, attack_data: list):
-    """Build the [V,94] card table and [A,14] attack table for the given vocab.
+    """Build the [V,218] card table and [A,45] attack table for the given vocab.
 
     Returns (card_table, attack_id_to_index, attack_table):
-      - card_table[V,94] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
+      - card_table[V,218] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
         in-vocab card rows), rows 2..V-1 = card_static_row(card) per vocab id.
       - attack_id_to_index: {attackId: index}, index >= 1 (0 is PAD).
-      - attack_table[A,14] float32: row 0 = PAD (zeros); A = 1 + number of
+      - attack_table[A,45] float32: row 0 = PAD (zeros); A = 1 + number of
         distinct attackIds referenced by vocab cards.
     """
     cards_by_id = {c.cardId: c for c in card_data}
@@ -194,10 +190,10 @@ def build_static_tables(vocab: dict, card_data: list, attack_data: list):
 
 def build_engine_card_features(card_data: list,
                                attack_data: list) -> dict[int, np.ndarray]:
-    """Build ``{card_id: static_row_94}`` for ALL engine cards.
+    """Build ``{card_id: static_row_218}`` for ALL engine cards.
 
     Unlike :func:`build_static_tables` which only covers vocab cards, this
-    dict maps every card the engine knows about to its 94-dim static
+    dict maps every card the engine knows about to its 218-dim static
     features.  Used at inference time to represent every card purely by its
     features (no learned id embeddings).
     """
@@ -206,7 +202,7 @@ def build_engine_card_features(card_data: list,
 
 
 def build_engine_attack_features(attack_data: list) -> dict[int, np.ndarray]:
-    """Build ``{attack_id: static_row_43}`` for ALL engine attacks."""
+    """Build ``{attack_id: static_row_45}`` for ALL engine attacks."""
     return {a.attackId: attack_static_row(a) for a in attack_data}
 
 

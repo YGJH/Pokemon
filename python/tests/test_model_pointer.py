@@ -20,6 +20,7 @@ def _make_synthetic_h_and_x(B: int = 2):
         "opt_type": torch.randint(0, 17, (B, O)),
         "opt_src_idx": torch.randint(-1, L, (B, O)),
         "opt_tgt_idx": torch.randint(-1, L, (B, O)),
+        "opt_bench_idx": torch.randint(-1, L, (B, O)),
         "opt_card_feat": torch.randn(B, O, F_CARD),
         "opt_attack_feat": torch.randn(B, O, F_ATK),
         "opt_scalar": torch.randn(B, O, F_OPT),

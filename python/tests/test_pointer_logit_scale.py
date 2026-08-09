@@ -16,6 +16,9 @@ import torch
 
 from ptcg_il.model.pointer import PointerHead
 from ptcg_il.model.policy import Policy
+from tests.test_model_policy import (
+    N_TEST_ATTACKS, N_TEST_CARDS, make_policy,
+)
 
 
 def _pointer_inputs(B=4, L=46, O=12, D=64):
@@ -28,10 +31,25 @@ def _pointer_inputs(B=4, L=46, O=12, D=64):
         "opt_type": torch.randint(0, 18, (B, O)),
         "opt_src_idx": torch.randint(-1, L, (B, O)),
         "opt_tgt_idx": torch.randint(-1, L, (B, O)),
+        "opt_bench_idx": torch.randint(-1, L, (B, O)),
         "opt_card_feat": torch.randn(B, O, F_CARD),
         "opt_attack_feat": torch.randn(B, O, F_ATK),
         "opt_scalar": torch.randn(B, O, F_OPT),
         "opt_mask": torch.ones(B, O, dtype=torch.bool),
+        # The `*_card_feat` entries above go straight into `PointerHead`, which
+        # still consumes features.  The ids are for the tests that go through a
+        # whole `Policy`: it gathers its own features from its static tables and
+        # overwrites them, which is fine here — this fixture is about logit
+        # magnitude, not about which card is which.
+        "poke_card_id": torch.randint(1, N_TEST_CARDS, (B, 12)),
+        "hand_card_id": torch.randint(1, N_TEST_CARDS, (B, 30)),
+        "stadium_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "context_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "effect_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "discard_ids": torch.randint(1, N_TEST_CARDS, (B, 2, 60)),
+        "prize_ids": torch.zeros(B, 2, 6, dtype=torch.long),
+        "opt_card_id": torch.randint(1, N_TEST_CARDS, (B, O)),
+        "opt_attack_idx": torch.randint(1, N_TEST_ATTACKS, (B, O)),
     }
     return h, tok_mask, x
 
@@ -125,17 +143,32 @@ def _policy_batch(B=2, O=16):
         "opt_type": torch.randint(0, 18, (B, O)),
         "opt_src_idx": torch.randint(-1, 46, (B, O)),
         "opt_tgt_idx": torch.randint(-1, 46, (B, O)),
+        "opt_bench_idx": torch.randint(-1, 46, (B, O)),
         "opt_card_feat": torch.randn(B, O, F_CARD),
         "opt_attack_feat": torch.randn(B, O, F_ATK),
         "opt_scalar": torch.randn(B, O, F_OPT),
         "opt_mask": torch.ones(B, O, dtype=torch.bool),
+        # The `*_card_feat` entries above go straight into `PointerHead`, which
+        # still consumes features.  The ids are for the tests that go through a
+        # whole `Policy`: it gathers its own features from its static tables and
+        # overwrites them, which is fine here — this fixture is about logit
+        # magnitude, not about which card is which.
+        "poke_card_id": torch.randint(1, N_TEST_CARDS, (B, 12)),
+        "hand_card_id": torch.randint(1, N_TEST_CARDS, (B, 30)),
+        "stadium_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "context_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "effect_card_id": torch.randint(1, N_TEST_CARDS, (B, 1)),
+        "discard_ids": torch.randint(1, N_TEST_CARDS, (B, 2, 60)),
+        "prize_ids": torch.zeros(B, 2, 6, dtype=torch.long),
+        "opt_card_id": torch.randint(1, N_TEST_CARDS, (B, O)),
+        "opt_attack_idx": torch.randint(1, N_TEST_ATTACKS, (B, O)),
     }
 
 
 def test_policy_logits_bounded_under_pointer_drift():
     """End-to-end: the same blowup through a full Policy stays in softmax range."""
     torch.manual_seed(0)
-    pol = Policy(D=64, heads=4, layers=2, ff=128)
+    pol = make_policy(D=64, heads=4, layers=2, ff=128)
     pol.eval()
     x = _policy_batch()
     with torch.no_grad():

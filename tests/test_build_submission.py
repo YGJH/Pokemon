@@ -8,6 +8,7 @@ and loses nearly all of them without raising anywhere.  `save_checkpoint` pins
 to print them and compare nothing.
 """
 
+import ast
 import hashlib
 import importlib.util
 import sys
@@ -375,6 +376,213 @@ def test_table_disagreeing_with_the_checkpoint_is_fatal(bs, row_width):
     """
     with pytest.raises(SystemExit):
         _exec_width_fragment(bs, cfg={"feat_dims": {"F_CARD": 212}}, row_width=row_width)
+
+
+# ── Static feature tables ────────────────────────────────────────────────
+# Cards and attacks reach the model as *ids*: `Policy._gather_card_feats` turns
+# every `*_card_feat` key back into features from a dense table, one per kind
+# (`featurizer.CARD_FEAT_SOURCES`).  A template that builds only the card table
+# constructs, loads its weights and imports fine, then raises on the first real
+# decision -- where main.py's greedy-inference `except` downgrades it to a
+# warning and plays the first legal option for the rest of every game.
+
+_AGENT_TEMPLATES = ["MAIN_PY_TEMPLATE", "MAIN_PY_TEMPLATE_GREEDY"]
+
+#: The names whose top-level statements build the static tables.  Pulled out of
+#: the real template, so the test reads the shipped source rather than a
+#: paraphrase of it.
+_TABLE_NAMES = ("_all_card_feat", "_all_attack_feat", "_max_cid", "_max_aid",
+                "_card_feat_dim", "_attack_feat_dim", "_table_dim",
+                "_attack_row_dim")
+
+
+def _exec_table_fragment(bs, template):
+    """Exec the static-table statements of *template* against stub engine data."""
+    import ast
+
+    import numpy as np
+    import torch
+
+    from ptcg_il.featurizer import F_ATK, F_CARD
+
+    src = getattr(bs, template)
+    tree = ast.parse(src)
+    chunks = []
+    for node in tree.body:
+        seg = ast.get_source_segment(src, node) or ""
+        if any(w in seg for w in _TABLE_NAMES) and "Policy(" not in seg and "torch.load" not in seg:
+            chunks.append(seg)
+    assert chunks, f"{template} no longer builds the static tables at top level"
+
+    ns = {
+        "np": np,
+        "torch": torch,
+        "sys": sys,
+        "_cfg": {"D": 32, "heads": 2, "layers": 1, "ff": 64, "n_opp_arch": 1,
+                 "feat_dims": {"F_CARD": F_CARD, "F_ATK": F_ATK}},
+        "_engine_card_features": {
+            7: np.zeros(F_CARD, dtype=np.float32),
+            11: np.ones(F_CARD, dtype=np.float32),
+        },
+        "_engine_attack_features": {
+            3: np.zeros(F_ATK, dtype=np.float32),
+            9: np.ones(F_ATK, dtype=np.float32),
+        },
+    }
+    exec(compile("\n".join(chunks), "main.py", "exec"), ns)
+    return ns
+
+
+def _template_call(bs, template, predicate):
+    """Source of the first call node in *template* matching *predicate*."""
+    src = getattr(bs, template)
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Call) and predicate(node):
+            return ast.get_source_segment(src, node)
+    return None
+
+
+@pytest.mark.parametrize("template", _AGENT_TEMPLATES)
+def test_agent_policy_can_gather_every_card_feature(bs, template):
+    """The Policy each template builds must be able to gather every feature key.
+
+    Built exactly as the template builds it -- its own table statements, its own
+    `Policy(...)` call -- then asked for the gather that every forward begins
+    with.  Constructing it proves nothing: the tables are non-persistent
+    buffers, so a policy missing one loads every weight and only raises once the
+    ids it has no table for reach `_gather_card_feats`.
+
+    Driven off `CARD_FEAT_SOURCES` rather than a list of keys, so a feature key
+    added against a third table fails here instead of after submission.
+    """
+    import torch
+
+    from ptcg_il.featurizer import (
+        CARD_FEAT_SOURCES, F_ATK, F_CARD, LOG_CARD_ID_COLUMN,
+    )
+    from ptcg_il.model.policy import Policy
+
+    ns = _exec_table_fragment(bs, template)
+    call = _template_call(
+        bs, template,
+        lambda n: isinstance(n.func, ast.Name) and n.func.id == "Policy")
+    assert call, f"{template} no longer constructs Policy directly"
+
+    ns["Policy"] = Policy
+    policy = eval(call, ns)  # noqa: S307 - the template's own source
+
+    x = {id_key: torch.ones(1, 4, dtype=torch.long)
+         for id_key, _kind in CARD_FEAT_SOURCES.values()}
+    x["log_feat"] = torch.ones(1, 4, LOG_CARD_ID_COLUMN + 1)
+    out = policy._gather_card_feats(x)
+
+    widths = {"card": F_CARD, "attack": F_ATK}
+    assert set(CARD_FEAT_SOURCES) <= set(out), "gather dropped a feature key"
+    for feat_key, (_id_key, kind) in CARD_FEAT_SOURCES.items():
+        assert out[feat_key].shape[-1] == widths[kind], (
+            f"{template} builds a {kind} table {out[feat_key].shape[-1]} wide, "
+            f"not {widths[kind]}")
+    assert out["log_card_feat"].shape[-1] == F_CARD
+
+
+def _template_func(bs, template, name):
+    """Source of the top-level function *name* defined in *template*."""
+    src = getattr(bs, template)
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return ast.get_source_segment(src, node)
+    return None
+
+
+def _greedy_agent_ns(bs, featurize):
+    """`agent` from the greedy template, wired to stubs, ready to call."""
+    src = _template_func(bs, "MAIN_PY_TEMPLATE_GREEDY", "agent")
+    assert src, "greedy template no longer defines agent()"
+
+    def _unused(*a, **kw):
+        raise AssertionError("should not be reached")
+
+    ns = {
+        "to_observation_class": lambda d: type("O", (), {"select": d.get("select")})(),
+        "featurize": featurize,
+        "_vocab": {},
+        "_engine_card_features": {},
+        "_engine_attack_features": {},
+        "_evolution_map": None,
+        "_fixed_deck": [11, 22, 33],
+        "_to_batch": lambda f: f,
+        "_model": _unused,
+        "select_multi": _unused,
+        "torch": __import__("torch"),
+        "_legal": lambda idx, n, lo, hi: list(idx),
+    }
+    exec(compile(src, "main.py", "exec"), ns)
+    return ns
+
+
+def test_inference_failure_is_raised_not_swallowed(bs):
+    """A policy that cannot answer must fail the run, not play the first option.
+
+    The handler this replaces turned a dead policy -- a missing static table, a
+    shape mismatch, a renamed key -- into one line on stderr and `minCount`
+    legal options for every decision of every game after it.  Nothing
+    downstream distinguishes that from a policy that simply plays badly, so it
+    survives a full experiment and is read as a training result.
+    """
+    def _boom(*a, **kw):
+        raise RuntimeError("no attack static table")
+
+    ns = _greedy_agent_ns(bs, _boom)
+    obs = {"select": {"option": [{}, {}, {}], "minCount": 1, "maxCount": 1}}
+    with pytest.raises(RuntimeError, match="no attack static table"):
+        ns["agent"](obs)
+
+
+def test_deck_selection_still_answers_before_any_inference(bs):
+    """The `select is None` step must stay ahead of the model.
+
+    It is the one decision with no options to score, so it must keep working
+    without touching the featurizer -- otherwise raising on inference failure
+    would also break deck submission.
+    """
+    def _never(*a, **kw):
+        raise AssertionError("deck selection must not featurize")
+
+    ns = _greedy_agent_ns(bs, _never)
+    assert ns["agent"]({"select": None}) == [11, 22, 33]
+
+
+def test_ensemble_members_are_given_both_static_tables(bs):
+    """`EnsemblePolicy.from_checkpoints` builds every member, so it needs both.
+
+    The members are `policy_from_config`'d inside it and never seen by the
+    template again, so a table omitted here cannot be attached afterwards.
+    """
+    ns = _exec_table_fragment(bs, "MAIN_PY_TEMPLATE_GREEDY")
+    call = _template_call(
+        bs, "MAIN_PY_TEMPLATE_GREEDY",
+        lambda n: isinstance(n.func, ast.Attribute)
+        and n.func.attr == "from_checkpoints")
+    assert call, "MAIN_PY_TEMPLATE_GREEDY no longer builds an EnsemblePolicy"
+
+    seen = {}
+
+    class _Recorder:
+        @classmethod
+        def from_checkpoints(cls, paths, all_card_feat=None, all_attack_feat=None,
+                             device="cpu"):
+            seen["card"] = all_card_feat
+            seen["attack"] = all_attack_feat
+            return cls()
+
+    ns.update({"EnsemblePolicy": _Recorder, "_member_paths": [], "_device": "cpu"})
+    eval(call, ns)  # noqa: S307 - the template's own source
+
+    assert seen["card"] is ns["_all_card_feat"], "members get no card table"
+    assert seen["attack"] is ns["_all_attack_feat"], (
+        "members get no attack table; every ensemble decision then raises "
+        "inside the agent's greedy-inference except clause and falls back to "
+        "the first legal option")
 
 
 def test_featurizer_imports_are_rewritten_for_the_bundle(bs):

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from ptcg_il.featurizer import featurize as _featurize_raw
 from ptcg_il.featurizer import (
     ATKCOST_N,
     COUNT_N,
@@ -938,20 +939,10 @@ class TestEndToEnd:
     """Step 13: End-to-end test — iterate all ACTIVE decisions, verify all keys."""
 
     REQUIRED_KEYS = {
-        # State — card identity, as static features (no learned id embeddings)
-        "poke_card_feat",
-        # Cards attached to a Pokémon.  Kept as identities, not counts: a
-        # defensive Tool and an offensive one are otherwise the same token, and
-        # a Special Energy is indistinguishable from a basic of its type.
-        "poke_tool_feat",
-        "poke_energy_feat",
-        "hand_card_feat",
-        "stadium_card_feat",
-        "context_card_feat",
-        "effect_card_feat",
-        "discard_card_feat",
+        # Card identity travels as *ids* (listed below); the ``*_card_feat``
+        # tensors they gather are produced by ``Policy`` on device and must not
+        # appear here.
         "discard_mask",
-        "prize_card_feat",
         # State — dense features
         "poke_feat",
         "hand_feat",
@@ -967,14 +958,14 @@ class TestEndToEnd:
         "opt_type",
         "opt_src_idx",
         "opt_tgt_idx",
-        "opt_card_feat",
-        "opt_attack_feat",
+        "opt_bench_idx",
         "opt_scalar",
         "opt_mask",
         "opt_group",
-        # Raw ids behind the *_card_feat tensors above.  The model never reads
-        # these; the shard writer stores them *instead of* the features, which
-        # are a ~200x larger gather from a frozen table (CARD_FEAT_SOURCES).
+        # Card and attack ids — what the model actually consumes.  It gathers
+        # the feature rows itself from the frozen static tables
+        # (CARD_FEAT_SOURCES), a ~200x larger tensor that no longer crosses the
+        # DataLoader queue.
         "poke_card_id",
         "poke_tool_ids",
         "poke_energy_ids",
@@ -1000,7 +991,6 @@ class TestEndToEnd:
         "log_feat",
         "log_mask",
         "log_len",
-        "log_card_feat",
     }
 
     def test_out_of_vocab_cards_still_carry_their_features(self):
@@ -1085,13 +1075,18 @@ class TestEndToEnd:
                 yield obs, action
 
     def test_all_keys_present(self):
-        """Every featurize call returns all 31 A.4 keys."""
+        """Every featurize call returns exactly the A.4 keys — ids, no features.
+
+        Uses the unwrapped featurizer on purpose: the module-level ``featurize``
+        here adds the model-side gather, and this is the one test whose subject
+        is the key set the featurizer actually produces.
+        """
         ep = _load_episode()
         vocab = _build_test_vocab_with_attacks(ep)
 
         count = 0
         for obs, action in self._iter_active_decisions(ep):
-            result = featurize(obs, vocab, action)
+            result = _featurize_raw(obs, vocab, action)
             missing = self.REQUIRED_KEYS - set(result.keys())
             extra = set(result.keys()) - self.REQUIRED_KEYS
             assert not missing, f"Missing keys: {missing}"
@@ -1598,6 +1593,47 @@ class TestOptCardId:
 # ---------------------------------------------------------------------------
 
 
+#: The ``*_card_feat`` keys, and the ids they are gathered from.
+#:
+#: ``featurize`` emits only the ids -- ``Policy`` gathers the features on its
+#: own device, because materialising them per sample was 93% of a sample's
+#: bytes and 128 of 174 ms per training step.  These tests are about what the
+#: features *contain*, so the wrapper below runs exactly the gather the model
+#: runs and the assertions are unchanged.  That ``featurize`` itself emits no
+#: feature key is a separate contract, pinned in
+#: ``test_card_feature_reconstruction.py``.
+
+
+def _with_card_feats(result, engine_card_features=None, engine_attack_features=None):
+    """Add the ``*_card_feat`` tensors ``Policy._gather_card_feats`` would."""
+    from ptcg_il.featurizer import (
+        CARD_FEAT_SOURCES, LOG_CARD_ID_COLUMN, build_static_table,
+        gather_static_feats,
+    )
+
+    tables = {
+        "card": build_static_table(engine_card_features or {}, F_CARD),
+        "attack": build_static_table(engine_attack_features or {}, F_ATK),
+    }
+    for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
+        if id_key in result:
+            result[feat_key] = gather_static_feats(result[id_key], tables[kind])
+    if "log_feat" in result:
+        result["log_card_feat"] = gather_static_feats(
+            result["log_feat"][:, LOG_CARD_ID_COLUMN].astype(np.int64), tables["card"]
+        )
+    return result
+
+
+def featurize(*args, **kwargs):
+    """``ptcg_il.featurizer.featurize`` plus the model-side card gather."""
+    return _with_card_feats(
+        _featurize_raw(*args, **kwargs),
+        kwargs.get("engine_card_features"),
+        kwargs.get("engine_attack_features"),
+    )
+
+
 def _remap(card_id, id_to_index):
     """Remap helper matching featurizer logic."""
     if card_id is None:
@@ -1649,6 +1685,7 @@ def _opt_arrays(n_valid: int):
         "opt_type": np.zeros(O_MAX, dtype=np.int64),
         "opt_src_idx": np.full(O_MAX, -1, dtype=np.int64),
         "opt_tgt_idx": np.full(O_MAX, -1, dtype=np.int64),
+        "opt_bench_idx": np.full(O_MAX, -1, dtype=np.int64),
         "opt_card_feat": np.zeros((O_MAX, F_CARD), dtype=np.float32),
         "opt_attack_feat": np.zeros((O_MAX, F_ATK), dtype=np.float32),
         "opt_scalar": np.zeros((O_MAX, F_OPT), dtype=np.float32),

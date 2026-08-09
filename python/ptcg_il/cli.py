@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULTS = {
     # Model
     "d_model": 256,
-    "layers": 8,
+    "layers": 4,
     "heads": 8,
     "ff": 1024,
     "dropout": 0.1,
@@ -197,8 +197,19 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Training epochs (overridden by --total-steps)")
     train_hp.add_argument("--total-steps", type=int, default=None,
                           help="Override total training steps (default: epochs * steps_per_epoch)")
+    from ptcg_il.train.loop import MUON_LR
+
+    train_hp.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw",
+                          help="adamw (default) or muon: orthogonalized momentum "
+                               "for the trunk matrices, AdamW for embeddings, "
+                               "biases, norms and output heads")
+    train_hp.add_argument("--muon-lr", type=float, default=MUON_LR,
+                          help="Peak LR for the orthogonalized group. Does NOT "
+                               "transfer from --peak-lr: an orthogonalized "
+                               "update's size is set by the matrix shape, not "
+                               "the gradient. Ignored unless --optimizer muon")
     train_hp.add_argument("--peak-lr", type=float, default=DEFAULTS["peak_lr"],
-                          help="Peak learning rate")
+                          help="Peak learning rate (AdamW parameters)")
     train_hp.add_argument("--min-lr", type=float, default=DEFAULTS["min_lr"],
                           help="Minimum learning rate (cosine floor)")
     train_hp.add_argument("--warmup", type=int, default=DEFAULTS["warmup"],
@@ -388,30 +399,17 @@ def _belief_weights(args: argparse.Namespace) -> dict[str, float] | None:
     return {name: float(getattr(args, f"belief_{name[2:]}")) for name in BELIEF_WEIGHTS}
 
 
-def _load_all_card_feat(data_dir: Path) -> Any:
-    """``[n_all_cards, F_CARD]`` static features for every engine card.
+def _load_static_tables(data_dir: Path) -> Any:
+    """``(card_table, attack_table)`` for the policy's on-device card gather.
 
-    The belief heads score against every card the engine knows about, so they
-    need this matrix; ``BeliefHeads.forward`` raises without it rather than
-    scoring against randomly-initialised rows.  Indexed by raw engine card id,
-    so row 0 and any gap stay zero (PAD).
+    Thin wrapper over :func:`ptcg_il.model.policy.load_static_tables` so the
+    import stays lazy — ``cli`` is imported for subcommands that never build a
+    model.  The card table doubles as the belief heads' scoring matrix; the
+    policy wires both from one call.
     """
-    import numpy as np
-    import torch
+    from ptcg_il.model.policy import load_static_tables
 
-    from ptcg_il.featurizer import F_CARD
-
-    ecf_path = Path(data_dir) / "engine_card_features.npy"
-    if not ecf_path.exists():
-        return None
-    ecf = np.load(ecf_path, allow_pickle=True).item()
-    if not ecf:
-        return None
-    max_id = max(int(cid) for cid in ecf)
-    all_feat = torch.zeros(max_id + 1, F_CARD)
-    for cid, feat in ecf.items():
-        all_feat[int(cid)] = torch.from_numpy(np.asarray(feat, dtype=np.float32))
-    return all_feat
+    return load_static_tables(data_dir)
 
 
 def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
@@ -423,18 +421,23 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
     """
     from ptcg_il.model.policy import Policy
 
-    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+    all_card_feat, all_attack_feat = _load_static_tables(Path(args.data_dir))
     n_all_cards = int(all_card_feat.shape[0]) if all_card_feat is not None else 0
-    if all_card_feat is None:
-        # The belief heads raise without it; say so here rather than at the
-        # first forward pass, several minutes into a run.
-        logger.warning(
-            "no engine_card_features.npy in %s — belief heads will have no "
-            "card matrix", args.data_dir,
+    missing = [name for name, t in (("engine_card_features.npy", all_card_feat),
+                                    ("engine_attack_features.npy", all_attack_feat))
+               if t is None]
+    if missing:
+        # Every card would embed as all-zeros and the belief heads would have no
+        # scoring matrix.  Refuse here rather than at the first forward pass,
+        # several minutes into a run -- or worse, not at all.
+        raise SystemExit(
+            f"missing {', '.join(missing)} in {args.data_dir}; the policy cannot "
+            "featurize cards without the engine static tables. Run "
+            "`python -m ptcg_mine.mine` to write them."
         )
-    else:
-        logger.info("all_card_feat: %d cards x %d features",
-                    n_all_cards, int(all_card_feat.shape[1]))
+    logger.info("static tables: %d cards x %d, %d attacks x %d",
+                n_all_cards, int(all_card_feat.shape[1]),
+                int(all_attack_feat.shape[0]), int(all_attack_feat.shape[1]))
 
     policy = Policy(
         D=args.d_model,
@@ -444,6 +447,7 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
         n_opp_arch=artifacts.get("n_opp_arch", 0),
         n_all_cards=n_all_cards,
         all_card_feat=all_card_feat,
+        all_attack_feat=all_attack_feat,
     )
     policy.config["seed"] = args.seed
     # Apply spec B.8 weight init (trunc_normal std=0.02 for Linear/Embedding weights)
@@ -592,6 +596,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         save_dir=out_dir,
         batch_size=args.batch_size,
         grad_accum=args.grad_accum,
+        optimizer_name=args.optimizer,
+        muon_lr=args.muon_lr,
         archetype_self=args.archetype_self,
         seed=args.seed,
         peak_lr=args.peak_lr,
@@ -757,12 +763,13 @@ def _cmd_eval_only_ensemble(
     from torch.utils.data import DataLoader
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    all_card_feat = _load_all_card_feat(Path(args.data_dir))
+    all_card_feat, all_attack_feat = _load_static_tables(Path(args.data_dir))
 
     # Build EnsemblePolicy from checkpoints
     logger.info("Building ensemble from %d checkpoints...", len(ckpt_paths))
     ensemble = EnsemblePolicy.from_checkpoints(
-        ckpt_paths, all_card_feat=all_card_feat, device=str(device),
+        ckpt_paths, all_card_feat=all_card_feat,
+        all_attack_feat=all_attack_feat, device=str(device),
     )
     ensemble.to(device)
     ensemble.eval()

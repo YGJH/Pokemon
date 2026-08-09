@@ -24,13 +24,15 @@ from ptcg_il.qa import (
 )
 
 
-def _card_row(seed: int) -> np.ndarray:
-    """A distinct, reproducible ``opt_card_feat`` row standing in for one card.
+def _card_row(seed: int) -> int:
+    """A distinct, reproducible ``opt_card_id`` standing in for one card.
 
-    The collision check compares feature *rows*, so what matters is that
-    different cards get different rows and the same card gets the same one.
+    The collision check compares stored card *ids* — that is what shards carry;
+    the features are gathered from them on the model's device — so what matters
+    is that different cards get different ids and the same card gets the same
+    one.
     """
-    return np.full(F_CARD, float(seed), dtype=np.float32)
+    return int(seed) + 1  # never 0: that is PAD
 
 
 # ============================================================
@@ -159,7 +161,7 @@ def test_attachment_collision_no_collisions(tmp_path):
     S, O = 2, 64
     opt_type = np.zeros((S, O), dtype=np.int64)
     opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.zeros((S, O, F_CARD), dtype=np.float32)
+    opt_card = np.zeros((S, O), dtype=np.int32)
     opt_mask = np.zeros((S, O), dtype=bool)
 
     # Sample 0: two ENERGY options on different pokemon (same card features,
@@ -186,7 +188,7 @@ def test_attachment_collision_no_collisions(tmp_path):
     opt_group_arr[1, :1] = [0]
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_feat=opt_card, opt_mask=opt_mask,
+                        opt_card_id=opt_card, opt_mask=opt_mask,
                         opt_group=opt_group_arr)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"] * S, "row": [0, 1]})
@@ -200,7 +202,7 @@ def test_attachment_collision_with_collisions(tmp_path):
     S, O = 1, 64
     opt_type = np.zeros((S, O), dtype=np.int64)
     opt_src = np.full((S, O), -1, dtype=np.int64)
-    opt_card = np.zeros((S, O, F_CARD), dtype=np.float32)
+    opt_card = np.zeros((S, O), dtype=np.int32)
     opt_mask = np.zeros((S, O), dtype=bool)
 
     # Two identical options: same src, same card features
@@ -219,7 +221,7 @@ def test_attachment_collision_with_collisions(tmp_path):
     opt_group_arr[0, :2] = [0, 0]
     np.savez_compressed(shard_dir / "train-00000.npz",
                         opt_type=opt_type, opt_src_idx=opt_src,
-                        opt_card_feat=opt_card, opt_mask=opt_mask,
+                        opt_card_id=opt_card, opt_mask=opt_mask,
                         opt_group=opt_group_arr)
 
     meta = pd.DataFrame({"shard": ["train-00000.npz"], "row": [0]})
@@ -398,21 +400,21 @@ def _roundtrip_shard(tmp_path, *, src_row, card_row_value, state_slot_value):
     """One-sample shard whose only option points at a hand row."""
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir(exist_ok=True)
-    O, F = 64, 8
+    O = 64
     opt_mask = np.zeros((1, O), dtype=bool); opt_mask[0, 0] = True
     opt_src = np.full((1, O), -1, dtype=np.int64); opt_src[0, 0] = src_row
-    opt_card = np.zeros((1, O, F), dtype=np.float16); opt_card[0, 0, 0] = card_row_value
-    hand = np.zeros((1, 30, F), dtype=np.float16); hand[0, src_row - 13, 0] = state_slot_value
+    opt_card = np.zeros((1, O), dtype=np.int32); opt_card[0, 0] = card_row_value
+    hand = np.zeros((1, 30), dtype=np.int32); hand[0, src_row - 13] = state_slot_value
     np.savez(shard_dir / "train-00000.npz",
-             opt_mask=opt_mask, opt_src_idx=opt_src, opt_card_feat=opt_card,
-             hand_card_feat=hand,
-             poke_card_feat=np.zeros((1, 12, F), dtype=np.float16),
-             stadium_card_feat=np.zeros((1, 1, F), dtype=np.float16))
+             opt_mask=opt_mask, opt_src_idx=opt_src, opt_card_id=opt_card,
+             hand_card_id=hand,
+             poke_card_id=np.zeros((1, 12), dtype=np.int32),
+             stadium_card_id=np.zeros((1, 1), dtype=np.int32))
     return shard_dir
 
 
 def test_reference_roundtrip_passes_when_pointer_resolves(tmp_path):
-    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=1.0)
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1, state_slot_value=1)
     passed, details = check_reference_roundtrip(shard_dir)
     assert passed is True
     assert details["n_compared"] == 1
@@ -420,8 +422,12 @@ def test_reference_roundtrip_passes_when_pointer_resolves(tmp_path):
 
 
 def test_reference_roundtrip_catches_off_by_one(tmp_path):
-    """The pointer names hand row 15 but the card there is a different card."""
-    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=0.5)
+    """The pointer names hand row 15 but the card there is a different card.
+
+    Both ids must be nonzero: 0 is PAD, and a PAD row is skipped rather than
+    counted as a mismatch, so a zero here would make the gate report nothing.
+    """
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1, state_slot_value=2)
     passed, details = check_reference_roundtrip(shard_dir)
     assert passed is False
     assert details["n_mismatch"] == 1
@@ -429,7 +435,7 @@ def test_reference_roundtrip_catches_off_by_one(tmp_path):
 
 def test_reference_roundtrip_flags_impossible_source_rows(tmp_path):
     """Row 0 is CLS and row 43-44 are summary tokens — no option may point there."""
-    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1.0, state_slot_value=1.0)
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=1, state_slot_value=1)
     d = dict(np.load(shard_dir / "train-00000.npz"))
     d["opt_src_idx"][0, 0] = 43
     np.savez(shard_dir / "train-00000.npz", **d)
@@ -440,7 +446,7 @@ def test_reference_roundtrip_flags_impossible_source_rows(tmp_path):
 
 def test_reference_roundtrip_returns_none_when_nothing_compared(tmp_path):
     """Zero comparisons is 'skipped', never 'passed'."""
-    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=0.0, state_slot_value=0.0)
+    shard_dir = _roundtrip_shard(tmp_path, src_row=15, card_row_value=0, state_slot_value=0)
     passed, details = check_reference_roundtrip(shard_dir)
     assert passed is None
     assert details["n_compared"] == 0

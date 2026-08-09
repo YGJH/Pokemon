@@ -30,6 +30,7 @@ PRIZE_N = 6.0
 BENCH_N = 8.0
 ATKCOST_N = 5.0
 DMGCTR_N = 20.0
+DRAW_N = 10.0
 
 # ============================================================
 # Capacities (A.1)
@@ -49,13 +50,13 @@ LOG_FEAT_DIM = 6 # log_type, player_rel, card_id, area_from, area_to, scalar
 # ============================================================
 # Feature dims (A.1)
 # ============================================================
-F_CARD = 212  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 43
-F_ATK = 43    # 14 numeric + 29 attack keywords
+F_CARD = 218  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 45
+F_ATK = 45    # 16 numeric + 29 attack keywords
 F_POKE = 26
 F_HAND = 7
 F_SUM = 11
 F_GLOBAL = 97
-F_OPT = 8
+F_OPT = 13
 
 # Columns 9:12 of a card static row are (basic, stage1, stage2) — see
 # ``ptcg_mine.cards.card_static_row``.  Named here rather than written as a
@@ -341,6 +342,74 @@ def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
         _onehot_index(defender[_CARD_RESISTANCE]),
     )
     return min(dmg / tgt_hp, 2.0)
+
+
+def _best_bench_damage_ratio(
+    poke_card_feat: np.ndarray,
+    opp_active_card_feat: np.ndarray,
+) -> tuple[float, int]:
+    """Best damage ratio any bench Pokemon can achieve vs the opponent's Active.
+
+    Reads attack blocks from bench slots (1..5) and opponent Active HP from
+    ``opp_active_card_feat[0]`` (slot 6).  Returns ``(best_ratio, best_slot)``
+    where *best_slot* is the 0-based bench position (0..4).
+
+    Damage is read from the static table columns
+    ``CARD_ATTACK_BLOCK_START + ai * F_ATK`` (the attack's static damage, col 0
+    of the attack block).  These are normalised by ATKDMG_N (350.0).
+
+    Pure-Python arithmetic on purpose — bench is ≤5 slots × 3 attacks = 15 reads,
+    and this runs on the RL rollout path.
+    """
+    best_ratio = 0.0
+    best_slot = 0
+    opp_hp = float(opp_active_card_feat[0]) * 400.0 + 10.0
+    if opp_hp <= 10.0:
+        return 0.0, 0
+    atk_start = int(CARD_ATTACK_BLOCK_START)
+    atk_stride = int(F_ATK)
+    for bench_pos in range(1, 6):
+        row = poke_card_feat[bench_pos]
+        hp = float(row[0]) * 400.0
+        if hp <= 0:
+            continue
+        for ai in range(3):
+            dmg_norm = float(row[atk_start + ai * atk_stride])
+            dmg = dmg_norm * ATKDMG_N
+            if dmg <= 0:
+                continue
+            ratio = dmg / opp_hp
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_slot = bench_pos - 1
+    return best_ratio, best_slot
+
+
+def _best_bench_hp_ratio(
+    poke_card_feat: np.ndarray,
+    active_card_feat: np.ndarray,
+) -> tuple[float, int]:
+    """Best HP ratio of bench Pokemon vs active.  Clipped to [0, 1].
+
+    Returns ``(best_ratio, best_slot)`` — *best_slot* is the 0-based bench
+    position for tie-breaking ``opt_bench_idx``.
+    """
+    active_hp = float(active_card_feat[0]) * 400.0
+    if active_hp <= 0:
+        return 0.0, 0
+    best_ratio = 0.0
+    best_slot = 0
+    for bench_pos in range(1, 6):
+        hp = float(poke_card_feat[bench_pos][0]) * 400.0
+        if hp <= 0:
+            continue
+        ratio = hp / active_hp
+        if ratio > 1.0:
+            ratio = 1.0
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_slot = bench_pos - 1
+    return best_ratio, best_slot
 
 
 def _build_poke_tokens(
@@ -723,7 +792,7 @@ def _build_option_tokens(
     poke_card_feat: np.ndarray | None = None,
     poke_feat: np.ndarray | None = None,
     engine_attack_features: dict | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
     """Build option tensors per A.4/A.7.
 
     When the raw option list exceeds O_MAX, the chosen actions are always
@@ -735,17 +804,22 @@ def _build_option_tokens(
     after the regular options so the model can learn when to stop picking.
     *stop_column* is the index of that column (or -1 for single-select).
 
-    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_card_id,
+    Returns (opt_type, opt_src_idx, opt_tgt_idx, opt_bench_idx, opt_card_id,
              opt_attack_idx, opt_scalar, opt_mask, index_remap, stop_column).
     """
     options = select["option"]
     n_total = len(options)
     max_count = int(select.get("maxCount", 1))
+    min_count = int(select.get("minCount", 1))
     is_multi = max_count > 1
+    # A STOP column is what makes "take nothing" expressible.  Multi-select has
+    # always had one; `minCount == 0` needs one just as much even when
+    # `maxCount == 1`, because declining is legal there too.
+    wants_stop = is_multi or min_count == 0
 
     # ---- choose which option indices to keep (old → new) ----
-    # For multi-select, reserve one slot for the STOP column
-    max_regular = (O_MAX - 1) if is_multi else O_MAX
+    # Reserve one slot for the STOP column whenever there will be one
+    max_regular = (O_MAX - 1) if wants_stop else O_MAX
 
     if n_total <= max_regular:
         indices_to_keep = list(range(n_total))
@@ -775,6 +849,29 @@ def _build_option_tokens(
     opt_attack_idx = np.zeros(O_MAX, dtype=np.int64)
     opt_scalar = np.zeros((O_MAX, F_OPT), dtype=np.float32)
     opt_mask = np.zeros(O_MAX, dtype=bool)
+    opt_bench_idx = np.full(O_MAX, -1, dtype=np.int64)
+
+    # Compute bench promotion candidates when at least one RETREAT option exists.
+    # RETREAT never offers two options in one select (measured over 60 episodes),
+    # so the same values apply to every RETREAT option.
+    _has_retreat = any(int(options[i]["type"]) == 12 for i in indices_to_keep)
+    if _has_retreat:
+        _bench_best_dmg, _bench_best_dmg_slot = _best_bench_damage_ratio(
+            poke_card_feat, poke_card_feat[6],  # slot 6 = opponent Active
+        )
+        _bench_best_hp, _bench_best_hp_slot = _best_bench_hp_ratio(
+            poke_card_feat, poke_card_feat[0],  # slot 0 = my Active
+        )
+        # Prefer the highest-damage bench slot for opt_bench_idx
+        _bench_idx_slot = _bench_best_dmg_slot if _bench_best_dmg > 0 else _bench_best_hp_slot
+        _my_attached_energy = float(np.asarray(poke_feat[0][3:15], dtype=np.float64).sum()) * ENERGY_N
+        _retreat_cost = float(poke_card_feat[0, 1]) * RETREAT_N
+    else:
+        _bench_best_dmg = 0.0
+        _bench_best_hp = 0.0
+        _bench_idx_slot = 0
+        _my_attached_energy = 0.0
+        _retreat_cost = 0.0
 
     for new_j, old_j in enumerate(indices_to_keep):
         opt = options[old_j]
@@ -863,15 +960,29 @@ def _build_option_tokens(
 
         elif otype == 12:  # RETREAT
             opt_src_idx[new_j] = 1  # my active (row 1)
+            _set_card(4, your_index, 0)  # AREA_ACTIVE=4
+            # Point at the best bench slot for promotion visibility
+            bench_row = _ref(5, your_index, _bench_idx_slot)  # AREA_BENCH=5
+            opt_bench_idx[new_j] = bench_row if bench_row != -1 else -1
+            # Retreat affordability: (attached energy - retreat cost) / RETREAT_N
+            opt_scalar[new_j, 10] = _clip_norm(_my_attached_energy - _retreat_cost, RETREAT_N)
+            opt_scalar[new_j, 11] = min(_bench_best_dmg, 2.0)
+            opt_scalar[new_j, 12] = _bench_best_hp
 
         elif otype == 13:  # ATTACK
+            # The attacker is always my active; resolve it so an absent active
+            # yields -1 (the null token) instead of a PAD row.
             opt_src_idx[new_j] = 1  # my active (row 1)
+            _set_card(4, your_index, 0)  # AREA_ACTIVE=4
             opt_attack_idx[new_j] = _raw_attack(opt.get("attackId"))
             # Some attacks target specific bench slots (snipe effects)
             in_play_area = opt.get("inPlayArea")
             in_play_idx = opt.get("inPlayIndex")
             if in_play_area is not None and in_play_idx is not None:
                 opt_tgt_idx[new_j] = _ref(in_play_area, 1 - your_index, in_play_idx)
+            else:
+                # Default target is the defending Active.
+                opt_tgt_idx[new_j] = _ref(4, 1 - your_index, 0)  # AREA_ACTIVE
             # Damage preview.  Target is the snipe slot when the option names
             # one, else the opponent's Active (poke slot 6).  opt_tgt_idx is a
             # state-token row index (1..12), so poke slot = row - 1.
@@ -882,6 +993,20 @@ def _build_option_tokens(
             )
             opt_scalar[new_j, 6] = ratio
             opt_scalar[new_j, 7] = 1.0 if ratio >= 1.0 else 0.0
+            # Deck-out risk from drawing (dim 8) and zero-damage flag (dim 9)
+            aid = opt.get("attackId")
+            if engine_attack_features is not None and aid is not None:
+                atk_feat = engine_attack_features.get(int(aid))
+                if atk_feat is not None:
+                    # draw_fixed / draw_to_hand are at cols 14, 15 (normalised by DRAW_N)
+                    draw_fixed_val = float(atk_feat[14]) * DRAW_N
+                    draw_to_hand_val = float(atk_feat[15]) * DRAW_N
+                    my_hand = int(state["players"][your_index].get("handCount", 0))
+                    draw_est = draw_fixed_val + max(0, draw_to_hand_val - my_hand)
+                    deck_count = max(int(state["players"][your_index].get("deckCount", 0)), 1)
+                    opt_scalar[new_j, 8] = min(draw_est / deck_count, 1.0)
+                    # Zero-damage: damage col is 0, normalised by ATKDMG_N
+                    opt_scalar[new_j, 9] = 1.0 if float(atk_feat[0]) == 0.0 else 0.0
 
         elif otype == 3:  # CARD
             area = opt.get("area")
@@ -923,9 +1048,9 @@ def _build_option_tokens(
             if cid is not None:
                 opt_card_id[new_j] = _raw_card(cid)
 
-    # ---- STOP column for multi-select ----
+    # ---- STOP column (multi-select, or any select that may be declined) ----
     stop_column = -1
-    if is_multi and n_opts < O_MAX:
+    if wants_stop and n_opts < O_MAX:
         stop_column = n_opts
         opt_type[n_opts] = STOP_OPT_TYPE
         opt_mask[n_opts] = True
@@ -935,6 +1060,7 @@ def _build_option_tokens(
         opt_type,
         opt_src_idx,
         opt_tgt_idx,
+        opt_bench_idx,
         opt_card_id,
         opt_attack_idx,
         opt_scalar,
@@ -959,9 +1085,13 @@ def _build_label(
     For multi-select with a STOP column, the STOP target is appended
     after the last expert pick, so the model learns to stop after the
     correct number of selections.
+
+    Single-select is different: it is *one* step, so STOP is the label only when
+    the expert declined outright and is never appended after a pick.
     """
     action_idx = np.full(O_MAX, -1, dtype=np.int64)
     max_count = select["maxCount"]
+    is_multi = int(max_count) > 1
 
     n_picks = min(len(action), max_count)
     write_pos = 0
@@ -976,13 +1106,61 @@ def _build_label(
         action_idx[write_pos] = new_idx
         write_pos += 1
 
-    # Append STOP target for multi-select (after last expert pick)
-    if stop_column >= 0 and write_pos < O_MAX:
+    # Append STOP: after the last pick for multi-select, or *as* the label for a
+    # single-select the expert declined (write_pos == 0 means no pick was made).
+    if stop_column >= 0 and write_pos < O_MAX and (is_multi or write_pos == 0):
         action_idx[write_pos] = stop_column
         write_pos += 1
 
     action_len = np.int64(write_pos)
     return action_idx, action_len
+
+
+def option_groups(
+    opt_type: np.ndarray,
+    opt_src_idx: np.ndarray,
+    opt_tgt_idx: np.ndarray,
+    opt_bench_idx: np.ndarray,
+    opt_card_feat: np.ndarray,
+    opt_attack_feat: np.ndarray,
+    opt_scalar: np.ndarray,
+    opt_mask: np.ndarray,
+) -> np.ndarray:
+    """Equivalence classes over option slots: same id == identical model input.
+
+    The pointer head reads exactly ``opt_type``, the gathered rows named by
+    ``opt_src_idx``/``opt_tgt_idx``/``opt_bench_idx``, ``opt_card_feat``,
+    ``opt_attack_feat`` and ``opt_scalar``.  Two options agreeing on all of them
+    produce the same logit by construction, so a label that names one of them
+    and not the other asks for a distinction the network cannot make.
+
+    Returns ``int64[O_MAX]``: ``0..G-1`` in first-appearance order for valid
+    slots, ``-1`` for masked slots (so a padded slot never matches anything).
+    """
+    groups = np.full(O_MAX, -1, dtype=np.int64)
+    valid = np.flatnonzero(opt_mask)
+    if valid.size == 0:
+        return groups
+
+    ints = np.stack(
+        [opt_type[valid], opt_src_idx[valid], opt_tgt_idx[valid],
+         opt_bench_idx[valid]], axis=1
+    ).astype(np.int64)
+    feats = np.concatenate(
+        [
+            opt_card_feat[valid].astype(np.float32),
+            opt_attack_feat[valid].astype(np.float32),
+        ],
+        axis=1,
+    )
+    scal = opt_scalar[valid].astype(np.float32)
+
+    lookup: dict[tuple[bytes, bytes, bytes], int] = {}
+    for pos, slot in enumerate(valid):
+        key = (ints[pos].tobytes(), feats[pos].tobytes(), scal[pos].tobytes())
+        gid = lookup.setdefault(key, len(lookup))
+        groups[slot] = gid
+    return groups
 
 
 # ============================================================
@@ -1183,6 +1361,7 @@ def featurize(
         opt_type,
         opt_src_idx,
         opt_tgt_idx,
+        opt_bench_idx,
         opt_card_id,
         opt_attack_idx,
         opt_scalar,
@@ -1211,6 +1390,12 @@ def featurize(
     # about therefore gets its real features, in-vocab or not.
     _cfeat = lambda ids: _ids_to_feat(ids, engine_card_features, F_CARD, None)
     _afeat = lambda ids: _ids_to_feat(ids, engine_attack_features, F_ATK, None)
+    opt_card_feat = _cfeat(opt_card_id)
+    opt_attack_feat = _afeat(opt_attack_idx)
+    opt_group = option_groups(
+        opt_type, opt_src_idx, opt_tgt_idx, opt_bench_idx,
+        opt_card_feat, opt_attack_feat, opt_scalar, opt_mask,
+    )
     result = {
         # State — card features (float32, not int64 ids)
         "poke_card_feat": poke_card_feat,
@@ -1236,10 +1421,12 @@ def featurize(
         "opt_type": opt_type,
         "opt_src_idx": opt_src_idx,
         "opt_tgt_idx": opt_tgt_idx,
-        "opt_card_feat": _cfeat(opt_card_id),
-        "opt_attack_feat": _afeat(opt_attack_idx),
+        "opt_bench_idx": opt_bench_idx,
+        "opt_card_feat": opt_card_feat,
+        "opt_attack_feat": opt_attack_feat,
         "opt_scalar": opt_scalar,
         "opt_mask": opt_mask,
+        "opt_group": opt_group,
         # Labels & bookkeeping
         "action_idx": action_idx,
         "action_len": action_len,

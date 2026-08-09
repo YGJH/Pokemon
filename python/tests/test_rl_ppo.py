@@ -549,13 +549,13 @@ class TestReferenceLogpSharesTheUpdatePath:
 
         policy.eval()
         with torch.no_grad():
-            h_eval_nograd = policy._encode(x)[0]
-        h_eval_grad = policy._encode(x)[0].detach()
+            h_eval_nograd = policy._encode(x)[1]
+        h_eval_grad = policy._encode(x)[1].detach()
 
         policy.train()
         with torch.no_grad():
-            h_train_nograd = policy._encode(x)[0]
-        h_train_grad = policy._encode(x)[0].detach()
+            h_train_nograd = policy._encode(x)[1]
+        h_train_grad = policy._encode(x)[1].detach()
 
         assert torch.equal(h_train_nograd, h_train_grad), (
             "train mode must use one kernel regardless of grad; if this fails "
@@ -598,8 +598,11 @@ class TestReferenceLogpSharesTheUpdatePath:
         _recompute_buffer_logp(policy, batch, cfg, torch.device("cpu"))
 
         # Exactly what _ppo_epochs does next: grad-enabled recomputation.
-        h, _ = policy._encode({k: v for k, v in x.items()})
-        logp, _ = recompute_logp(policy, x, encoded=h)
+        # `_encode` returns the batch carrying the gathered option features, and
+        # that is the dict `recompute_logp` must be handed — passing the raw one
+        # alongside a pre-encoded `h` is the mistake the real caller cannot make.
+        xg, h, _ = policy._encode({k: v for k, v in x.items()})
+        logp, _ = recompute_logp(policy, xg, encoded=h)
 
         # Asserted *bitwise*, not against ratio_canary_tol.  The tolerance is a
         # property of the real model: on this tiny CPU policy the eval fast-path
