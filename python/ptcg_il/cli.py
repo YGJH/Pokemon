@@ -41,10 +41,15 @@ logger = logging.getLogger(__name__)
 DEFAULTS = {
     # Model
     "d_model": 256,
-    "layers": 4,
-    "heads": 8,
+    "layers": 6,
+    "heads": 4,
     "ff": 1024,
-    "dropout": 0.1,
+    # Split by site.  Attention-weight dropout stays off: the encoder runs over
+    # 46 structured entity tokens (CLS + Pokemon slots + hand + summaries +
+    # stadium), so dropping a key severs a specific fact rather than adding
+    # redundant noise the way it does over subword tokens.
+    "attn_dropout": 0.0,
+    "ffn_dropout": 0.0,
     # Training
     "batch_size": 1024,
     "epochs": 1000,
@@ -176,8 +181,13 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="Attention heads")
     model.add_argument("--ff", type=int, default=DEFAULTS["ff"],
                        help="Feed-forward hidden dim")
-    model.add_argument("--dropout", type=float, default=DEFAULTS["dropout"],
-                       help="Dropout rate")
+    model.add_argument("--attn-dropout", type=float, default=DEFAULTS["attn_dropout"],
+                       help="Dropout on encoder attention weights; training only. "
+                            "Default 0.0 — over 46 structured entity tokens this "
+                            "site removes facts rather than adding noise.")
+    model.add_argument("--ffn-dropout", type=float, default=DEFAULTS["ffn_dropout"],
+                       help="Dropout on the encoder FFN and both residual "
+                            "branches; training only")
 
     # Training hyperparameters
     train_hp = train_parser.add_argument_group("Training (C.10)")
@@ -448,6 +458,10 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
         n_all_cards=n_all_cards,
         all_card_feat=all_card_feat,
         all_attack_feat=all_attack_feat,
+        # getattr: callers build this Namespace by hand (eval-only, tests), and
+        # an absent flag must mean "no dropout", not AttributeError.
+        attn_dropout=getattr(args, "attn_dropout", 0.0),
+        ffn_dropout=getattr(args, "ffn_dropout", 0.0),
     )
     policy.config["seed"] = args.seed
     # Apply spec B.8 weight init (trunc_normal std=0.02 for Linear/Embedding weights)
@@ -557,12 +571,15 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     # Build policy
     logger.info(
-        "Building Policy(D=%d, heads=%d, layers=%d, ff=%d, n_opp_arch=%d)",
+        "Building Policy(D=%d, heads=%d, layers=%d, ff=%d, n_opp_arch=%d, "
+        "attn_dropout=%g, ffn_dropout=%g)",
         args.d_model,
         args.heads,
         args.layers,
         args.ff,
         artifacts.get("n_opp_arch", 0),
+        getattr(args, "attn_dropout", 0.0),
+        getattr(args, "ffn_dropout", 0.0),
     )
     import torch as _torch
     _torch.manual_seed(args.seed)

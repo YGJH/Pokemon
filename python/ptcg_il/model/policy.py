@@ -103,6 +103,15 @@ class Policy(nn.Module):
         Number of opponent archetypes for belief head.
     n_all_cards : int
         Total number of engine cards (for belief card matrix).
+    attn_dropout, ffn_dropout : float
+        Encoder dropout, split by site: attention weights vs FFN/residual (see
+        :class:`~ptcg_il.model.encoder.Encoder`).  They are separate knobs
+        because the attention site is the costly one over 46 structured entity
+        tokens, where dropping a key severs "look at the active Pokemon" rather
+        than adding redundant noise.  Training-time only: dropout adds no
+        parameters, so a checkpoint trained at any rate loads into a policy
+        built at any other.  ``policy_from_config`` therefore rebuilds at 0.0
+        regardless of what the checkpoint records -- see its docstring.
     """
 
     def __init__(
@@ -115,10 +124,14 @@ class Policy(nn.Module):
         n_all_cards: int = 0,
         all_card_feat: torch.Tensor | None = None,
         all_attack_feat: torch.Tensor | None = None,
+        attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
     ):
         super().__init__()
         self.embed = TokenEmbedder(D)
-        self.encoder = Encoder(D, heads, layers, ff)
+        self.encoder = Encoder(D, heads, layers, ff,
+                               attn_dropout=attn_dropout,
+                               ffn_dropout=ffn_dropout)
         self.pointer = PointerHead(D, heads)
         self.pointer.card = self.embed.card
         self.value = ValueHead(D)
@@ -136,6 +149,10 @@ class Policy(nn.Module):
             "n_opp_arch": n_opp_arch,
             "n_all_cards": n_all_cards,
             "feat_dims": current_feature_dims(),
+            # Provenance, not a shape.  Recorded so a .pt says which regime
+            # produced it; deliberately *not* read back by policy_from_config.
+            "attn_dropout": float(attn_dropout),
+            "ffn_dropout": float(ffn_dropout),
             "seed": 42,  # placeholder; set by caller after construction
         }
         self.register_buffer("card_table", None, persistent=False)
@@ -482,6 +499,18 @@ def policy_from_config(config: dict,
     Supports both old configs (with ``V``/``A`` from the id_emb era) and new
     configs (pure-feature model).  ``V``/``A`` are ignored — the pure-feature
     model does not need them.
+
+    ``attn_dropout``/``ffn_dropout`` are deliberately **not** restored.  They
+    are training-time knobs that add no parameters, so the state dict is
+    identical at any rate and a checkpoint loads cleanly into the 0.0 policy
+    built here.  Everything that goes through this function is inference or RL,
+    and one of those callers depends on the rates being zero: ``ptcg_rl.train``
+    runs its ``logp_old`` recompute under ``policy.train()`` on purpose, to
+    match the grad-enabled PPO update's non-fused encoder kernel.  Restoring a
+    nonzero rate would put live dropout in that pass, randomising ``logp_old``
+    and blowing the epoch-0 ratio canary.  Read the two config keys for
+    provenance; to *train* with them, pass them to :class:`Policy`
+    (``ptcg_il.cli`` does).
     """
     required = ["D", "heads", "layers", "ff"]
     missing = [k for k in required if k not in config]

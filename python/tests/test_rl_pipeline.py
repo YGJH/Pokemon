@@ -201,8 +201,11 @@ class TestCheckpointConfig:
         # record.  No static_table_shapes either: this policy was built without
         # tables, and the key appears only once they are attached.
         arch = {k: v for k, v in p.config.items() if k != "feat_dims"}
+        # The dropout rates are provenance, not shapes: they add no parameters
+        # and ``policy_from_config`` deliberately rebuilds at 0.0 regardless.
         assert arch == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
-                        "n_opp_arch": 6, "n_all_cards": 0, "seed": 42}
+                        "n_opp_arch": 6, "n_all_cards": 0, "seed": 42,
+                        "attn_dropout": 0.0, "ffn_dropout": 0.0}
         # ...plus the featurizer widths the weights were shaped by, so a
         # featurizer edit cannot silently redefine the checkpoint.
         assert p.config["feat_dims"] == current_feature_dims()

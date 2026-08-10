@@ -839,8 +839,14 @@ def _recompute_buffer_logp(policy, batch, cfg, device) -> None:
     # output, which reaches the epoch-0 ratio as p99 |ratio-1| = 3.7e-3 and
     # trips the canary at 1e-3.  Matching the update's mode is what makes this
     # function's "same precision path" promise true; it is safe because the
-    # policy has no dropout (encoder.py forces it to 0) and no batchnorm, so
-    # train mode differs from eval *only* in that kernel choice.
+    # policy has no dropout and no batchnorm, so train mode differs from eval
+    # *only* in that kernel choice.  IL now trains with encoder FFN dropout
+    # (``--ffn-dropout``, default 0.1), so the zero here is no longer a property
+    # of the architecture -- it is guaranteed by ``policy_from_config``, which
+    # deliberately does not restore either recorded rate.  Every policy that
+    # reaches this function was built by it (see ``_load_policies``).  If that
+    # ever stops being true, this pass needs an explicit dropout-disable, or
+    # ``logp_old`` is sampled noise and every ratio in epoch 0 is wrong.
     policy.train()
     with torch.no_grad():
         for start in range(0, n, cfg.minibatch):

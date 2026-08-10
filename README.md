@@ -41,7 +41,7 @@ uv run python -m ptcg_il.cli build-shards --raw-dir raw --out-dir data
 # 3. Train a1
 uv run python -m ptcg_il.cli train --data-dir data --out-dir checkpoints_a1 \
     --archetype-self 1 --d-model 256 --layers 14 --heads 8 --ff 1024 \
-    --dropout 0.2 --batch-size 256 --total-steps 2000000
+    --ffn-dropout 0.2 --batch-size 256 --total-steps 2000000
 
 uv run python -m ptcg_mine.mine --skip-download
     --raw-dir raw --out-dir data
@@ -128,6 +128,7 @@ uv run python -m ptcg_il.cli train --eval-only --data-dir data \
 
 ./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s[0-6]/ckpt-best.pt"
 
+./scripts/build_submit.sh --ensemble "python/checkpoints_a25_s*/ckpt-best.pt" --ensemble-top 10
 
 Ensemble mode is implicitly --no-mcts (greedy only) and produces submission-greedy-ens3.tar.gz with model_0.pt…model_2.pt + ensemble.json.
 

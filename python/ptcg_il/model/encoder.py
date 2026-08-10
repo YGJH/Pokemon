@@ -33,8 +33,17 @@ class Encoder(nn.Module):
         Number of transformer layers (4).
     ff : int
         Feed-forward hidden dim (1024).
-    dropout : float
-        Dropout probability (0.1).
+    attn_dropout : float
+        Dropout on the *attention weights* (``self_attn.dropout``), i.e. inside
+        the softmax.  Held at 0.0 by default even when ``ffn_dropout`` is on --
+        see the note above on why this site is the expensive one here.
+    ffn_dropout : float
+        Dropout on the other three sites: inside the FFN after the activation,
+        and on each of the two residual branches (``dropout1``/``dropout2``).
+
+    Both default to 0.0 so inference and RL rebuilds are deterministic;
+    ``ptcg_il.cli`` supplies the training rates (``--attn-dropout`` 0.0,
+    ``--ffn-dropout`` 0.1).
     """
 
     def __init__(
@@ -43,14 +52,17 @@ class Encoder(nn.Module):
         heads: int = 8,
         layers: int = 4,
         ff: int = 1024,
-        dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        ffn_dropout: float = 0.0,
     ):
         super().__init__()
+        # One constructor arg drives all four sites, so the FFN/residual rate
+        # goes in here and the attention weights are re-pointed afterwards.
         layer = nn.TransformerEncoderLayer(
             d_model=D,
             nhead=heads,
             dim_feedforward=ff,
-            dropout=dropout,
+            dropout=ffn_dropout,
             activation="gelu",
             batch_first=True,
             norm_first=True,
@@ -58,6 +70,15 @@ class Encoder(nn.Module):
         self.enc = nn.TransformerEncoder(
             layer, num_layers=layers, norm=nn.LayerNorm(D),
         )
+        # After TransformerEncoder, not before: it deep-copies `layer` N times,
+        # so a value set on the prototype would be copied but one set on
+        # `layer.self_attn` after construction would reach nothing.
+        # `MultiheadAttention.dropout` is a plain float read at forward time,
+        # which is the only seam torch gives us for splitting the two rates.
+        for enc_layer in self.enc.layers:
+            enc_layer.self_attn.dropout = float(attn_dropout)
+        self.attn_dropout = float(attn_dropout)
+        self.ffn_dropout = float(ffn_dropout)
 
     def forward(
         self, rows: torch.Tensor, tok_mask: torch.Tensor
