@@ -1961,3 +1961,248 @@ class TestSkillAndRetreatRefs:
         out2 = featurize(obs2, _build_test_vocab(_load_episode()), [0],
                          engine_card_features=_engine_card_features())
         assert out2["opt_src_idx"][0] == -1
+
+
+# ---------------------------------------------------------------------------
+# CARD-option damage preview (opt_scalar dims 6/7)
+# ---------------------------------------------------------------------------
+
+
+def _poke_e(card_id: int, serial: int, hp: int, energies: list[int] | None = None) -> dict:
+    """A Pokémon in play with explicit current HP and attached energy types."""
+    energies = list(energies or [])
+    return {
+        "id": card_id, "serial": serial, "hp": hp, "maxHp": hp,
+        "appearThisTurn": False, "energies": energies,
+        "energyCards": [{"id": 1, "serial": 900 + i, "playerIndex": 0}
+                        for i in range(len(energies))],
+        "tools": [], "preEvolution": [],
+    }
+
+
+def _obs_with_boards(my_active, my_bench, opp_active, opp_bench, options) -> dict:
+    """Minimal observation with both boards populated and a CARD select."""
+    def player(active, bench):
+        return {"active": active, "bench": bench, "benchMax": 5, "deckCount": 40,
+                "discard": [], "prize": [None] * 6,
+                "handCount": len(_HAND_STUB), "hand": list(_HAND_STUB),
+                "poisoned": False, "burned": False, "asleep": False,
+                "paralyzed": False, "confused": False}
+
+    return {
+        "select": {"type": 1, "context": 3, "minCount": 1, "maxCount": 1,
+                   "option": options},
+        "logs": [],
+        "current": {
+            "turn": 5, "turnActionCount": 0, "yourIndex": 0, "firstPlayer": 0,
+            "supporterPlayed": False, "stadiumPlayed": False,
+            "energyAttached": False, "retreated": False, "result": -1,
+            "stadium": [], "looking": None,
+            "players": [player(my_active, my_bench), player(opp_active, opp_bench)],
+        },
+    }
+
+
+_HAND_STUB = [{"id": 1121, "serial": 500, "playerIndex": 0}]
+
+# Engine ids used below, with the static data the expectations are derived from:
+#   677 Riolu       {F} 80hp  weak {P}   atk 30 for {F}
+#   305 Dunsparce   {C} 70hp  weak {F}   atk 0 for {C}, 20 for {C}{C}
+#   675 Lunatone    {F} 110hp weak {G}   atk 50 for {F}{F}
+#   676 Solrock     {F} 110hp weak {G}   atk 70 for {F}
+_F_ENERGY = 6  # EnergyType index for Fighting
+
+
+class TestCardOptionDamagePreview:
+    """CARD options that name a Pokémon in play must carry the damage preview.
+
+    Before this, ``opt_scalar`` was all-zero for every CARD option: dims 6-9 are
+    filled only in the ATTACK branch and 10-12 only in RETREAT.  A Boss's Orders
+    gust is a KO-evaluation decision with no KO feature, leaving ``src`` and
+    ``card_enc`` as the only 2 of PointerHead's 6 base terms that separate the
+    options.
+    """
+
+    def _featurize(self, obs):
+        return featurize(obs, _build_test_vocab(_load_episode()), [0],
+                         engine_card_features=_engine_card_features())
+
+    def test_opponent_targets_get_damage_ratio_over_their_own_hp(self):
+        """Gust targets are scored by my Active's best affordable attack."""
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],   # Riolu, 1 {F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],              # Solrock
+            opp_bench=[_poke_e(305, 21, 50),                 # Dunsparce, weak {F}
+                       _poke_e(675, 22, 110)],               # Lunatone, weak {G}
+            options=[{"type": 3, "area": 5, "playerIndex": 1, "index": 0},
+                     {"type": 3, "area": 5, "playerIndex": 1, "index": 1}],
+        )
+        out = self._featurize(obs)
+
+        # Riolu's 30 doubles to 60 on Dunsparce's {F} weakness -> 60/50 = 1.2
+        assert np.isclose(out["opt_scalar"][0, 6], 60.0 / 50.0), (
+            "opponent-bench target did not get my Active's weakness-adjusted "
+            "damage over its current HP"
+        )
+        assert out["opt_scalar"][0, 7] == 1.0, "60 damage into 50 HP is a KO"
+
+        # Lunatone is weak to {G}, not {F} -> 30 undoubled, 30/110
+        assert np.isclose(out["opt_scalar"][1, 6], 30.0 / 110.0)
+        assert out["opt_scalar"][1, 7] == 0.0, "30 damage into 110 HP is not a KO"
+
+    def test_weakness_is_what_separates_the_two_gust_targets(self):
+        """The KO flag must come from weakness, not from raw damage."""
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[_poke_e(305, 21, 50), _poke_e(675, 22, 110)],
+            options=[{"type": 3, "area": 5, "playerIndex": 1, "index": 0},
+                     {"type": 3, "area": 5, "playerIndex": 1, "index": 1}],
+        )
+        out = self._featurize(obs)
+        # Undoubled, 30 into 50 HP would be 0.6 and no KO.  The flag flipping
+        # is the whole signal a gust decision needs.
+        assert out["opt_scalar"][0, 6] > 1.0 > out["opt_scalar"][1, 6]
+        assert out["opt_scalar"][0, 7] > out["opt_scalar"][1, 7]
+
+    def test_my_own_targets_get_offense_and_an_incoming_ko_flag(self):
+        """Promote/switch candidates: what it does, and whether it survives."""
+        obs = _obs_with_boards(
+            my_active=[],                                    # just got KO'd
+            my_bench=[_poke_e(677, 10, 80, [_F_ENERGY]),     # Riolu, 1 {F}
+                      _poke_e(305, 11, 70)],                 # Dunsparce, 0 energy
+            opp_active=[_poke_e(676, 20, 110)],              # Solrock, 70 for {F}
+            opp_bench=[],
+            options=[{"type": 3, "area": 5, "playerIndex": 0, "index": 0},
+                     {"type": 3, "area": 5, "playerIndex": 0, "index": 1}],
+        )
+        out = self._featurize(obs)
+
+        # Riolu: 30 into Solrock (weak {G}, so undoubled) over 110 HP
+        assert np.isclose(out["opt_scalar"][0, 6], 30.0 / 110.0)
+        # Solrock's 70 does not KO an 80 HP Riolu (Riolu is weak to {P})
+        assert out["opt_scalar"][0, 7] == 0.0
+
+        # Dunsparce has no energy, so no attack is affordable
+        assert out["opt_scalar"][1, 6] == 0.0, (
+            "an unaffordable attack must not count as offense"
+        )
+        # Solrock's 70 doubles on Dunsparce's {F} weakness -> 140 into 70 HP
+        assert out["opt_scalar"][1, 7] == 1.0, (
+            "incoming weakness ignored — this candidate dies on promotion"
+        )
+
+    def test_hand_targets_stay_zero(self):
+        """CARD options naming a hand card must not read a poke slot."""
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[],
+            options=[{"type": 3, "area": 2, "playerIndex": 0, "index": 0}],
+        )
+        out = self._featurize(obs)
+        assert out["opt_src_idx"][0] >= 13, "hand cards live on rows 13..42"
+        assert out["opt_scalar"][0, 6] == 0.0
+        assert out["opt_scalar"][0, 7] == 0.0
+
+    def test_missing_card_tables_leave_the_preview_at_zero(self):
+        """No static features means no damage information, not a garbage ratio."""
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[_poke_e(305, 21, 50)],
+            options=[{"type": 3, "area": 5, "playerIndex": 1, "index": 0}],
+        )
+        out = featurize(obs, _build_test_vocab(_load_episode()), [0])
+        assert out["opt_scalar"][0, 6] == 0.0
+        assert out["opt_scalar"][0, 7] == 0.0
+
+    def test_attack_options_keep_their_own_preview(self):
+        """Dims 6/7 are shared with ATTACK; the ATTACK reading must not regress."""
+        ep = _load_episode()
+        vocab = _build_test_vocab_with_attacks(ep)
+        ecf, eaf = _engine_card_features(), _engine_attack_features()
+        n_checked = 0
+        for step_idx in range(len(ep["steps"]) - 1):
+            for player in (0, 1):
+                rec = ep["steps"][step_idx][player]
+                if rec.get("status") != "ACTIVE":
+                    continue
+                sel = rec["observation"].get("select")
+                if sel is None:
+                    continue
+                atk = [j for j, o in enumerate(sel["option"])
+                       if int(o["type"]) == 13]
+                if not atk:
+                    continue
+                obs, action = _get_active_step(ep, step_idx, player)
+                out = featurize(obs, vocab, action, engine_card_features=ecf,
+                                engine_attack_features=eaf)
+                for j in atk:
+                    assert 0.0 <= out["opt_scalar"][j, 6] <= 2.0
+                    assert out["opt_scalar"][j, 7] in (0.0, 1.0)
+                    n_checked += 1
+        assert n_checked > 0, "fixture offered no ATTACK options — test is vacuous"
+
+
+class TestAffordabilityTolerance:
+    """Energy counts and attack costs round-trip through *different* divisors.
+
+    ``poke_feat``'s histogram is normalised by ``ENERGY_N`` and an attack's cost
+    block by ``ATKCOST_N``, so "1 energy" and "costs 1" come back as 1.0 and
+    1.00000001.  A bare ``<`` then calls an exactly-paid attack unaffordable —
+    which is the single most common board state in the game.
+    """
+
+    def test_exactly_paid_cost_is_affordable(self):
+        from ptcg_il.featurizer import _attack_is_affordable
+
+        cost = np.zeros(12)
+        cost[_F_ENERGY] = 1.00000001   # as denormalised from the static table
+        have = np.zeros(12)
+        have[_F_ENERGY] = 1.0          # as denormalised from poke_feat
+        assert _attack_is_affordable(cost, have), (
+            "an attack whose cost is exactly met read as unaffordable"
+        )
+
+    def test_genuinely_short_energy_is_still_unaffordable(self):
+        """The tolerance must not swallow a whole missing energy."""
+        from ptcg_il.featurizer import _attack_is_affordable
+
+        cost = np.zeros(12)
+        cost[_F_ENERGY] = 2.0
+        have = np.zeros(12)
+        have[_F_ENERGY] = 1.0
+        assert not _attack_is_affordable(cost, have)
+
+    def test_wrong_colour_is_still_unaffordable(self):
+        from ptcg_il.featurizer import _attack_is_affordable
+
+        cost = np.zeros(12)
+        cost[_F_ENERGY] = 1.0
+        have = np.zeros(12)
+        have[1] = 1.0  # a Grass energy does not pay a Fighting cost
+        assert not _attack_is_affordable(cost, have)
+
+    def test_ko_pressure_sees_an_exactly_paid_attack(self):
+        """The CLS offense features were reading 0.0 on the common case."""
+        from ptcg_il.featurizer import _build_poke_tokens, _feat_gatherer, _ko_pressure
+
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],   # Riolu, exactly 1 {F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],              # Solrock
+            opp_bench=[],
+            options=[],
+        )
+        poke_id, poke_feat, _, _ = _build_poke_tokens(obs["current"], 0)
+        poke_card_feat = _feat_gatherer(_engine_card_features(), F_CARD)(poke_id)
+        my_ratio, can_ko, _, _ = _ko_pressure(poke_card_feat, poke_feat)
+        assert np.isclose(my_ratio, 30.0 / 110.0), (
+            "my_ratio stayed 0.0 with an exactly-affordable attack"
+        )
+        assert can_ko == 0.0

@@ -38,12 +38,16 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # Default hyperparameters (C.10)
 # ============================================================
+import random
+d_model = random.choice([128,256,512])
+layers  = random.randint(4, 10)
+heads   = random.choice([2, 4, 8])
 DEFAULTS = {
     # Model
-    "d_model": 256,
-    "layers": 6,
-    "heads": 4,
-    "ff": 1024,
+    "d_model": d_model,
+    "layers": layers,
+    "heads": heads,
+    "ff": 4*d_model,
     # Split by site.  Attention-weight dropout stays off: the encoder runs over
     # 46 structured entity tokens (CLS + Pokemon slots + hand + summaries +
     # stadium), so dropping a key severs a specific fact rather than adding

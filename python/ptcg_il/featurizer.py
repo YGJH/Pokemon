@@ -281,13 +281,24 @@ def _effective_damage(base, atk_type, weakness, resistance) -> float:
     return max(dmg, 0.0)
 
 
+# Attached-energy counts reach the comparison denormalised by ENERGY_N and
+# attack costs by ATKCOST_N, so the same integer "1" arrives as 1.0 down one
+# path and 1.00000001 down the other.  A bare `<` then calls an exactly-paid
+# attack unaffordable -- which is the most common board state in the game, and
+# it fails *silently*: `_ko_pressure`'s my_ratio/can_ko_opp simply read 0.0,
+# indistinguishable from "no attack reaches".  Both sides are integer counts,
+# so any tolerance below 1 is safe; 1e-3 is far above fp32 noise and far below
+# one energy.
+_ENERGY_EPS = 1e-3
+
+
 def _attack_is_affordable(cost_hist, attached_hist) -> bool:
     """Colorless (index 0) accepts any energy; colored costs need their colour."""
     cost = np.asarray(cost_hist, dtype=np.float64)
     have = np.asarray(attached_hist, dtype=np.float64)
-    if cost[1:].sum() > 0 and np.any(have[1:] < cost[1:]):
+    if cost[1:].sum() > 0 and np.any(have[1:] < cost[1:] - _ENERGY_EPS):
         return False
-    return have.sum() >= cost.sum()
+    return have.sum() >= cost.sum() - _ENERGY_EPS
 
 
 def _best_damage(attacker_row, defender_row, attached_hist, require_affordable):
@@ -373,6 +384,76 @@ def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
         _onehot_index(defender[_CARD_RESISTANCE]),
     )
     return min(dmg / tgt_hp, 2.0)
+
+
+def _card_target_preview(
+    src_slot: int,
+    poke_card_feat: np.ndarray | None,
+    poke_feat: np.ndarray | None,
+) -> tuple[float, float]:
+    """``(damage_ratio, ko_flag)`` for a CARD option naming a Pokémon in play.
+
+    Mirrors the ATTACK branch's ``opt_scalar`` dims 6/7 for *target selection*.
+    Those dims were filled only for ``otype == 13``, and 10-12 only for RETREAT,
+    so a CARD option carried an all-zero scalar — leaving ``src`` and
+    ``card_enc`` as the only 2 of PointerHead's 6 additive base terms that
+    separate the options.  Gust, switch, promote-after-KO and heal are all
+    KO-evaluation decisions with no KO feature.
+
+    The two sides answer different questions on purpose:
+
+    * **opponent slots (6..11)** — my Active's best *affordable* attack against
+      this target, over the target's current HP; ``ko_flag`` = I can KO it.
+      This is the Boss's Orders decision: which of their board can I kill.
+    * **my slots (0..5)** — this candidate's best *affordable* attack against
+      their Active, over that Active's HP; ``ko_flag`` = their Active KOs *this
+      candidate*.  This is the promote-after-KO decision: what it threatens,
+      and whether it survives arriving.
+
+    Note the deliberate polarity flip on ``ko_flag``: opportunity on their side,
+    danger on mine.  ``opt_type`` and ``src`` are both in the pointer's additive
+    base, so the head can tell the two readings apart.
+
+    Returns ``(0.0, 0.0)`` whenever the slot, the attacker or the static tables
+    are unresolvable — the same "no information" signal a PAD row carries.
+    """
+    if poke_card_feat is None or poke_feat is None:
+        return 0.0, 0.0
+    if not (0 <= src_slot < P_MAX):
+        return 0.0, 0.0
+
+    target = poke_card_feat[src_slot]
+    if not np.asarray(target).any():
+        return 0.0, 0.0
+
+    if src_slot >= 6:
+        # Their board: what can my Active do to it?
+        attacker = poke_card_feat[0]
+        if not np.asarray(attacker).any():
+            return 0.0, 0.0
+        tgt_hp = float(poke_feat[src_slot][0]) * HP_N
+        if tgt_hp <= 0.0:
+            return 0.0, 0.0
+        my_energy = np.asarray(poke_feat[0][3:15], dtype=np.float64) * ENERGY_N
+        dmg = _best_damage(attacker, target, my_energy, require_affordable=True)
+        ratio = min(dmg / tgt_hp, 2.0)
+        return ratio, (1.0 if ratio >= 1.0 else 0.0)
+
+    # My board: what does this candidate threaten, and does it survive arriving?
+    opp_active = poke_card_feat[6]
+    if not np.asarray(opp_active).any():
+        return 0.0, 0.0
+    opp_hp = float(poke_feat[6][0]) * HP_N
+    cand_hp = float(poke_feat[src_slot][0]) * HP_N
+    cand_energy = np.asarray(poke_feat[src_slot][3:15], dtype=np.float64) * ENERGY_N
+
+    dmg = _best_damage(target, opp_active, cand_energy, require_affordable=True)
+    ratio = min(dmg / opp_hp, 2.0) if opp_hp > 0.0 else 0.0
+    # Incoming damage ignores affordability: their Active's energy is theirs to
+    # spend next turn, and the corpus shows it usually already can.
+    incoming = _best_damage(opp_active, target, None, require_affordable=False)
+    ko = 1.0 if (cand_hp > 0.0 and incoming >= cand_hp) else 0.0
+    return ratio, ko
 
 
 def _best_bench_damage_ratio(
@@ -1109,6 +1190,17 @@ def _build_option_tokens(
                 opt_card_id[new_j] = _raw_card(cid)
             else:
                 _set_card(area, player_idx, index)
+            # Damage preview, sharing dims 6/7 with ATTACK.  `opt_src_idx` is a
+            # state-token row, and only rows 1..P_MAX are Pokémon slots — hand
+            # rows (13..42), the stadium row and -1 must stay at 0.0 rather
+            # than indexing a poke slot that describes a different card.
+            src_row = int(opt_src_idx[new_j])
+            if 1 <= src_row <= P_MAX:
+                ratio, ko = _card_target_preview(
+                    src_row - 1, poke_card_feat, poke_feat,
+                )
+                opt_scalar[new_j, 6] = ratio
+                opt_scalar[new_j, 7] = ko
 
         elif otype in (4, 5, 6):  # TOOL_CARD, ENERGY_CARD, ENERGY
             area = opt.get("area")
