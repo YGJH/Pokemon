@@ -732,6 +732,7 @@ def _select_multi_raw(
     stop_column: torch.Tensor | None = None,
     pointers: list[PointerHead] | None = None,
     h_list: list[torch.Tensor] | None = None,
+    card_encs: list[nn.Module] | None = None,
 ) -> torch.Tensor:
     """Low-level greedy AR multi-select inference (Appendix B.7).
 
@@ -754,6 +755,11 @@ def _select_multi_raw(
         Maximum picks per sample.
     stop_column : int64 Tensor[B] or None
         STOP column index per sample (-1 = no STOP / single-select).
+    pointers, h_list, card_encs : list or None
+        Ensemble mode: element *i* of each list belongs to member *i* and they
+        are used together.  Members may differ in ``D``, so nothing D-shaped
+        may be shared across them — ``card_encs[i]`` and the msgru hidden
+        state below are both sized from member *i*, not from *card_enc*/*h*.
 
     Returns
     -------
@@ -777,12 +783,25 @@ def _select_multi_raw(
                 f"got {len(pointers)} and {len(h_list)}"
             )
         N = len(pointers)
+        if card_encs is None:
+            card_encs = [card_enc] * N
+        elif len(card_encs) != N:
+            raise ValueError(
+                f"card_encs must have same length as pointers, "
+                f"got {len(card_encs)} and {N}"
+            )
     else:
         N = 1
 
-    # Multi-select GRU hidden state(s) — fp32, GRU runs outside autocast
+    # Multi-select GRU hidden state(s) — fp32, GRU runs outside autocast.
+    # Sized per member: ``msgru_h_list[i]`` is added to member i's option
+    # representation and fed to member i's GRUCell, so a shared ``D`` taken
+    # from ``h`` would be member 0's for everyone.
     if is_ensemble:
-        msgru_h_list = [torch.zeros(B, D, device=device, dtype=torch.float32) for _ in range(N)]
+        msgru_h_list = [
+            torch.zeros(B, h_i.shape[-1], device=device, dtype=torch.float32)
+            for h_i in h_list
+        ]
     else:
         msgru_h = torch.zeros(B, D, device=device, dtype=torch.float32)
 
@@ -795,7 +814,9 @@ def _select_multi_raw(
             all_logits: list[torch.Tensor] = []
             all_o: list[torch.Tensor] = []
             for i in range(N):
-                li, oi = pointers[i](h_list[i], tok_mask, card_enc, x, msgru_h=msgru_h_list[i])
+                li, oi = pointers[i](
+                    h_list[i], tok_mask, card_encs[i], x, msgru_h=msgru_h_list[i]
+                )
                 # Mask STOP column for samples that haven't reached minCount yet
                 if stop_column is not None:
                     t_tensor = torch.tensor(t, device=device)

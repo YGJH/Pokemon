@@ -1096,7 +1096,7 @@ def train(
                 wandb_logger.mark_best(step + 1, sel_metric)
 
                 with ema.applied(policy):
-                    ckpt_path = save_checkpoint(
+                    save_checkpoint(
                         policy, optimizer, scheduler, ema,
                         step=step + 1,
                         save_dir=save_dir,
@@ -1104,14 +1104,6 @@ def train(
                         deck=deck_meta,
                     )
                 policy.train()
-                # Log checkpoint as W&B artifact (C.9)
-                wandb_logger.log_artifact(str(ckpt_path), artifact_type="model", aliases=["best"])
-                # Attach vocab + archetypes
-                _data_dir = Path(data_dir)
-                for fname in ("vocab.json", "archetypes.json"):
-                    fp = _data_dir / fname
-                    if fp.exists():
-                        wandb_logger.log_artifact(str(fp), artifact_type=fname.split(".")[0])
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
@@ -1134,21 +1126,13 @@ def train(
 
     # Final checkpoint (last)
     ema.apply(policy)
-    last_ckpt_path = save_checkpoint(
+    save_checkpoint(
         policy, optimizer, scheduler, ema,
         step=total_steps,
         save_dir=save_dir,
         tag="last",
         deck=deck_meta,
     )
-    # Log last checkpoint as W&B artifact (C.9)
-    wandb_logger.log_artifact(str(last_ckpt_path), artifact_type="model", aliases=["last"])
-    # Attach vocab + archetypes
-    _data_dir = Path(data_dir)
-    for fname in ("vocab.json", "archetypes.json"):
-        fp = _data_dir / fname
-        if fp.exists():
-            wandb_logger.log_artifact(str(fp), artifact_type=fname.split(".")[0])
 
     # Deck sidecar — same record as the one inside the .pt, but readable
     # without torch, and also emits deck.csv for the submission bundle.

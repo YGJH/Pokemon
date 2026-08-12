@@ -725,3 +725,78 @@ def test_train_forwards_group_marginal_flag(tmp_path):
         batch_size=4, total_steps=1, val_every=10_000, run_val=False,
         group_marginal=False, archetype_self=0,
     )
+
+
+# ============================================================
+# IL training must not upload anything to W&B
+# ============================================================
+
+
+class _MetricsOnlyLogger:
+    """A logger exposing only the *metric* surface of ``WandbLogger``.
+
+    Any attempt by the training loop to upload a checkpoint, vocab or
+    archetypes file raises ``AttributeError`` here rather than silently
+    shipping bytes to a remote service.
+    """
+
+    active = False
+
+    # State the real WandbLogger carries and the loop reads back.
+    _active = False
+    _run = None
+    _best_macro = 0.0
+    _best_step = 0
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def _record(self, name):
+        def _fn(*args, **kwargs):
+            self.calls.append(name)
+        return _fn
+
+    def __getattr__(self, name):
+        if name in {"log_train", "log_eval", "mark_best", "alert", "finish",
+                    "log", "summary"}:
+            return self._record(name)
+        raise AttributeError(
+            f"training called logger.{name!r} — IL training must not upload "
+            f"artifacts to W&B"
+        )
+
+
+def test_wandb_logger_has_no_artifact_upload():
+    """The capability is removed, not merely unused."""
+    assert not hasattr(WandbLogger, "log_artifact"), (
+        "WandbLogger still exposes log_artifact — the upload path is one call "
+        "away from coming back"
+    )
+
+
+def test_training_uploads_nothing_to_wandb(tmp_path):
+    """A full train() to completion must never reach for an upload method."""
+    import json
+    data_dir = _build_tiny_data(num_samples=8)
+    (data_dir / "archetypes.json").write_text(json.dumps({
+        "archetypes": [
+            {"id": 0, "representative": [7] * 60, "members": 10,
+             "decklist": [7] * 60},
+        ],
+        "fixed_deck": [7] * 60,
+        "lineage": {"seeded": False, "generation": 0},
+    }))
+    # vocab.json is one of the files the removed code used to attach.
+    (data_dir / "vocab.json").write_text(json.dumps({"size": 8, "id_to_index": {}}))
+
+    spy = _MetricsOnlyLogger()
+    loop_train(
+        _tiny_policy(), data_dir=data_dir, save_dir=tmp_path / "ckpt",
+        batch_size=4, total_steps=1, val_every=10_000, run_val=False,
+        archetype_self=0, wandb_logger=spy,
+    )
+    # The checkpoint must still be written to disk — removing the upload must
+    # not remove the local save.
+    assert list((tmp_path / "ckpt").glob("ckpt-*.pt")), (
+        "no checkpoint on disk — the local save was removed along with the upload"
+    )

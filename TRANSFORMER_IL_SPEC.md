@@ -274,7 +274,8 @@ Ship `main.py` + `deck.csv` (FIXED_DECK) + `cg/` + weights; loaded from `/kaggle
    𝒟. Cache to tensor shards.
 3. **Model**: embeddings + encoder + pointer head + value head.
 4. **Train loop**: weighted CE + value aux; per-context metrics; **W&B logging from step 1** (train
-   scalars, per-context val table, live win-rate, model artifacts — Appendix C.9).
+   scalars, per-context val table, live win-rate — Appendix C.9). Metrics only: checkpoints are
+   never uploaded.
 5. **Eval harness**: live-engine win-rate vs baselines.
 6. Later specs: `logs` belief module (GRU/attention), RL fine-tune (PPO self-play / AlphaZero with the
    engine's `search_begin/step`).
@@ -853,7 +854,7 @@ for step, batch in enumerate(loader):
     opt.step(); sched.step(); opt.zero_grad(set_to_none=True); ema.update(policy)
     if step % LOG_EVERY == 0:   wandb.log(train_signals(loss, ce, value, grad_norm, sched), step=step)  # C.9
     if step % VAL_EVERY == 0:   offline_eval(ema, val_loader)      # C.8 → wandb.log(step)
-    if step % CKPT_EVERY == 0:  save_ckpt(step, policy, ema, opt, sched)   # + wandb.Artifact (C.7)
+    if step % CKPT_EVERY == 0:  save_ckpt(step, policy, ema, opt, sched)   # local only (C.7)
 ```
 Live eval is run **after training completes** (not inline on the GPU step), wrapping the EMA policy as
 `agent()` and running head-to-head games against baseline opponents in a separate process pool.
@@ -872,9 +873,10 @@ ema, opt, sched, rng}`. The **submission bundle** is assembled from the best-val
 submission/  main.py  deck.csv(=FIXED_DECK)  cg/  weights.pt(ema)  vocab.json  archetypes.json
 ```
 `vocab.json` (id/attack remaps + norm constants + caps) is the contract between the featurizer used in
-training and the one inside `agent()`. Pin it; never re-mine vocab without retraining. Mirror each
-best-val/last checkpoint to W&B as a versioned `wandb.Artifact` (C.9) with `vocab.json`/`archetypes.json`
-attached, so a run is fully recoverable — and diffable — from the tracker alone.
+training and the one inside `agent()`. Pin it; never re-mine vocab without retraining. Checkpoints,
+`vocab.json` and `archetypes.json` stay **local to `--out-dir`/`--data-dir`** — nothing is uploaded to
+W&B (C.9). Every checkpoint already pins `vocab_sha1`/`archetypes_sha1` in its `"deck"` record, and
+`decks.json` sidecars the same information, so a run is reconstructible from disk without the tracker.
 
 ## C.8 Eval cadence
 Two tiers — cheap offline metrics often, expensive live games rarely.
@@ -928,9 +930,11 @@ training-only dependency (`uv add --group train wandb`)**: it is never imported 
 - `live/game_len_mean@{o}`, `live/illegal_action_rate@{o}` (**must be 0**)
 - `live/oov_rate` (fraction of opponent cards hitting `UNKNOWN`, §1.2/§5)
 
-**Checkpoints as artifacts:** log best-val and last as a `wandb.Artifact(type="model")` (C.7),
-aliasing the promoted one `best`; attach `vocab.json`/`archetypes.json` so the submission bundle is
-recoverable from W&B alone.
+**No artifact uploads.** W&B carries **metrics only**. Checkpoints, `vocab.json` and `archetypes.json`
+are written to disk and never mirrored to the tracker — `wandb.Artifact` is not used anywhere in
+training. Reproducibility comes from the local artifacts instead: each `.pt` stamps its `"deck"`
+record with `vocab_sha1`/`archetypes_sha1` (C.7), and `decks.json`/`deck.csv` sidecar the same
+information next to the checkpoints.
 
 **Error handling:** NaN/Inf loss triggers an early-stop break. Illegal actions at live eval are
 logged as metrics; a non-zero rate is a hard bug (engine err 4/5/6) to fix before the next run.

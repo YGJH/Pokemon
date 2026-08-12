@@ -281,6 +281,72 @@ class TestEnsemblePolicySelectMulti:
                 if p >= 0:
                     assert p < 8, f"Sample {b}: pick {p} out of range"
 
+    def test_heterogeneous_dims(self):
+        """Members with different D multi-select together.
+
+        ``from_checkpoints`` advertises heterogeneous architectures, and the
+        real ensembles are heterogeneous (archetype 0's seeds are D=128/256/512).
+        Every D-dependent term inside the AR loop must therefore come from the
+        member it is added to: the card encoder feeding ``pointers[i]`` and the
+        msgru hidden state, neither of which member 0 can supply for member i.
+        """
+        m0 = _make_member(D=256, heads=8, layers=2, ff=512, seed=0)
+        m1 = _make_member(D=128, heads=4, layers=2, ff=256, seed=1)
+        m2 = _make_member(D=512, heads=8, layers=2, ff=1024, seed=2)
+        ensemble = EnsemblePolicy(nn.ModuleList([m0, m1, m2]))
+        ensemble.eval()
+
+        x = _make_synthetic_batch(4, max_count=3)
+        x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
+        x["minCount"] = torch.full((4,), 1, dtype=torch.long)
+
+        chosen = select_multi(ensemble, x)
+        assert chosen.shape == (4, 3)
+        for b in range(4):
+            picks = [int(p) for p in chosen[b].tolist() if p >= 0]
+            assert len(set(picks)) == len(picks), f"Sample {b}: duplicate picks {picks}"
+            for p in picks:
+                assert p < 8, f"Sample {b}: pick {p} out of range"
+
+    def test_each_member_pointer_gets_its_own_card_encoder(self):
+        """Member *i*'s pointer is called with member *i*'s card encoder.
+
+        Same-D members hide a shared encoder: it still runs and only changes
+        the numbers.  Perturbation cannot isolate it either — ``embed.card``
+        also feeds the state tokens — so this asserts identity at the call.
+        """
+        members = [_make_member(D=256, heads=8, layers=2, ff=512, seed=s)
+                   for s in range(3)]
+        ensemble = EnsemblePolicy(nn.ModuleList(members))
+        ensemble.eval()
+
+        seen: dict[int, list] = {}
+
+        def spy(i, member):
+            orig = member.pointer.forward
+
+            def fwd(h, tok_mask, card_enc, x, msgru_h=None):
+                seen.setdefault(i, []).append(card_enc)
+                return orig(h, tok_mask, card_enc, x, msgru_h=msgru_h)
+            member.pointer.forward = fwd
+
+        for i, m in enumerate(members):
+            spy(i, m)
+
+        x = _make_synthetic_batch(4, max_count=3)
+        x["maxCount"] = torch.full((4,), 3, dtype=torch.long)
+        x["minCount"] = torch.full((4,), 1, dtype=torch.long)
+        select_multi(ensemble, x)
+
+        assert set(seen) == {0, 1, 2}, f"not every member's pointer ran: {sorted(seen)}"
+        for i, m in enumerate(members):
+            assert seen[i], f"member {i}'s pointer was never called"
+            for enc in seen[i]:
+                assert enc is m.embed.card, (
+                    f"member {i}'s pointer got a card encoder belonging to "
+                    f"another member"
+                )
+
     def test_single_member_ensemble_matches_policy(self):
         """1-member ensemble select_multi matches single Policy select_multi."""
         torch.manual_seed(42)

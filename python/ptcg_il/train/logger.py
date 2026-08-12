@@ -204,40 +204,6 @@ class WandbLogger:
                 wandb.run.summary["val/best_top1_macro"] = macro_top1
                 wandb.run.summary["val/best_step"] = step
 
-    def log_artifact(
-        self,
-        path: str,
-        artifact_type: str = "model",
-        name: str | None = None,
-        aliases: list[str] | None = None,
-    ) -> None:
-        """Log a checkpoint artifact to W&B (C.9).
-
-        Parameters
-        ----------
-        path : str
-            Path to the file/directory.
-        artifact_type : str
-            "model", "vocab", etc.
-        name : str or None
-            Artifact name; defaults to the filename.
-        aliases : list[str] or None
-            E.g. ``["best"]`` for the promoted checkpoint.
-        """
-        if not self._active:
-            return
-        wandb = _get_wandb()
-        if wandb is False:
-            return
-        import os as _os
-        name = name or _os.path.basename(path)
-        artifact = wandb.Artifact(name=name, type=artifact_type)
-        if _os.path.isdir(path):
-            artifact.add_dir(path)
-        else:
-            artifact.add_file(path)
-        wandb.log_artifact(artifact, aliases=aliases or [])
-
     def alert(
         self,
         title: str,

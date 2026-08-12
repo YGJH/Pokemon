@@ -204,17 +204,23 @@ class EnsemblePolicy(nn.Module):
         # Pre-encode each member
         pointers: list = []
         h_list: list[torch.Tensor] = []
+        card_encs: list = []
         xs: list[dict] = []
         for member in self.members:
             x_i, h_i, _hist_i = member._encode(x, history_h)
             pointers.append(member.pointer)
             h_list.append(h_i)
+            card_encs.append(member.embed.card)
             xs.append(x_i)
         # Members share one corpus and therefore one static table, so every
         # x_i is the same gather; the pointer call below takes the first.
         x = xs[0]
 
         stop_col = x.get("stop_column")
+        # Members may differ in D (the seed sweeps vary it), so every D-shaped
+        # argument is passed per member: ``card_encs[i]`` goes to
+        # ``pointers[i]``.  The leading positional args are member 0's and are
+        # unused in ensemble mode.
         return _select_multi_raw(
             self.members[0].pointer,
             h_list[0],
@@ -226,6 +232,7 @@ class EnsemblePolicy(nn.Module):
             stop_column=stop_col,
             pointers=pointers,
             h_list=h_list,
+            card_encs=card_encs,
         )
 
     def belief_logits(
