@@ -77,15 +77,13 @@ def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> int:
     """Load *ckpt_sd* into *policy*, handling size-mismatched ``*.static`` params.
 
     For any parameter whose checkpoint shape differs from the model, only
-    the overlapping prefix is copied.  Everything else is loaded as-is.
-    Missing belief-head keys are tolerated.
+    the overlapping prefix is copied.  Everything else is loaded as-is; keys
+    the checkpoint does not carry are left at their initial values.
     """
     loaded = 0
     for key, model_param in model_sd.items():
         ckpt_param = ckpt_sd.get(key)
         if ckpt_param is None:
-            if key.startswith("belief_heads."):
-                continue
             continue
         if ckpt_param.shape != model_param.shape:
             slices = tuple(

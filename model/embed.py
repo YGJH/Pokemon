@@ -18,7 +18,14 @@ P_MAX = 12
 H_MAX = 30
 SUM = 2
 
-from model.featurizer import F_GLOBAL, F_HAND, F_POKE, F_SUM
+from model.featurizer import (
+    CLS_HAS_CONTEXT_CARD,
+    CLS_HAS_EFFECT,
+    F_GLOBAL,
+    F_HAND,
+    F_POKE,
+    F_SUM,
+)
 
 # Normalizer for discard sum-pooling (A.2)
 DECK_N = 60.0
@@ -75,8 +82,10 @@ class TokenEmbedder(nn.Module):
         rows = torch.zeros(B, L_STATE, self.D, device=device)
 
         # --- CLS token (row 0) ---
-        x_has_context = x["cls_feat"][:, 87:88]   # [B, 1]
-        x_has_effect = x["cls_feat"][:, 88:89]    # [B, 1]
+        c = CLS_HAS_CONTEXT_CARD
+        e = CLS_HAS_EFFECT
+        x_has_context = x["cls_feat"][:, c:c + 1]   # [B, 1]
+        x_has_effect = x["cls_feat"][:, e:e + 1]    # [B, 1]
 
         cls_tok = self.cls_mlp(x["cls_feat"])                                              # [B, D]
         cls_tok = cls_tok + self.card(x["context_card_feat"]).squeeze(1) * x_has_context  # [B, D]
@@ -84,7 +93,21 @@ class TokenEmbedder(nn.Module):
         rows[:, 0] = cls_tok
 
         # --- Pokemon tokens (rows 1..12) ---
+        # Attached Tools and Energy cards are pooled in the same mask-aware way
+        # the discard pile is pooled below.  Without them a Pokemon token knows
+        # only *how many* cards are attached (poke_feat[16]/[17]), so a
+        # defensive Tool and an offensive one are the same token, and a Special
+        # Energy is indistinguishable from a basic of the same type.
         poke_emb = self.poke_mlp(x["poke_feat"]) + self.card(x["poke_card_feat"])  # [B, P_MAX, D]
+        for key in ("poke_tool_feat", "poke_energy_feat"):
+            feat = x.get(key)
+            if feat is None:      # shards written before attachments were kept
+                continue
+            emb = self.card(feat)                                       # [B,P,N,D]
+            # All-zero rows are PAD (no such attachment, or a card the engine
+            # has no features for) — the same sentinel the prize pooling reads.
+            mask = (feat.abs().sum(-1) > 0).to(emb.dtype).unsqueeze(-1)  # [B,P,N,1]
+            poke_emb = poke_emb + (emb * mask).sum(dim=2)                # [B,P,D]
         rows[:, 1:13] = poke_emb
 
         # --- Hand tokens (rows 13..42) ---

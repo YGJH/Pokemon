@@ -120,6 +120,31 @@ impl PuctTree {
         counts.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
         counts
     }
+
+    /// Per-root-child `(option_index, mean_value, visits, player_role)`.
+    ///
+    /// Diagnostic only.  Visit counts alone cannot say *why* the search
+    /// preferred an option: a child can lead on visits because its Q is high
+    /// or because its prior is, and those call for opposite fixes.  `Q` is in
+    /// the root player's frame (`expand_leaf` orients before backup), so these
+    /// are directly comparable across children, and `player_role` exposes
+    /// whether the child is a node the opponent moves at — the asymmetry that
+    /// makes "end the turn" structurally unlike every other option.
+    pub fn child_stats(&self) -> Vec<(i32, f64, u32, u8)> {
+        let root = &self.nodes[0];
+        root.children
+            .iter()
+            .map(|&c| {
+                let child = &self.nodes[c];
+                let q = if child.visits > 0.0 {
+                    child.total_value / child.visits
+                } else {
+                    f64::NAN
+                };
+                (child.action.unwrap_or(-1), q, child.visits as u32, child.player_role)
+            })
+            .collect()
+    }
 }
 
 // ── PUCT formula ──────────────────────────────────────────────────────────
@@ -234,6 +259,36 @@ pub(crate) fn select_leaf(
         if tree.selection_path.len() > config.max_depth as usize {
             return Ok(current);
         }
+    }
+}
+
+/// `player_role` for an observation: 0 = the root player moves, 1 = the other.
+///
+/// The engine's `yourIndex` is an **absolute seat**, while `player_role` is
+/// relative to whoever owns the search — `expand_leaf` negates the network's
+/// value exactly when it is 1, and `puct_score` minimises exactly when it is 1.
+/// Assigning `yourIndex` straight into it is therefore only correct when the
+/// root player happens to sit in seat 0; from seat 1 every node in the tree
+/// gets the opposite role, so the search negates its own value at its own
+/// nodes and maximises the opponent's — it plays to lose, in half of all games,
+/// with no error anywhere.
+///
+/// Defaults to 0 (the root player) when the observation carries no
+/// `yourIndex`, which matches the previous behaviour for a malformed
+/// observation: treat it as our own node rather than silently flipping a sign.
+fn role_of(current: &Option<serde_json::Value>, our_player_index: i32) -> u8 {
+    match current
+        .as_ref()
+        .and_then(|c| c.get("yourIndex").and_then(|v| v.as_i64()))
+    {
+        Some(seat) => {
+            if seat as i32 == our_player_index {
+                0
+            } else {
+                1
+            }
+        }
+        None => 0,
     }
 }
 
@@ -407,13 +462,9 @@ pub(crate) fn realise_child(
         None
     };
 
-    // Determine player role from the observation.
-    let player_role = obs
-        .current
-        .as_ref()
-        .and_then(|c| c.get("yourIndex").and_then(|v| v.as_i64()))
-        .map(|v| v as u8)
-        .unwrap_or(0);
+    // Determine player role from the observation.  `yourIndex` is an absolute
+    // seat, `player_role` is relative to the root player — see `role_of`.
+    let player_role = role_of(&obs.current, tree.our_player_index);
 
     let obs_json = result.observation_json.clone();
 
@@ -495,12 +546,7 @@ pub fn puct_search_sync(
         None
     };
 
-    let root_player_role = root_obs
-        .current
-        .as_ref()
-        .and_then(|c| c.get("yourIndex").and_then(|v| v.as_i64()))
-        .map(|v| v as u8)
-        .unwrap_or(0);
+    let root_player_role = role_of(&root_obs.current, our_player_index);
 
     let root_node = PuctNode {
         search_id: root.search_id,
@@ -988,5 +1034,50 @@ mod tests {
         expand_leaf(&mut tree, 0, vec![0.1, 0.2, 0.3, 0.4], 0.0, "{}".to_string()).unwrap();
         assert_eq!(tree.nodes[0].children.len(), 4);
         assert_eq!(tree.nodes[0].priors, vec![0.1, 0.2, 0.3, 0.4]);
+    }
+}
+
+#[cfg(test)]
+mod role_of_tests {
+    use super::role_of;
+    use serde_json::json;
+
+    fn obs(seat: i64) -> Option<serde_json::Value> {
+        Some(json!({ "yourIndex": seat }))
+    }
+
+    /// From seat 0 the old code was accidentally right, so this passes either
+    /// way — it is here to pin that the fix did not break the common case.
+    #[test]
+    fn seat_zero_root_sees_itself_as_the_max_player() {
+        assert_eq!(role_of(&obs(0), 0), 0);
+        assert_eq!(role_of(&obs(1), 0), 1);
+    }
+
+    /// The bug: `player_role` was the raw seat, so a root player in seat 1 got
+    /// role 1 at its *own* nodes — `expand_leaf` then negated its own value and
+    /// `puct_score` minimised it, i.e. the search played to lose.
+    #[test]
+    fn seat_one_root_is_still_the_max_player() {
+        assert_eq!(role_of(&obs(1), 1), 0, "our own node must be a max node");
+        assert_eq!(role_of(&obs(0), 1), 1, "their node must be a min node");
+    }
+
+    /// Role is a relation between two seats, so it must be symmetric under
+    /// swapping which seat we occupy.
+    #[test]
+    fn role_depends_on_both_seats_not_just_the_observation() {
+        for seat in 0..2i64 {
+            for ours in 0..2i32 {
+                let expected = if seat as i32 == ours { 0 } else { 1 };
+                assert_eq!(role_of(&obs(seat), ours), expected, "seat={seat} ours={ours}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_your_index_defaults_to_our_own_node() {
+        assert_eq!(role_of(&None, 1), 0);
+        assert_eq!(role_of(&Some(json!({})), 1), 0);
     }
 }

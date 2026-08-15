@@ -136,6 +136,7 @@ class PolicyAgent:
         *,
         device: str = "cpu",
         data_dir: Any = None,
+        use_deck_guard: bool = True,
     ) -> None:
         from ptcg_il.featurizer import normalize_vocab
 
@@ -149,6 +150,11 @@ class PolicyAgent:
         # The tables are loaded on first use and dropped again by __getstate__.
         self.data_dir = str(data_dir) if data_dir is not None else None
         self._engine_tables: dict | None = None
+        # Anti-deck-out guard, matching the submission bundle's greedy agent.
+        # Built lazily (it wants the engine card table); the default ON keeps
+        # live eval measuring the same behavior the Kaggle agent ships.
+        self.use_deck_guard = use_deck_guard
+        self._guard = None
 
         policy.eval()
         policy.to(device)
@@ -190,7 +196,22 @@ class PolicyAgent:
         """Drop the loaded tables before pickling; the worker reloads them."""
         state = self.__dict__.copy()
         state["_engine_tables"] = None
+        state["_guard"] = None  # holds the card table; rebuilt on demand
         return state
+
+    def _ensure_guard(self):
+        """The shared DeckGuard, built with this agent's engine card table.
+
+        Lazy for the same reason the tables are per-process: the guard holds
+        a reference to the 1.1 MB table, which must not ride the per-job
+        pickle into every worker.
+        """
+        if self._guard is None:
+            from ptcg_il.deck_guard import DeckGuard, GuardConfig
+
+            self._guard = DeckGuard(
+                GuardConfig(), self._tables()["engine_card_features"])
+        return self._guard
 
     def __call__(self, obs_dict: dict) -> list[int]:
         import torch
@@ -210,9 +231,33 @@ class PolicyAgent:
         batch = _sample_to_batch(sample, self.device)
         max_count = int(sample["maxCount"])
 
+        guard = self._ensure_guard() if self.use_deck_guard else None
+        deck = hand = prizes = 0
+        if guard is not None:
+            # Raw state for the guard, straight from the observation.
+            cur = obs_dict.get("current") or {}
+            players = cur.get("players") or [{}]
+            me = players[int(cur.get("yourIndex", 0))]
+            deck = int(me.get("deckCount", 0) or 0)
+            hand = int(me.get("handCount", 0) or 0)
+            prizes = len(me.get("prize") or [])
+            # Mechanism A: in-place opt_mask edit; select_multi honors it too.
+            guard.apply_mask(batch, sel_type=int(sample["sel_type"]),
+                             deck=deck, hand=hand, prizes=prizes)
+
         with torch.no_grad():
             if max_count == 1:
                 logits, _value, _hist = self.policy(batch)
+                if guard is not None:
+                    j = guard.pick(logits, batch,
+                                   sel_type=int(sample["sel_type"]),
+                                   max_count=max_count,
+                                   deck=deck, hand=hand, prizes=prizes)
+                    # The STOP column means decline; its index is not a legal
+                    # answer (engine error 5).
+                    stop_raw = sample.get("stop_column", -1)
+                    stop = -1 if stop_raw is None else int(stop_raw)
+                    return [] if 0 <= stop == j else [j]
                 # A minCount==0 select carries a STOP column; picking it means
                 # declining, and returning its index would be engine error 5.
                 return decode_single_select(
@@ -250,6 +295,7 @@ def make_agent_from_policy(
     *,
     device: str = "cpu",
     data_dir: Any = None,
+    use_deck_guard: bool = True,
 ) -> Callable[[dict], list[int]]:
     """Wrap an EMA Policy as a picklable ``agent(obs_dict)`` callable.
 
@@ -257,7 +303,8 @@ def make_agent_from_policy(
     *data_dir* (the mining output directory) so the agent can load the engine
     feature tables — without it every card feature it sees is zero.
     """
-    return PolicyAgent(policy, vocab, fixed_deck, device=device, data_dir=data_dir)
+    return PolicyAgent(policy, vocab, fixed_deck, device=device,
+                       data_dir=data_dir, use_deck_guard=use_deck_guard)
 
 
 def _sample_to_batch(sample: dict[str, np.ndarray], device: str) -> dict:
@@ -321,32 +368,41 @@ def search_planner_agent(obs_dict: dict) -> list[int]:
 
 
 class SearchPlannerAgent:
-    """:func:`search_planner_agent` with a belief-driven opponent model.
+    """:func:`search_planner_agent` with a prior-driven opponent model.
 
     The plain function leaves the Rust determinizer to assume the opponent
-    mirrors our own deck.  Given an
-    :class:`~ptcg_il.belief_infer.OpponentDeckOracle`, this variant predicts
-    their decklist from the current observation instead, so the worlds MCTS
-    searches are drawn from a deck the opponent might actually be playing.
+    mirrors our own deck, which is worth 19.4 of their 60 cards.  Given an
+    :class:`~ptcg_il.deck_prior.OpponentDeckPredictor`, this variant infers
+    their archetype from the mined frequency prior plus whatever they have
+    shown — 44.6/60 before a single card is seen, 59.1/60 by eight — so the
+    worlds MCTS searches are drawn from a deck they might actually be playing.
+
+    Both forms are kept: ``predictor=None`` is the mirror baseline the
+    prior-driven one is measured against.
 
     A class rather than a closure because live eval hands agents to a process
     pool: ``make_agent_from_policy``'s inner function could not be pickled, and
     a bound ``__call__`` can.
     """
 
-    def __init__(self, oracle: Any = None, iterations: int = 200, seed: int = 42):
-        self.oracle = oracle
+    def __init__(self, predictor: Any = None, iterations: int = 200, seed: int = 42):
+        self.predictor = predictor
         self.iterations = iterations
         self.seed = seed
 
     def __call__(self, obs_dict: dict) -> list[int]:
         select = obs_dict.get("select")
         if select is None:
+            # Deck selection — a new game.  Stale evidence would otherwise be
+            # inference about an opponent who is no longer at the table.
+            if self.predictor is not None:
+                self.predictor.reset()
             return _search_planner_deck()
 
         opp_deck = None
-        if self.oracle is not None:
-            opp_deck = self.oracle.predict(obs_dict) or None
+        if self.predictor is not None:
+            self.predictor.observe(obs_dict)
+            opp_deck = self.predictor.template()
 
         result = _call_rust_search_planner(
             obs_dict, opp_deck=opp_deck,

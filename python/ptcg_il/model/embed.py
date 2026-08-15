@@ -18,7 +18,14 @@ P_MAX = 12
 H_MAX = 30
 SUM = 2
 
-from ptcg_il.featurizer import F_GLOBAL, F_HAND, F_POKE, F_SUM
+from ptcg_il.featurizer import (
+    CLS_HAS_CONTEXT_CARD,
+    CLS_HAS_EFFECT,
+    F_GLOBAL,
+    F_HAND,
+    F_POKE,
+    F_SUM,
+)
 
 # Normalizer for discard sum-pooling (A.2)
 DECK_N = 60.0
@@ -75,8 +82,10 @@ class TokenEmbedder(nn.Module):
         rows = torch.zeros(B, L_STATE, self.D, device=device)
 
         # --- CLS token (row 0) ---
-        x_has_context = x["cls_feat"][:, 87:88]   # [B, 1]
-        x_has_effect = x["cls_feat"][:, 88:89]    # [B, 1]
+        c = CLS_HAS_CONTEXT_CARD
+        e = CLS_HAS_EFFECT
+        x_has_context = x["cls_feat"][:, c:c + 1]   # [B, 1]
+        x_has_effect = x["cls_feat"][:, e:e + 1]    # [B, 1]
 
         cls_tok = self.cls_mlp(x["cls_feat"])                                              # [B, D]
         cls_tok = cls_tok + self.card(x["context_card_feat"]).squeeze(1) * x_has_context  # [B, D]

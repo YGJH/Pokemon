@@ -55,9 +55,6 @@ QUIET="true"
 # 评估设定。离线评估（top-1/top-3）永远跑；live-eval 要真的开对局，慢得多，
 # 所以预设关闭，用 --live-eval 打开。
 LIVE_EVAL=""
-# belief 頭現在一律訓練（build-shards 無條件寫入標籤），所以沒有 --belief 旗標了；
-# 要關掉請用 --no-belief，它會一路傳到 ptcg_il.cli。
-NO_BELIEF=""
 LIVE_EVAL_GAMES=200
 LIVE_EVAL_WORKERS=""
 # 相对路径一律以 python/ 为基准（管线全程在 python/ 下执行，
@@ -264,9 +261,6 @@ while [[ $# -gt 0 ]]; do
         --no-eval)
             NO_EVAL="true"; shift
             ;;
-        --no-belief)
-            NO_BELIEF="true"; shift
-            ;;
         --no-rl)
             NO_RL="true"; shift
             ;;
@@ -374,8 +368,6 @@ while [[ $# -gt 0 ]]; do
             echo "                         要 top-10 就設 10 —— 會重跑 mining 與分片。"
             echo "  --generalist           只訓練單一通才模型 (舊行為，準確率明顯較差)"
             echo "  --no-eval              訓練後跳過評估"
-            echo "  --no-belief            關閉對手牌組 belief 頭 (預設開啟；關掉會讓"
-            echo "                         MCTS determinizer 退回鏡像牌組猜測)"
             echo "  --live-eval            额外跑 live engine 对局评估 (慢: 每局都要真的打完)"
             echo "  --live-eval-games N    live-eval 每个对手的局数 (默认: 200)"
             echo "  --live-eval-workers N  live-eval 并行 worker 数 (默认: 由 CLI 决定)"
@@ -696,9 +688,6 @@ build_train_cmd() {
     if [[ -n "$IL_DROPOUT" ]]; then cmd="$cmd --dropout $IL_DROPOUT"; fi
     if [[ -n "$arch" ]]; then
         cmd="$cmd --archetype-self $arch"
-    fi
-    if [[ "$NO_BELIEF" == "true" ]]; then
-        cmd="$cmd --no-belief"
     fi
     if [[ -n "${RESUME_CKPT:-}" ]]; then
         cmd="$cmd $RESUME_CKPT"

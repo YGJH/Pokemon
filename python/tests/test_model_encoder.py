@@ -431,7 +431,7 @@ class TestCliPassesDropoutToThePolicy:
             data_dir=_data_dir_with_static_tables(tmp_path),
             attn_dropout=0.15, ffn_dropout=0.3,
         )
-        policy = _build_policy({"n_opp_arch": 3}, args)
+        policy = _build_policy({}, args)
         ffn = _ffn_rates(policy.encoder)
         assert ffn and all(r == 0.3 for r in ffn), (
             f"--ffn-dropout did not reach the encoder: {sorted(set(ffn))}"

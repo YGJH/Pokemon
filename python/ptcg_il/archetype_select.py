@@ -86,11 +86,12 @@ def describe(data_dir: str | Path) -> str:
         self_ids = [int(i) for i in json.load(f).get("self_ids", [])]
     counts = archetype_row_counts(data_dir)
 
-    lines = ["archetype   train     val    test  usable"]
+    lines = [" archetype" + ' ' * 7 + 'train' + ' ' * 9 + 'val' + ' ' * 8 + 'test' + ' ' * 2 +  "usable"]
+
     for aid in sorted(self_ids, key=lambda a: counts.get(a, {}).get("train", 0), reverse=True):
         c = counts.get(aid, {"train": 0, "val": 0, "test": 0})
         ok = c["val"] >= MIN_VAL_ROWS and c["test"] >= MIN_TEST_ROWS
         lines.append(
-            f"{aid:>9}  {c['train']:>6}  {c['val']:>6}  {c['test']:>6}  {'yes' if ok else 'no'}"
+            f"{aid:>10}  {c['train']:>10}  {c['val']:>10}  {c['test']:>10}  {'yes' if ok else 'no'}"
         )
     return "\n".join(lines)

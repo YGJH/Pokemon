@@ -105,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--baseline-archetypes",
         default=None,
         help="A previous archetypes.json to seed clustering from, so cluster ids "
-             "and 𝒟_opp belief slots are append-only. Defaults to "
+             "and the 𝒟_opp list are append-only. Defaults to "
              "<out-dir>/archetypes.json when it exists — stable ids are the "
              "default because losing them silently repoints every trained "
              "checkpoint at a different deck.",
@@ -114,8 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebaseline",
         action="store_true",
         help="Ignore any baseline and renumber archetypes from scratch. This "
-             "INVALIDATES every existing checkpoint's deck record and every "
-             "𝒟_opp belief slot; --archetype-self N will mean a different deck. "
+             "INVALIDATES every existing checkpoint's deck record; "
+             "--archetype-self N will mean a different deck. "
              "Use it when the meta has moved far enough that frozen "
              "representatives are worse than a clean re-cluster, and expect to "
              "retrain.",
@@ -375,14 +375,11 @@ def run(config: MineConfig, skip_download: bool, force: bool = False,
         print(f"  baseline: {baseline_path} ({len(baseline)} archetypes, ids "
               f"0..{max(a.id for a in baseline)}) → +{n_new} new cluster(s)")
         if len(opp_ids) != len(base_opp):
-            # n_opp_arch just changed, so a policy built against the new
-            # artifacts no longer has the same belief-head width as one built
-            # against the old.  Loud, because --resume across this boundary is
-            # a shape mismatch and warm-starting needs the widening path.
-            print(f"  WARNING: 𝒟_opp grew {len(base_opp)} → {len(opp_ids)} slots. "
-                  "Old checkpoints keep their own width and still evaluate, but "
-                  "resuming one into the new artifacts needs "
-                  "--allow-belief-widening.")
+            # Nothing is shaped by this any more (the belief head that indexed
+            # 𝒟_opp by position is gone), so it is a note, not a warning: the
+            # list is append-only metadata about which opponents were ranked.
+            print(f"  𝒟_opp grew {len(base_opp)} → {len(opp_ids)} entries "
+                  "(append-only; no checkpoint shape depends on it).")
     else:
         print("  baseline: none — archetype ids are being assigned from scratch")
 

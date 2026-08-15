@@ -67,7 +67,6 @@ ABLATION_GROUPS: dict[str, tuple[str, ...]] = {
     "global state (cls)": ("cls_feat",),
     "per-player summary": ("sum_feat",),
     "discard / prizes": ("discard_ids", "prize_ids"),
-    "game log (belief)": ("log_feat",),
     "stadium / context": ("stadium_card_id", "context_card_id", "effect_card_id"),
 }
 
@@ -183,7 +182,7 @@ def feature_health(data_dir: str | Path, split: str, max_shards: int = 3) -> dic
 
     for path in shards:
         d = np.load(path, allow_pickle=True)
-        for key in ("cls_feat", "sum_feat", "poke_feat", "hand_feat", "opt_scalar", "log_feat"):
+        for key in ("cls_feat", "sum_feat", "poke_feat", "hand_feat", "opt_scalar"):
             if key not in d:
                 continue
             arr = np.asarray(d[key], dtype=np.float32)
@@ -204,10 +203,6 @@ def feature_health(data_dir: str | Path, split: str, max_shards: int = 3) -> dic
                 ids = np.asarray(d[key])
                 state_total += int((ids != PAD_CARD).sum())
                 state_unknown += int((ids == UNKNOWN_CARD).sum())
-
-        if "log_mask" in d:
-            lm = np.asarray(d["log_mask"], dtype=bool)
-            stats["log_mask_occupancy"] = float(lm.mean())
 
     stats["constant_columns"] = {k: sorted(v) for k, v in const_cols.items() if v}
     stats["opt_pad_rate"] = pad / opt_total if opt_total else 0.0
@@ -420,11 +415,6 @@ def run_diagnosis(
             "   (should be ~0; anything else is a vocab/normalisation bug)",
             f"  state card UNKNOWN rate  : {health['state_unknown_rate']:.4f}",
         ]
-        if "log_mask_occupancy" in health:
-            lines.append(
-                f"  game-log token occupancy : {health['log_mask_occupancy']:.4f}"
-                "   (how full the belief module's input actually is)"
-            )
         if health["constant_columns"]:
             lines += ["", "  ZERO-VARIANCE FEATURE COLUMNS (dead by construction):"]
             for key, cols in sorted(health["constant_columns"].items()):

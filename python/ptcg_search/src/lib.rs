@@ -22,6 +22,41 @@ use engine::Engine;
 use guessing::build_guesses;
 use mcts::MctsConfig;
 
+// ── GameInitialize latch (process-global) ─────────────────────────────────
+//
+// `GameInitialize` must be called **exactly once per process** (see
+// `Engine::load`): a second call throws `std::runtime_error("buffer full.
+// capacity:7")`, and a C++ exception crossing the FFI boundary aborts the
+// process with SIGABRT rather than returning an `Err`.
+//
+// `host_initialized` answers "did the *host* already call it?", which is only
+// half the question — the other half is "did *we* already call it?".  Every
+// entry point here is called once per decision, so a caller for whom the host
+// answer is 0 (the Kaggle bundle, which ships no importable `cg` package and so
+// can never have called `GameInitialize` from Python) passed 0 on every
+// decision and re-initialized every time.  That shipped: the agent played its
+// first move and the process died on its second, leaving no traceback, an
+// empty action, and an INVALID status attributed to the deck.
+//
+// The latch makes the answer stateful, which is what it always was.  Init only
+// when the host has not, *and* we have not done it ourselves already.
+static GAME_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this call must call `GameInitialize`, latching so no later call can.
+///
+/// `swap` unconditionally marks the process as initialized: after this returns,
+/// `GameInitialize` has either just been requested by us or was already done by
+/// the host, and either way nobody may call it again.
+fn latch_game_init(flag: &std::sync::atomic::AtomicBool, host_initialized: c_int) -> bool {
+    let already = flag.swap(true, std::sync::atomic::Ordering::SeqCst);
+    host_initialized == 0 && !already
+}
+
+/// [`latch_game_init`] against this process's one latch.
+fn needs_game_init(host_initialized: c_int) -> bool {
+    latch_game_init(&GAME_INITIALIZED, host_initialized)
+}
+
 // ── Basic-Pokémon set (process-global) ─────────────────────────────────────
 //
 // Only a Basic Pokémon can legally sit face-down as the opponent's active, and
@@ -88,7 +123,8 @@ pub unsafe extern "C" fn puct_set_basic_pokemon(ids_json: *const c_char) -> c_in
 ///   `GameInitialize` on this libcg.so (every Python caller has, via `cg.sim`'s
 ///   import).  Getting this wrong is fatal, not recoverable: a second
 ///   `GameInitialize` throws a C++ exception across the FFI boundary and aborts
-///   the process.  See [`Engine::load`].
+///   the process.  See [`Engine::load`] and [`needs_game_init`], which latches
+///   this so only the *first* call through this library can ever init.
 ///
 /// # Returns
 ///
@@ -183,9 +219,10 @@ fn search_plan_impl(
         .to_string();
     }
 
-    // Load engine.  Only call GameInitialize if the host has not already done so —
-    // a second call aborts the process (see Engine::load).
-    let engine = match unsafe { Engine::load(&lib_str, host_initialized == 0) } {
+    // Load engine.  Only call GameInitialize if neither the host nor an earlier
+    // call through this library has — a second call aborts the process
+    // (see Engine::load and needs_game_init).
+    let engine = match unsafe { Engine::load(&lib_str, needs_game_init(host_initialized)) } {
         Ok(e) => e,
         Err(e) => return error_json(&format!("Engine::load: {e}")),
     };
@@ -371,8 +408,9 @@ fn puct_init_impl(
         return Err("deck selection step: no select in observation".into());
     }
 
-    // Load engine
-    let engine = unsafe { Engine::load(&lib_str, host_initialized == 0) }
+    // Load engine.  `needs_game_init` latches: this runs once per decision, so
+    // re-deriving init from `host_initialized` alone re-initializes every move.
+    let engine = unsafe { Engine::load(&lib_str, needs_game_init(host_initialized)) }
         .map_err(|e| format!("Engine::load: {e}"))?;
 
     // Build hidden-state guesses
@@ -684,6 +722,7 @@ fn puct_result_impl(handle: i64) -> String {
 
     serde_json::json!({
         "visit_counts": h.tree.visit_counts(),
+        "child_stats": h.tree.child_stats(),
         "root_value": h.tree.root_value(),
         "iterations": h.tree.iter_count,
         "nodes_created": h.tree.nodes.len(),
@@ -743,7 +782,9 @@ pub unsafe extern "C" fn puct_forest_create(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let lib_str = unsafe { cstr_to_str(lib_path) };
         let n = (n_engines.max(1)) as usize;
-        let pool = EnginePool::new(&lib_str, n, host_initialized == 0)
+        // EnginePool::new already inits at most once across its `n` engines;
+        // the latch extends that to "at most once across all forests too".
+        let pool = EnginePool::new(&lib_str, n, needs_game_init(host_initialized))
             .map_err(|e| format!("EnginePool::new: {e}"))?;
         let n_eng = pool.len();
         Ok::<PuctForestHandle, String>(PuctForestHandle {
@@ -1188,4 +1229,47 @@ pub unsafe extern "C" fn vec_env_drain(handle: i64) -> *mut c_char {
 #[no_mangle]
 pub unsafe extern "C" fn vec_env_free(handle: i64) {
     if handle != 0 { drop(unsafe { Box::from_raw(handle as *mut VecEnvHandle) }); }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod game_init_latch_tests {
+    use super::latch_game_init;
+    use std::sync::atomic::AtomicBool;
+
+    /// The shipped bug: a caller with no `cg` package passes 0 every decision.
+    /// Deriving init from that alone re-inits every move, and move two SIGABRTs.
+    #[test]
+    fn only_the_first_call_initializes_when_the_host_did_not() {
+        let flag = AtomicBool::new(false);
+        assert!(latch_game_init(&flag, 0), "first call must initialize");
+        for decision in 2..=10 {
+            assert!(
+                !latch_game_init(&flag, 0),
+                "decision {decision} re-initialized; a second GameInitialize aborts the process"
+            );
+        }
+    }
+
+    /// A host that already called it (the repo, via `cg.sim`'s import) must
+    /// never init — not even on the first call.
+    #[test]
+    fn an_initialized_host_never_initializes() {
+        let flag = AtomicBool::new(false);
+        for _ in 0..5 {
+            assert!(!latch_game_init(&flag, 1));
+        }
+    }
+
+    /// `host_initialized` is read per call, so a host that inits *between*
+    /// calls must not cause a second one either.  The latch is set by the
+    /// earlier call regardless of what it returned.
+    #[test]
+    fn a_host_that_initializes_late_does_not_get_a_second_init() {
+        let flag = AtomicBool::new(false);
+        assert!(latch_game_init(&flag, 0));
+        assert!(!latch_game_init(&flag, 1));
+        assert!(!latch_game_init(&flag, 0));
+    }
 }

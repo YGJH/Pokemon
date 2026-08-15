@@ -1,0 +1,722 @@
+<title>頂尖牌組風向</title>
+<style>
+:root {
+  color-scheme: light;
+  --page:        #f2f2ee;
+  --surface:     #fcfcfb;
+  --ink:         #0b0b0b;
+  --ink-2:       #52514e;
+  --muted:       #898781;
+  --grid:        #e1e0d9;
+  --axis:        #c3c2b7;
+  --hair:        rgba(11,11,11,0.10);
+  --wash:        rgba(11,11,11,0.035);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --pos: #2a78d6;
+  --neg: #e34948;
+  --neutral: #c3c2b7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page:      #0d0d0d;
+    --surface:   #1a1a19;
+    --ink:       #ffffff;
+    --ink-2:     #c3c2b7;
+    --muted:     #898781;
+    --grid:      #2c2c2a;
+    --axis:      #383835;
+    --hair:      rgba(255,255,255,0.10);
+    --wash:      rgba(255,255,255,0.045);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --pos: #3987e5;
+    --neg: #e66767;
+    --neutral: #383835;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page:      #0d0d0d;
+  --surface:   #1a1a19;
+  --ink:       #ffffff;
+  --ink-2:     #c3c2b7;
+  --muted:     #898781;
+  --grid:      #2c2c2a;
+  --axis:      #383835;
+  --hair:      rgba(255,255,255,0.10);
+  --wash:      rgba(255,255,255,0.045);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --pos: #3987e5;
+  --neg: #e66767;
+  --neutral: #383835;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans TC", sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 48px 24px 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 40px;
+}
+
+/* ---- header ---- */
+.eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+h1 {
+  font-size: clamp(30px, 4.4vw, 44px);
+  font-weight: 660;
+  letter-spacing: -0.024em;
+  line-height: 1.1;
+  text-wrap: balance;
+  margin: 0 0 14px;
+}
+.lede {
+  font-size: 17px;
+  color: var(--ink-2);
+  max-width: 62ch;
+  margin: 0;
+}
+.provenance {
+  margin: 18px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- stat tiles ---- */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 1px;
+  background: var(--hair);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tile { background: var(--surface); padding: 18px 20px; }
+.tile .k {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 6px;
+}
+.tile .v { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin: 0; }
+.tile .sub { font-size: 12px; color: var(--muted); margin: 3px 0 0; }
+
+/* ---- sections ---- */
+section {
+  background: var(--surface);
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  padding: 26px 24px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+h2 {
+  font-size: 19px; font-weight: 620; letter-spacing: -0.015em;
+  margin: 0;
+}
+.note {
+  font-size: 13px; color: var(--ink-2); margin: 0 0 12px; max-width: 74ch;
+}
+.note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; background: var(--wash); padding: 1px 5px; border-radius: 3px;
+}
+
+/* ---- controls ---- */
+.controls {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-bottom: 14px;
+}
+button.seg {
+  font: inherit; font-size: 13px;
+  background: transparent; color: var(--ink-2);
+  border: 1px solid var(--hair); border-radius: 5px;
+  padding: 5px 12px; cursor: pointer;
+}
+button.seg[aria-pressed="true"] {
+  background: var(--ink); color: var(--surface); border-color: var(--ink);
+}
+button.seg:focus-visible, .legend-item:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--s1); outline-offset: 2px;
+}
+
+/* ---- legend ---- */
+.legend {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  margin: 14px 0 0; padding: 0; list-style: none;
+}
+.legend-item {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--ink-2);
+  background: none; border: 0; padding: 3px 2px; cursor: pointer;
+  font-family: inherit; text-align: left; border-radius: 4px;
+}
+.legend-item .swatch {
+  width: 11px; height: 11px; border-radius: 3px; flex: none;
+}
+.legend-item[data-dim="1"] { opacity: 0.38; }
+
+/* ---- charts ---- */
+/* Scroll rather than shrink: a 900-unit viewBox squeezed into a phone makes
+   every axis tick unreadable, which is worse than a horizontal scrollbar. */
+.chart-scroll { overflow-x: auto; }
+.chart-scroll > svg { min-width: 700px; width: 100%; height: auto; }
+svg { display: block; max-width: 100%; }
+svg text { font-family: inherit; }
+.tick { font-size: 11px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.axis { stroke: var(--axis); stroke-width: 1; }
+.endlabel { font-size: 11.5px; font-weight: 600; }
+.series-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.series-raw  { fill: none; stroke-width: 1; opacity: 0.30; }
+.dim { opacity: 0.12; }
+.hot { stroke-width: 2.6; }
+
+/* ---- small multiples ---- */
+.sm-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(228px, 1fr));
+  /* Cell borders rather than a gap over a tinted background: with 27 panels in
+     a 4-column grid the last row is short, and a tinted gap paints the unused
+     cell as a phantom panel. */
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+.sm {
+  background: var(--surface);
+  padding: 14px 14px 10px;
+  display: flex; flex-direction: column; gap: 2px;
+  border-right: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair);
+}
+.sm .name {
+  font-size: 12.5px; font-weight: 600; line-height: 1.3;
+  display: flex; align-items: center; gap: 6px;
+}
+.sm .name .chip { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.sm .figs {
+  font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* the container already draws the outer rule */
+.sm-grid > .sm:nth-child(4n) { border-right: 0; }
+.sm .delta { font-weight: 600; }
+
+/* ---- table ---- */
+details { border-top: 1px solid var(--hair); padding-top: 14px; margin-top: 6px; }
+summary {
+  cursor: pointer; font-size: 13.5px; font-weight: 600; color: var(--ink-2);
+  list-style: revert;
+}
+.tablewrap { overflow-x: auto; margin-top: 14px; max-height: 460px; overflow-y: auto; }
+table { border-collapse: collapse; font-size: 12px; width: 100%; }
+th, td {
+  padding: 5px 9px; text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--grid);
+}
+th {
+  position: sticky; top: 0; background: var(--surface);
+  font-weight: 600; color: var(--ink-2); font-size: 11px;
+  text-align: right; z-index: 1;
+}
+th:first-child, td:first-child {
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ---- tooltip ---- */
+#tip {
+  position: fixed; z-index: 20; pointer-events: none;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--hair); border-radius: 6px;
+  box-shadow: 0 6px 22px rgba(0,0,0,0.14);
+  padding: 10px 12px; font-size: 12.5px; line-height: 1.5;
+  opacity: 0; transition: opacity 90ms linear;
+  font-variant-numeric: tabular-nums; min-width: 190px;
+}
+#tip[data-on="1"] { opacity: 1; }
+#tip .t-day { font-weight: 600; margin-bottom: 6px; }
+#tip .t-row { display: flex; align-items: center; gap: 7px; }
+#tip .t-row .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+#tip .t-row .nm { flex: 1; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+#tip .t-row .vl { font-weight: 600; }
+#tip .t-foot { margin-top: 6px; color: var(--muted); font-size: 11.5px; }
+
+footer {
+  font-size: 12.5px; color: var(--muted); line-height: 1.7;
+  border-top: 1px solid var(--hair); padding-top: 18px;
+}
+footer code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Pokémon TCG · 天梯牌組風向</p>
+    <h1>誰正在變強？</h1>
+    <p class="lede">
+      這份資料集抓的是天梯頂端的對局，所以「某個牌組佔了當天多少比例」就是頂尖玩家對它的投票。佔比往上爬的牌組，通常就是正在變強勢的牌組。
+    </p>
+    <p class="provenance" id="provenance"></p>
+  </header>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <h2>近期勢頭</h2>
+    <p class="note" id="momentum-note"></p>
+    <p class="note" id="selection-note"></p>
+    <div class="chart-scroll"><svg id="momentum"></svg></div>
+  </section>
+
+  <section>
+    <h2>每日出場佔比</h2>
+    <p class="note" id="trend-note"></p>
+    <div class="controls">
+      <button class="seg" id="btn-ma" aria-pressed="true">7 日移動平均</button>
+      <button class="seg" id="btn-raw" aria-pressed="false">每日原始值</button>
+    </div>
+    <div class="chart-scroll"><svg id="trend"></svg></div>
+    <ul class="legend" id="legend"></ul>
+  </section>
+
+  <section>
+    <h2>每日樣本數</h2>
+    <p class="note">
+      七月那段每天只抓 210–580 場，八月起才穩定在 4,300–4,800 場。左半邊線條的抖動多半是樣本太少，不是 meta 真的在震盪。
+    </p>
+    <div class="chart-scroll"><svg id="samples"></svg></div>
+  </section>
+
+  <section>
+    <h2>逐一看每個牌組</h2>
+    <p class="note" id="sm-note"></p>
+    <div class="sm-grid" id="sm-grid"></div>
+  </section>
+
+  <section>
+    <h2>原始數字</h2>
+    <p class="note" id="table-note"></p>
+    <details open>
+      <summary>展開 day × 牌組 佔比表</summary>
+      <div class="tablewrap" id="tablewrap"></div>
+    </details>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+
+<div id="tip" role="status" aria-live="polite"></div>
+
+<script id="payload" type="application/json">__DECK_META_TREND_DATA__</script>
+<script>
+(function () {
+  "use strict";
+  const D = JSON.parse(document.getElementById("payload").textContent);
+  const SERIES_SLOTS = 8;              // the palette has 8 validated hues; never cycle
+  const hue = i => `var(--s${i + 1})`;
+  const pct = v => (v * 100);
+  const fmtPct = (v, d) => (v == null || Number.isNaN(v)) ? "—" : pct(v).toFixed(d == null ? 1 : d) + "%";
+  const fmtPP = v => (v >= 0 ? "+" : "−") + Math.abs(pct(v)).toFixed(1) + " pp";
+  const fmtInt = n => n.toLocaleString("en-US");
+  const shortDay = s => s.slice(5).replace("-", "/");
+
+  // The overview carries hues; everything past slot 8 is identified by name in
+  // the small multiples instead of by an invented colour.
+  const colored = D.series.slice(0, SERIES_SLOTS);
+  const colorOf = new Map(colored.map((s, i) => [s.id, hue(i)]));
+
+  // ---------- header ----------
+  const first = D.days[0], last = D.days[D.days.length - 1];
+  document.getElementById("provenance").textContent =
+    `${first} – ${last}　·　${fmtInt(D.meta.n_episodes)} 場對局　·　` +
+    `${fmtInt(D.meta.n_slots)} 個牌組出場　·　對照 ${fmtInt(D.meta.n_archetypes)} 個已定版 archetype`;
+
+  const tiles = [
+    { k: "對局", v: fmtInt(D.meta.n_episodes), sub: `${D.meta.n_days} 天，每場兩位玩家` },
+    { k: "追蹤牌組", v: String(D.meta.n_series), sub: `任一天曾進當日前 ${D.meta.top_n}` },
+    { k: "這些牌組合計", v: fmtPct(D.series.reduce((a, s) => a + s.total, 0) / D.meta.n_slots, 0), sub: "佔全部出場的比例" },
+    { k: "可歸類率", v: D.meta.coverage == null ? "—" : fmtPct(D.meta.coverage, 0),
+      sub: D.other ? "其餘為未分群牌表"
+        : `沒有一副牌表落在 ${fmtInt(D.meta.n_archetypes)} 個 cluster 之外` },
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(t =>
+    `<div class="tile"><p class="k">${t.k}</p><p class="v">${t.v}</p><p class="sub">${t.sub}</p></div>`
+  ).join("");
+
+  document.getElementById("momentum-note").textContent =
+    `最後 ${D.meta.momentum_window} 天的平均佔比，減去前 ${D.meta.momentum_window} 天的平均佔比。` +
+    `這兩段都落在每天 4,600 場的密集期，所以差值不是採樣造成的。往右＝正在被更多頂尖玩家選用。`;
+  document.getElementById("trend-note").textContent =
+    `每天該牌組的出場數 ÷ 當天總出場數。分母含所有未分群的牌表，所以這是真正的 meta 佔比。` +
+    `這裡只畫合計出場數最高的 ${colored.length} 個；其餘 ${D.meta.n_series - colored.length} 個在下方逐一列出。`;
+  document.getElementById("selection-note").innerHTML =
+    `追蹤名單的挑法：只有 <strong>${D.meta.select_since} 之後</strong>的 ${D.meta.dense_days} 天` +
+    `（每天 4,300–4,800 場）可以提名牌組，取這些天各自的前 ${D.meta.top_n} 名聯集，得到 ` +
+    `<strong>${D.meta.n_series} 個</strong>。七月那段每天只有 210–580 場，第 10 名往往只是幾場對局；` +
+    `把它們也算進提名，聯集會膨脹到 70 個（加 1% 佔比門檻也砍不掉半個）。` +
+    `被選中的牌組仍然畫出 7/04 以來的完整走勢——限制的是提名權，不是量測範圍。`;
+  document.getElementById("table-note").textContent =
+    `每一格是該牌組當天的出場佔比（%）。「其餘」是這 ${D.meta.n_series} 個以外的另外 ` +
+    `${fmtInt(D.meta.n_archetypes - D.meta.n_series)} 個 cluster 合計，所以每一列加起來是 100%。` +
+    `色彩在淺色模式下對比不足，這張表就是那個補償——所有數字在這裡都讀得到。`;
+  document.getElementById("sm-note").textContent =
+    `全部 ${D.meta.n_series} 個牌組，依勢頭由強到弱排列，線是 ${D.meta.ma_window} 日移動平均。` +
+    `每格 y 軸各自縮放到自己的峰值——#1 峰值 57%，另外 24 個都在 2.2% 以下，` +
+    `共用刻度的話絕大多數面板會是一條貼在底線的直線。要比大小請看每格標的「現在」與「峰值」。`;
+
+  // ---------- SVG helpers ----------
+  const NS = "http://www.w3.org/2000/svg";
+  const el = (n, attrs, text) => {
+    const e = document.createElementNS(NS, n);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  };
+
+  // ---------- momentum: diverging bars ----------
+  (function momentum() {
+    const rows = D.series.slice().sort((a, b) => b.momentum - a.momentum);
+    const rowH = 26, padT = 26, padB = 30, labelW = 250, valW = 78;
+    const W = 900, H = padT + rows.length * rowH + padB;
+    const plotL = labelW, plotR = W - valW;
+    const maxAbs = Math.max(...rows.map(r => Math.abs(r.momentum))) || 1;
+    const x = v => plotL + (plotR - plotL) / 2 + (v / maxAbs) * ((plotR - plotL) / 2 - 6);
+    const mid = (plotL + plotR) / 2;
+
+    const svg = document.getElementById("momentum");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.setAttribute("width", W); svg.setAttribute("height", H);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "各牌組近期佔比變化的發散長條圖");
+
+    for (const t of [-maxAbs, -maxAbs / 2, 0, maxAbs / 2, maxAbs]) {
+      svg.appendChild(el("line", {
+        x1: x(t), x2: x(t), y1: padT - 8, y2: H - padB + 2,
+        class: t === 0 ? "axis" : "gridline",
+      }));
+      svg.appendChild(el("text", {
+        x: x(t), y: H - padB + 17, class: "tick", "text-anchor": "middle",
+      }, (t >= 0 ? "+" : "−") + Math.abs(pct(t)).toFixed(1)));
+    }
+    svg.appendChild(el("text", {
+      x: mid, y: 12, class: "tick", "text-anchor": "middle",
+    }, "佔比變化（百分點）"));
+
+    rows.forEach((r, i) => {
+      const y = padT + i * rowH;
+      const up = r.momentum >= 0;
+      const x0 = x(0), x1 = x(r.momentum);
+      const w = Math.max(Math.abs(x1 - x0), 1.5);
+      const rx = Math.min(4, w);
+      svg.appendChild(el("rect", {
+        x: Math.min(x0, x1), y: y + 5, width: w, height: 13,
+        rx: rx, fill: up ? "var(--pos)" : "var(--neg)",
+      }));
+      // square off the baseline end so only the data end is rounded
+      svg.appendChild(el("rect", {
+        x: up ? x0 : x0 - Math.min(4, w), y: y + 5,
+        width: Math.min(4, w), height: 13, fill: up ? "var(--pos)" : "var(--neg)",
+      }));
+      const nm = el("text", {
+        x: labelW - 14, y: y + 15.5, "text-anchor": "end",
+        style: "font-size:12.5px;fill:var(--ink)",
+      }, r.label.length > 34 ? r.label.slice(0, 33) + "…" : r.label);
+      nm.appendChild(el("title", {}, r.label));
+      svg.appendChild(nm);
+      svg.appendChild(el("text", {
+        x: W - 10, y: y + 15.5, "text-anchor": "end",
+        style: `font-size:12px;font-weight:600;fill:var(--ink);font-variant-numeric:tabular-nums`,
+      }, fmtPP(r.momentum)));
+    });
+  })();
+
+  // ---------- shared time scale ----------
+  const N = D.days.length;
+  const TW = 900, TH = 380, mL = 52, mR = 168, mT = 18, mB = 34;
+  const px = i => mL + (i / (N - 1)) * (TW - mL - mR);
+  const yMax = Math.max(...D.series.flatMap(s => s.share.concat(s.ma)));
+  const yTop = Math.ceil(yMax * 100 / 5) * 5 / 100;
+  const py = v => mT + (1 - v / yTop) * (TH - mT - mB);
+
+  function dayTicks() {
+    const out = [];
+    for (let i = 0; i < N; i++) {
+      const d = D.days[i];
+      if (i === 0 || i === N - 1 || d.endsWith("-01") || /-(0[17]|1[45]|2[18])$/.test(d)) out.push(i);
+    }
+    return out.filter((v, i, a) => i === 0 || v - a[i - 1] > 2);
+  }
+
+  // ---------- trend lines ----------
+  let mode = "ma";
+  let focus = null;
+  const trend = document.getElementById("trend");
+
+  function path(vals) {
+    return vals.map((v, i) => `${i ? "L" : "M"}${px(i).toFixed(1)},${py(v).toFixed(1)}`).join("");
+  }
+
+  function drawTrend() {
+    trend.textContent = "";
+    trend.setAttribute("viewBox", `0 0 ${TW} ${TH}`);
+    trend.setAttribute("width", TW); trend.setAttribute("height", TH);
+    trend.setAttribute("role", "img");
+    trend.setAttribute("aria-label", "前八大牌組的每日出場佔比折線圖");
+
+    for (let t = 0; t <= yTop + 1e-9; t += yTop / 5) {
+      trend.appendChild(el("line", { x1: mL, x2: TW - mR, y1: py(t), y2: py(t), class: "gridline" }));
+      trend.appendChild(el("text", { x: mL - 10, y: py(t) + 4, class: "tick", "text-anchor": "end" },
+        pct(t).toFixed(0) + "%"));
+    }
+    trend.appendChild(el("line", { x1: mL, x2: TW - mR, y1: py(0), y2: py(0), class: "axis" }));
+    for (const i of dayTicks()) {
+      trend.appendChild(el("text", { x: px(i), y: TH - mB + 20, class: "tick", "text-anchor": "middle" },
+        shortDay(D.days[i])));
+    }
+
+    colored.forEach((s, i) => {
+      const dim = focus != null && focus !== s.id;
+      if (mode === "ma") {
+        trend.appendChild(el("path", {
+          d: path(s.share), class: "series-raw" + (dim ? " dim" : ""), stroke: hue(i),
+        }));
+      }
+      trend.appendChild(el("path", {
+        d: path(mode === "ma" ? s.ma : s.share),
+        class: "series-line" + (dim ? " dim" : "") + (focus === s.id ? " hot" : ""),
+        stroke: hue(i),
+      }));
+    });
+
+    // Direct endpoint labels — the relief for the light-mode contrast warning,
+    // stacked so they cannot collide.
+    const ends = colored.map((s, i) => ({
+      s, i, y: py((mode === "ma" ? s.ma : s.share)[N - 1]),
+    })).sort((a, b) => a.y - b.y);
+    // Push apart, then lift the whole stack back inside the plot: the bottom
+    // four series sit within a point of each other, so an un-lifted stack runs
+    // past the baseline and the SVG clips the last label away.
+    let prev = -Infinity;
+    for (const e of ends) { e.ly = Math.max(e.y, prev + 15); prev = e.ly; }
+    const overflow = prev - (TH - mB);
+    if (overflow > 0) {
+      const lift = Math.min(overflow, ends[0].ly - mT - 4);
+      for (const e of ends) e.ly -= lift;
+    }
+    for (const e of ends) {
+      const y = e.ly;
+      const g = el("g", { opacity: focus != null && focus !== e.s.id ? 0.25 : 1 });
+      g.appendChild(el("line", {
+        x1: TW - mR + 2, x2: TW - mR + 10, y1: e.y, y2: y,
+        stroke: hue(e.i), "stroke-width": 1, opacity: 0.5,
+      }));
+      g.appendChild(el("rect", {
+        x: TW - mR + 12, y: y - 8, width: 9, height: 9, rx: 2, fill: hue(e.i),
+      }));
+      const t = el("text", {
+        x: TW - mR + 26, y: y + 0.5, class: "endlabel",
+        style: "fill:var(--ink)", "dominant-baseline": "middle",
+      }, fmtPct((mode === "ma" ? e.s.ma : e.s.share)[N - 1]));
+      g.appendChild(t);
+      trend.appendChild(g);
+    }
+
+    trend.appendChild(el("line", {
+      id: "crosshair", x1: 0, x2: 0, y1: mT, y2: py(0),
+      stroke: "var(--axis)", "stroke-width": 1, opacity: 0,
+    }));
+    trend.appendChild(el("rect", {
+      x: mL, y: mT, width: TW - mL - mR, height: py(0) - mT,
+      fill: "transparent", id: "hit",
+    }));
+    wireHover();
+  }
+
+  // ---------- tooltip ----------
+  const tip = document.getElementById("tip");
+  function wireHover() {
+    const hit = trend.querySelector("#hit");
+    const cross = trend.querySelector("#crosshair");
+    const move = ev => {
+      const r = trend.getBoundingClientRect();
+      const sx = (ev.clientX - r.left) * (TW / r.width);
+      let i = Math.round(((sx - mL) / (TW - mL - mR)) * (N - 1));
+      i = Math.max(0, Math.min(N - 1, i));
+      cross.setAttribute("x1", px(i)); cross.setAttribute("x2", px(i));
+      cross.setAttribute("opacity", 0.65);
+      const rows = colored.map((s, k) => ({ s, k, v: (mode === "ma" ? s.ma : s.share)[i] }))
+        .sort((a, b) => b.v - a.v);
+      tip.innerHTML =
+        `<div class="t-day">${D.days[i]}</div>` +
+        rows.map(r =>
+          `<div class="t-row"><span class="swatch" style="background:${hue(r.k)}"></span>` +
+          `<span class="nm">${r.s.label}</span><span class="vl">${fmtPct(r.v)}</span></div>`
+        ).join("") +
+        `<div class="t-foot">當天 ${fmtInt(D.episodes[i])} 場對局` +
+        (mode === "ma" ? `　·　${D.meta.ma_window} 日移動平均` : "") + `</div>`;
+      tip.dataset.on = "1";
+      const tw = tip.offsetWidth, th = tip.offsetHeight;
+      let lx = ev.clientX + 16, ly = ev.clientY - th / 2;
+      if (lx + tw > innerWidth - 8) lx = ev.clientX - tw - 16;
+      tip.style.left = Math.max(8, lx) + "px";
+      tip.style.top = Math.max(8, Math.min(ly, innerHeight - th - 8)) + "px";
+    };
+    hit.addEventListener("mousemove", move);
+    hit.addEventListener("mouseleave", () => {
+      tip.dataset.on = "0"; cross.setAttribute("opacity", 0);
+    });
+  }
+
+  // ---------- legend ----------
+  const legend = document.getElementById("legend");
+  legend.innerHTML = colored.map((s, i) =>
+    `<li><button class="legend-item" data-id="${s.id}">` +
+    `<span class="swatch" style="background:${hue(i)}"></span>` +
+    `<span>${s.label}</span></button></li>`
+  ).join("");
+  legend.querySelectorAll(".legend-item").forEach(b => {
+    const id = Number(b.dataset.id);
+    const on = () => { focus = id; syncLegend(); drawTrend(); };
+    const off = () => { focus = null; syncLegend(); drawTrend(); };
+    b.addEventListener("mouseenter", on);
+    b.addEventListener("mouseleave", off);
+    b.addEventListener("focus", on);
+    b.addEventListener("blur", off);
+    b.addEventListener("click", () => { focus = focus === id ? null : id; syncLegend(); drawTrend(); });
+  });
+  function syncLegend() {
+    legend.querySelectorAll(".legend-item").forEach(b => {
+      b.dataset.dim = (focus != null && Number(b.dataset.id) !== focus) ? "1" : "0";
+    });
+  }
+
+  const btnMa = document.getElementById("btn-ma"), btnRaw = document.getElementById("btn-raw");
+  function setMode(m) {
+    mode = m;
+    btnMa.setAttribute("aria-pressed", String(m === "ma"));
+    btnRaw.setAttribute("aria-pressed", String(m === "raw"));
+    drawTrend();
+  }
+  btnMa.addEventListener("click", () => setMode("ma"));
+  btnRaw.addEventListener("click", () => setMode("raw"));
+
+  drawTrend();
+
+  // ---------- sample-size strip ----------
+  (function samples() {
+    const H = 118, mB2 = 30, mT2 = 16;
+    const svg = document.getElementById("samples");
+    svg.setAttribute("viewBox", `0 0 ${TW} ${H}`);
+    svg.setAttribute("width", TW); svg.setAttribute("height", H);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "每日抓到的對局數長條圖");
+    const maxE = Math.max(...D.episodes);
+    const bw = Math.max(4, (TW - mL - mR) / N - 3);
+    const base = H - mB2;
+    for (const t of [0, 0.5, 1]) {
+      const y = mT2 + (1 - t) * (base - mT2);
+      svg.appendChild(el("line", { x1: mL, x2: TW - mR, y1: y, y2: y, class: t ? "gridline" : "axis" }));
+      svg.appendChild(el("text", { x: mL - 10, y: y + 4, class: "tick", "text-anchor": "end" },
+        fmtInt(Math.round(maxE * t))));
+    }
+    D.episodes.forEach((e, i) => {
+      const h = Math.max((e / maxE) * (base - mT2), 1.5);
+      const g = el("rect", {
+        x: px(i) - bw / 2, y: base - h, width: bw, height: h,
+        rx: Math.min(3, bw / 2), fill: "var(--muted)", opacity: 0.55,
+      });
+      g.appendChild(el("title", {}, `${D.days[i]}　${fmtInt(e)} 場`));
+      svg.appendChild(g);
+    });
+    for (const i of dayTicks()) {
+      svg.appendChild(el("text", { x: px(i), y: H - 8, class: "tick", "text-anchor": "middle" },
+        shortDay(D.days[i])));
+    }
+  })();
+
+  // ---------- small multiples ----------
+  (function smallMultiples() {
+    const rows = D.series.slice().sort((a, b) => b.momentum - a.momentum);
+    const w = 200, h = 62;
+    const sx = i => (i / (N - 1)) * w;
+    document.getElementById("sm-grid").innerHTML = rows.map(r => {
+      // Each panel scales to its own peak.  A shared scale was tried and is
+      // useless here: #1 peaks at 57% while 24 of the 27 stay under 2.2%, so
+      // every panel but three renders as a flat line on the baseline.  The
+      // peak is printed on the panel so the scale can never be misread.
+      const peak = Math.max(...r.ma);
+      const top = peak > 0 ? peak * 1.15 : 1;
+      const sy = v => h - (v / top) * h;
+      const d = r.ma.map((v, i) => `${i ? "L" : "M"}${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join("");
+      const area = `M0,${h}L` + r.ma.map((v, i) => `${sx(i).toFixed(1)},${sy(v).toFixed(1)}`).join("L") + `L${w},${h}Z`;
+      const c = colorOf.get(r.id) || "var(--muted)";
+      const up = r.momentum >= 0;
+      return `<div class="sm">
+        <div class="name"><span class="chip" style="background:${c}"></span>${r.label}</div>
+        <svg viewBox="0 0 ${w} ${h + 2}" width="100%" height="${h + 2}" preserveAspectRatio="none" role="img" aria-label="${r.label} 的佔比走勢">
+          <path d="${area}" fill="${c}" opacity="0.10"/>
+          <path d="${d}" fill="none" stroke="${c}" stroke-width="1.6" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>
+          <circle cx="${sx(N - 1).toFixed(1)}" cy="${sy(r.ma[N - 1]).toFixed(1)}" r="2.6" fill="${c}"/>
+        </svg>
+        <div class="figs">現在 ${fmtPct(r.recent)}　·　<span class="delta" style="color:${up ? "var(--pos)" : "var(--neg)"}">${fmtPP(r.momentum)}</span>　·　峰值 ${fmtPct(peak)}</div>
+      </div>`;
+    }).join("");
+  })();
+
+  // ---------- table ----------
+  (function table() {
+    const cols = D.series;
+    const head = `<tr><th>日期</th><th>場數</th>` +
+      cols.map(s => `<th title="${s.label}">#${s.id}</th>`).join("") +
+      `<th>其餘</th></tr>`;
+    const body = D.days.map((d, i) =>
+      `<tr><td>${d}</td><td>${fmtInt(D.episodes[i])}</td>` +
+      cols.map(s => `<td>${pct(s.share[i]).toFixed(1)}</td>`).join("") +
+      `<td>${pct(D.rest.share[i]).toFixed(1)}</td></tr>`
+    ).join("");
+    document.getElementById("tablewrap").innerHTML =
+      `<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  })();
+
+  document.getElementById("footer").innerHTML =
+    `牌組身分沿用 <code>data/archetypes.json</code> 已定版的 ${fmtInt(D.meta.n_archetypes)} 個 cluster` +
+    `（multiset Jaccard ≥ 0.90 對代表牌表），不重新分群 —— archetype id 是 append-only 的，` +
+    `重分群會讓 id 與已訓練的 checkpoint 對不上。<br>` +
+    `分母是當天所有成功解析的牌組出場數，含未分群的牌表；未分群者計為「其他」，不參與前 ${D.meta.top_n} 的競爭。<br>` +
+    `重跑：<code>uv run python -m ptcg_mine.deck_meta_trend --raw-dir raw --data-dir data</code>`;
+})();
+</script>

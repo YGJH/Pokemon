@@ -23,7 +23,7 @@
 - Run tests from the repo root: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest <path>`. The env var is required (ROS steals plugin autoload). `pyproject.toml` sets `pythonpath = [".", "python"]`.
 - **`tests/` and `python/tests/` must be run separately** — they share basenames and collection fails if combined.
 - Tests that count occurrences must fail on zero examined. Validate each new guard by **mutation**: break it deliberately, confirm the test goes red, restore.
-- Do not run `git commit` unless the executing session is told to. Commit steps below are written for a worker that has been given that permission; if not, stop at the passing test.
+- **NO GIT COMMANDS AT ALL in this run.** The repository owner has explicitly declined commits and branching. Every task's "Commit" step is **skipped** — finish at the passing test. Do not run `git commit`, `git add`, `git mv`, `git rm`, `git checkout`, `git stash`, or any other git subcommand that writes. Use plain `mv` and `rm` for file moves and deletions. Read-only inspection (`git diff`, `git log`, `git show`) is fine. Changes accumulate in the working tree and the owner commits when they choose.
 - **A training run may be in flight.** At the time of writing, `ptcg_il.cli train --archetype-self 1 --seed 2` had been running for 5+ hours against the existing shards. Phase 2 must not disturb it: no task rebuilds shards until Task 15, and every code change must keep reading the *existing* shards (which still carry `bel_*` and `log_*` keys) without error. Check `nvidia-smi` before starting Task 15.
 - **Checkpoints trained with belief weights must keep loading.** Task 10 establishes this and every later task preserves it. A checkpoint from the in-flight run carries `belief.*` and `belief_heads.*` parameters that the post-removal `Policy` does not define.
 
@@ -55,8 +55,8 @@ Relocate `ArchetypePosterior` and add the two helpers that configure it for the 
 
 ```bash
 cd /home/charles/Documents/Pokemon
-git mv python/ptcg_rl/belief.py python/ptcg_il/deck_prior.py
-git mv python/tests/test_rl_belief.py python/tests/test_deck_prior.py
+mv python/ptcg_rl/belief.py python/ptcg_il/deck_prior.py
+mv python/tests/test_rl_belief.py python/tests/test_deck_prior.py
 ```
 
 If the worker lacks git permission, use `mv` instead — the file content matters, not the git history.
@@ -309,15 +309,9 @@ Expected: `test_zero_frequency_is_floored_not_made_impossible` FAILS. Restore th
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/ -q -x --co 2>&1 | tail -5`
 Expected: collection succeeds with no `ImportError`. This catches any straggling `ptcg_rl.belief` import that the grep in Step 4 missed inside a function body.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 11: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/deck_prior.py python/ptcg_rl/belief.py \
-        python/tests/test_deck_prior.py python/tests/test_rl_belief.py \
-        python/ptcg_il/belief_infer.py
-git commit -m "refactor: move ArchetypePosterior to ptcg_il.deck_prior, add prior helpers"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -334,7 +328,9 @@ There are currently **three** implementations of "which opponent cards can I see
 - Produces:
   - `observed_cards_from_state(state: dict, your_index: int) -> Counter[int]`
   - `observed_cards_from_obs(obs_dict: dict) -> Counter[int]`
-  - `ObservedOpponentCards` with `.reset() -> None`, `.observe(obs_dict: dict) -> None`, `.counts() -> Counter[int]`, `.multiset() -> list[int]`
+  - `ObservedOpponentCards` with `.reset() -> None`, `.observe(obs_dict: dict) -> None`, `.add_cards(card_ids: Iterable[int]) -> None`, `.counts() -> Counter[int]`, `.multiset() -> list[int]`
+
+`add_cards` is a first-class entry point, not a test affordance: `ptcg_rl` records `Decision.opp_visible_card_ids` as a flat id list (`vec_env.py:81`) and has no observation dict to hand over at determinization time. It takes the **same per-card-maximum** combining rule as `observe`, because that id list is itself one snapshot of the visible zones — summing it into a running total would double-count exactly as summing observations would.
 
 **Background the implementer needs.** Per `AGENT_SPEC.md:57`, face-down cards (`active[0]`, `prize[i]`) arrive as `None`, so an `isinstance(card, dict)` guard is what excludes hidden information — there is no leak here, and there must not be one introduced. Per `belief_labels.py:117-134`, cards carry a `playerIndex` naming their owner, and the Stadium sits at `state["stadium"]` as a **bare dict, not a list**, owned by whoever played it.
 
@@ -553,6 +549,52 @@ class TestObservedOpponentCards:
         seen.observe(_obs(self._state([46])))
         seen.counts()[46] = 99
         assert seen.counts()[46] == 1
+
+
+class TestAddCards:
+    """`ptcg_rl` records visible cards as a flat id list, not an observation."""
+
+    def test_adds_a_raw_id_list(self):
+        seen = ObservedOpponentCards()
+        seen.add_cards([50, 50, 51])
+        assert seen.counts() == Counter({50: 2, 51: 1})
+
+    def test_combines_by_maximum_like_observe(self):
+        """Same rule as observe: an id list is one snapshot of the visible
+        zones, so re-adding it must not double the counts."""
+        seen = ObservedOpponentCards()
+        seen.add_cards([52, 52])
+        seen.add_cards([52, 52])
+        assert seen.counts()[52] == 2
+
+    def test_a_larger_later_snapshot_raises_the_count(self):
+        seen = ObservedOpponentCards()
+        seen.add_cards([53])
+        seen.add_cards([53, 53, 53])
+        assert seen.counts()[53] == 3
+
+    def test_interoperates_with_observe(self):
+        seen = ObservedOpponentCards()
+        seen.observe(_obs({
+            "players": [
+                {"active": [], "bench": [], "discard": []},
+                {"active": [], "bench": [], "discard": [{"id": 54}]},
+            ],
+        }))
+        seen.add_cards([55])
+        assert seen.counts() == Counter({54: 1, 55: 1})
+
+    def test_reset_clears_added_cards(self):
+        seen = ObservedOpponentCards()
+        seen.add_cards([56])
+        seen.reset()
+        assert seen.counts() == Counter()
+
+    def test_empty_list_is_a_no_op(self):
+        seen = ObservedOpponentCards()
+        seen.add_cards([57])
+        seen.add_cards([])
+        assert seen.counts() == Counter({57: 1})
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -667,7 +709,22 @@ class ObservedOpponentCards:
         self._counts.clear()
 
     def observe(self, obs_dict: dict) -> None:
-        for cid, n in observed_cards_from_obs(obs_dict).items():
+        """Fold one observation's visible cards into the record."""
+        self._merge(observed_cards_from_obs(obs_dict))
+
+    def add_cards(self, card_ids: Iterable[int]) -> None:
+        """Fold a raw multiset of engine card ids into the record.
+
+        ``ptcg_rl`` records the opponent's visible cards as a flat id list
+        (``Decision.opp_visible_card_ids``) and has no observation dict to hand
+        over at determinization time.  The combining rule is the same maximum
+        ``observe`` uses: that list is one snapshot of the visible zones, so
+        adding it twice must not double the counts.
+        """
+        self._merge(Counter(int(c) for c in card_ids))
+
+    def _merge(self, snapshot: Counter[int]) -> None:
+        for cid, n in snapshot.items():
             if n > self._counts[cid]:
                 self._counts[cid] = n
 
@@ -680,7 +737,7 @@ class ObservedOpponentCards:
         return list(self._counts.elements())
 ```
 
-You must also add `Counter` to the module's imports — it is already imported at the top of the moved file (`from collections import Counter`), so verify rather than duplicate.
+`Counter` is already imported at the top of the moved file (`from collections import Counter`) — verify rather than duplicate. `Iterable` is already imported too (`from typing import Any, Iterable, Sequence`).
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -697,13 +754,9 @@ Expected: `test_our_own_stadium_is_not_evidence_about_them` and `test_energy_we_
 
 Confirm green after restoring both.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/deck_prior.py python/tests/test_deck_prior.py
-git commit -m "feat: observation accumulator for opponent-visible cards"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -717,7 +770,9 @@ The caller-facing object. Everything downstream talks to this and nothing else.
 
 **Interfaces:**
 - Consumes: Tasks 1–2
-- Produces: `OpponentDeckPredictor(archetypes: dict, *, ids: Sequence[int] | None = None, use_frequency_prior: bool = True, epsilon: float = DEFAULT_EPSILON)` with `.reset() -> None`, `.observe(obs_dict: dict) -> None`, `.posterior() -> dict[int, float]`, `.template() -> list[int]`, `.sample_templates(k: int, rng) -> list[list[int]]`, and attribute `.ids: list[int]`
+- Produces: `OpponentDeckPredictor(archetypes: dict, *, ids: Sequence[int] | None = None, use_frequency_prior: bool = True, epsilon: float = DEFAULT_EPSILON)` with `.reset() -> None`, `.observe(obs_dict: dict) -> None`, `.observe_cards(card_ids: Iterable[int]) -> None`, `.posterior() -> dict[int, float]`, `.template() -> list[int]`, `.sample_templates(k: int, rng) -> list[list[int]]`, and attribute `.ids: list[int]`
+
+`observe_cards` forwards to `ObservedOpponentCards.add_cards` and is what `ptcg_rl` calls in Task 4. Nothing outside the class touches `_seen`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -779,15 +834,22 @@ class TestTemplateNeverAbstains:
         pred = OpponentDeckPredictor(PRED_ARCHETYPES)
         for ids in ([], [999], [100] * 4, [200] * 4, [100, 200, 300]):
             pred.reset()
-            pred._seen._counts.update(ids)   # inject observations directly
+            pred.observe_cards(ids)
             assert pred.template(), f"abstained on {ids}"
 
     def test_evidence_overrides_the_prior(self):
         """Elimination is the mechanism: four copies of card 200 rule out the
         900-frequency favourite outright."""
         pred = OpponentDeckPredictor(PRED_ARCHETYPES)
-        pred._seen._counts.update([200] * 4)
+        pred.observe_cards([200] * 4)
         assert set(pred.template()) == {200}
+
+    def test_an_unknown_card_does_not_abstain(self):
+        """A card no archetype contains leaves every hypothesis equally
+        penalised; the predictor must still commit."""
+        pred = OpponentDeckPredictor(PRED_ARCHETYPES)
+        pred.observe_cards([999])
+        assert len(pred.template()) == 60
 
 
 class TestPredictorObservation:
@@ -854,7 +916,7 @@ class TestSampleTemplates:
 
     def test_a_collapsed_posterior_yields_the_same_world(self):
         pred = OpponentDeckPredictor(PRED_ARCHETYPES)
-        pred._seen._counts.update([200] * 4)
+        pred.observe_cards([200] * 4)
         decks = pred.sample_templates(20, np.random.default_rng(0))
         assert {tuple(d) for d in decks} == {tuple([200] * 60)}
 
@@ -938,6 +1000,14 @@ class OpponentDeckPredictor:
     def observe(self, obs_dict: dict) -> None:
         """Fold one observation into the running record."""
         self._seen.observe(obs_dict)
+
+    def observe_cards(self, card_ids: Iterable[int]) -> None:
+        """Fold a raw multiset of engine card ids into the running record.
+
+        For callers holding an id list rather than an observation — ``ptcg_rl``
+        records ``Decision.opp_visible_card_ids`` that way.
+        """
+        self._seen.add_cards(card_ids)
 
     # ── Read-out ────────────────────────────────────────────────────────
 
@@ -1050,9 +1120,9 @@ def test_evidence_from_a_real_decklist_recovers_that_decklist(archetypes):
     hits = 0
     for aid in top:
         deck = [int(c) for c in entries[aid]["representative"]]
-        revealed = list(rng.choice(deck, size=20, replace=False))
+        revealed = [int(c) for c in rng.choice(deck, size=20, replace=False)]
         pred.reset()
-        pred._seen._counts.update(revealed)
+        pred.observe_cards(revealed)
         if sorted(pred.template()) == sorted(deck):
             hits += 1
         examined += 1
@@ -1066,14 +1136,9 @@ def test_evidence_from_a_real_decklist_recovers_that_decklist(archetypes):
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/test_deck_prior_real.py -v`
 Expected: PASS (or `skip` if `python/data/archetypes.json` is absent — check that it is present before accepting a skip).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/deck_prior.py python/tests/test_deck_prior.py \
-        python/tests/test_deck_prior_real.py
-git commit -m "feat: OpponentDeckPredictor over all archetypes with frequency prior"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1240,13 +1305,13 @@ def _opp_deck_templates(
     if obs_dict:
         predictor.observe(obs_dict)
     if observed_card_ids:
-        predictor._seen._counts.update(int(c) for c in observed_card_ids)
+        predictor.observe_cards(observed_card_ids)
     return predictor.sample_templates(k, np.random.default_rng(seed))
 ```
 
 Add `import functools` to the module's imports if it is not already there. Verify `Path` and `json` are already imported at module scope (they are — `_fixed_deck` and `_load_archetypes` use both).
 
-Note the mutation of `predictor._seen._counts`: `observed_card_ids` arrives pre-extracted from `Decision.opp_visible_card_ids`, so it is a flat list of ids rather than an observation. Task 5 does not need this path; it is here only because the RL rollout already records ids.
+`observe_cards` rather than `observe` for the id list: `observed_card_ids` arrives pre-extracted from `Decision.opp_visible_card_ids` (`vec_env.py:81`), so it is a flat list of engine ids, not an observation. Both go through the same per-card-maximum merge, so passing both — as this function does — cannot double-count a card that appears in each.
 
 - [ ] **Step 4: Update the call site**
 
@@ -1288,13 +1353,9 @@ Expected: `test_a_missing_artifact_raises_rather_than_returning_mirrors` and `te
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/ -q -k "rl or mcts"`
 Expected: PASS. `test_rl_mcts_wiring.py` exercises this path; if it stubs `_sample_opp_deck` by name, repoint the stub to `_opp_deck_templates` and adjust for the list return.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_rl/train.py python/tests/test_rl_opp_deck.py
-git commit -m "fix: RL determinization used mirror decks via a swallowed AttributeError"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1497,14 +1558,9 @@ Expected: no output. If a shell script or spec names the old key, update it — 
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/ -q -k "live_eval or cli or planner"`
 Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 9: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/live_eval.py python/ptcg_il/cli.py \
-        python/tests/test_live_eval_planner.py
-git commit -m "feat: prior-driven opponent model in the live-eval search planner"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1560,7 +1616,7 @@ These test tiers of a fallback chain that no longer exists. The `torch` import a
 - [ ] **Step 4: Run the search_infer suite**
 
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/test_search_infer.py -v`
-Expected: PASS, 11 passed. The MCTS-registration and fallback-warning tests are untouched and must all still run — a drop below 11 means something was over-deleted.
+Expected: PASS, 9 passed. The file has 12 tests before this task; the three deleted above leave 9. (An earlier draft of this plan said 11 — that was a miscount, corrected after Task 6 was implemented.) The MCTS-registration and fallback-warning tests are untouched and must all still run — a drop below 9 means something was over-deleted.
 
 - [ ] **Step 5: Confirm the module imports without torch**
 
@@ -1574,13 +1630,9 @@ print('clean')
 ```
 Expected: `clean`. The bundle imports this at agent load; a torch dependency creeping in here is a load-time cost on every Kaggle game.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/search_infer.py python/tests/test_search_infer.py
-git commit -m "refactor: drop the belief fallback chain from search_infer"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1598,14 +1650,19 @@ git commit -m "refactor: drop the belief fallback chain from search_infer"
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `tests/test_build_submission.py`:
+Add to `tests/test_build_submission.py`. The existing `test_greedy_main_py_calls_no_search` walks the AST inline; hoist that walk into a module-level helper first so both tests share one implementation:
 
 ```python
-def test_mcts_main_py_uses_the_prior_predictor(bs):
-    """Parsed, not grepped."""
+def _imports_and_calls(source: str) -> tuple[set[str], set[str]]:
+    """(imported names, called names) for a template, parsed rather than grepped.
+
+    Both main.py templates are checked for what they do and do not reference,
+    and their prose mentions the very symbols being asserted absent — so a
+    substring search over the template text reports false positives.
+    """
     import ast
 
-    tree = ast.parse(bs.MAIN_PY_TEMPLATE)
+    tree = ast.parse(source)
     imported, called = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -1617,6 +1674,11 @@ def test_mcts_main_py_uses_the_prior_predictor(bs):
             fn = node.func
             called.add(fn.id if isinstance(fn, ast.Name)
                        else fn.attr if isinstance(fn, ast.Attribute) else "")
+    return imported, called
+
+
+def test_mcts_main_py_uses_the_prior_predictor(bs):
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE)
 
     assert "OpponentDeckPredictor" in imported
     assert "OpponentDeckPredictor" in called
@@ -1650,21 +1712,7 @@ def test_bundled_deck_prior_has_no_unrewritten_imports(bs, tmp_path, monkeypatch
 
 
 def test_greedy_main_py_calls_no_search(bs):
-    """Parsed, not grepped: the template's prose mentions the search it drops."""
-    import ast
-
-    tree = ast.parse(bs.MAIN_PY_TEMPLATE_GREEDY)
-    imported, called = set(), set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            imported.add(node.module or "")
-            imported.update(a.name for a in node.names)
-        elif isinstance(node, ast.Import):
-            imported.update(a.name for a in node.names)
-        elif isinstance(node, ast.Call):
-            fn = node.func
-            called.add(fn.id if isinstance(fn, ast.Name)
-                       else fn.attr if isinstance(fn, ast.Attribute) else "")
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE_GREEDY)
 
     assert not any("search_infer" in m for m in imported), imported
     assert not any("deck_prior" in m for m in imported), imported
@@ -1674,7 +1722,7 @@ def test_greedy_main_py_calls_no_search(bs):
     assert "featurize" in called
 ```
 
-Replace the existing `test_greedy_main_py_calls_no_search` (lines 203–224) with the version above — it drops the `predict_opponent_deck` assertion for a symbol that no longer exists and adds the `deck_prior` equivalents.
+Replace the existing `test_greedy_main_py_calls_no_search` (lines 203–224) with the version above: its inline AST walk moves to `_imports_and_calls`, it drops the `predict_opponent_deck` assertion for a symbol that no longer exists, and it gains the `deck_prior` equivalents.
 
 Ensure `from pathlib import Path` is imported in the test module; add it if absent.
 
@@ -1819,13 +1867,9 @@ print('template len:', len(ns['_opp_predictor'].template()))
 ```
 Expected: `agent loaded: True`, an id count in the hundreds (not 9), and `template len: 60`. A `NameError` on `__file__` here is the failure this step exists to catch.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add scripts/build_submission.py tests/test_build_submission.py
-git commit -m "feat: bundle the archetype-prior opponent model instead of belief inference"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1854,7 +1898,7 @@ Expected: only `python/tests/test_belief.py`. Anything else means a task was ski
 
 ```bash
 cd /home/charles/Documents/Pokemon
-git rm python/ptcg_il/belief_infer.py
+rm python/ptcg_il/belief_infer.py
 ```
 
 - [ ] **Step 3: Prune the orphaned tests**
@@ -1889,13 +1933,9 @@ Expected: both PASS. Report any failure with its output rather than adjusting th
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest python/tests/ -q -k "train_loop or belief or policy"`
 Expected: PASS. The belief heads still train; only their inference consumers are gone.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/belief_infer.py python/tests/test_belief.py
-git commit -m "refactor: delete the belief-driven opponent deck oracle"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -1944,13 +1984,9 @@ Create `docs/superpowers/specs/2026-08-12-prior-determinizer-results.md` with: t
 - **No significant difference:** the change still stands on its own — it deletes a dead RL path, removes a forward pass per decision, and consolidates three copies of the visible-cards logic — but say so plainly in the writeup rather than implying a win.
 - **Prior planner loses:** stop and report. Do not tune `epsilon` or the prior to chase it; a loss against the mirror despite a 3× overlap advantage means something about the determinizer's use of the template is not what this design assumed, and that needs diagnosis, not knob-turning.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add docs/superpowers/specs/2026-08-12-prior-determinizer-results.md
-git commit -m "docs: live A/B results for the prior-based determinizer"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2080,13 +2116,9 @@ Expected: PASS.
 Change `_RETIRED_PREFIXES` to `("",)` (drop everything).
 Expected: `test_a_genuinely_unknown_key_still_raises` FAILS. Restore.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add python/ptcg_il/model/policy.py python/tests/test_model_policy.py
-git commit -m "feat: tolerate retired belief parameters when loading checkpoints"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2152,13 +2184,9 @@ uv run python -m ptcg_il.cli train --data-dir data --out-dir /tmp/belief-smoke \
 ```
 Expected: 20 steps complete and a val line prints. The shards still contain `bel_*` arrays; nothing should read them. If this OOMs or contends with the in-flight run, add `CUDA_VISIBLE_DEVICES=""` to force CPU.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add -u
-git commit -m "refactor: remove the auxiliary belief heads, loss and metrics"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2231,13 +2259,9 @@ In `scripts/build_submission.py`, remove `"belief.py"` from `MODEL_FILES` (line 
 Run: `cd /home/charles/Documents/Pokemon && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest tests/test_build_submission.py -q`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add -u
-git commit -m "refactor: remove the game-log belief encoder from the policy trunk"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2319,13 +2343,9 @@ print('removed keys:', sorted(set(old.files) - set(new.files)))
 ```
 Expected: ~8.9% smaller, and the removed keys are exactly the `bel_*` and `log_*` set. A smaller reduction means something is still being written.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add -u && git add -A python/ptcg_il/
-git commit -m "refactor: stop writing belief labels and game-log tensors"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2382,13 +2402,9 @@ grep -rn "belief" --include="*.py" . | grep -v worktrees | grep -v "label" | wc 
 ```
 Expected: both suites PASS, and the grep count is 0 (or only comments you deliberately kept).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add -u
-git commit -m "refactor: retire the belief CLI surface and RL load filters"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 
@@ -2460,13 +2476,9 @@ Create `docs/superpowers/specs/2026-08-12-belief-removal-results.md` with all si
 - **Accuracy regresses:** the likely culprit is Half B, not Half A — the log encoder was a real policy input, and Half A was measured at 0.5% of compute with no consumer. Restoring `BeliefModule` alone is the targeted fix: revert Task 12 and Task 13's featurizer/log portions, keep everything else. Do not revert wholesale, and do not conclude the auxiliary heads mattered without testing that separately.
 - Record the result either way. A regression here is the measurement that Phase 2 was explicitly taken without.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Do NOT commit**
 
-```bash
-cd /home/charles/Documents/Pokemon
-git add docs/superpowers/specs/2026-08-12-belief-removal-results.md
-git commit -m "docs: belief removal results"
-```
+This run makes no commits (see Global Constraints). Leave the changes in the working tree and report the files you touched. Do not run any git subcommand that writes.
 
 ---
 

@@ -11,9 +11,11 @@ to print them and compare nothing.
 import ast
 import hashlib
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -200,11 +202,16 @@ def test_absent_pins_are_not_treated_as_mismatches(bs, data_dir):
 # actually diverge.
 
 
-def test_greedy_main_py_calls_no_search(bs):
-    """Parsed, not grepped: the template's prose mentions the search it drops."""
+def _imports_and_calls(source: str) -> tuple[set[str], set[str]]:
+    """(imported names, called names) for a template, parsed rather than grepped.
+
+    Both main.py templates are checked for what they do and do not reference,
+    and their prose mentions the very symbols being asserted absent — so a
+    substring search over the template text reports false positives.
+    """
     import ast
 
-    tree = ast.parse(bs.MAIN_PY_TEMPLATE_GREEDY)
+    tree = ast.parse(source)
     imported, called = set(), set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -216,10 +223,60 @@ def test_greedy_main_py_calls_no_search(bs):
             fn = node.func
             called.add(fn.id if isinstance(fn, ast.Name)
                        else fn.attr if isinstance(fn, ast.Attribute) else "")
+    return imported, called
+
+
+def test_mcts_main_py_uses_the_prior_predictor(bs):
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE)
+
+    assert "OpponentDeckPredictor" in imported
+    assert "OpponentDeckPredictor" in called
+    assert "mcts_search" in called
+    assert "observe" in called, "the predictor must be fed each observation"
+    assert "template" in called
+    assert "reset" in called, "a new game must clear the previous opponent"
+    # The retired path
+    assert "predict_opponent_deck" not in called
+    assert "extract_opp_visible_cards" not in called
+    assert "belief_logits" not in called
+
+
+def test_mcts_package_bundles_deck_prior(bs, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    src = Path(bs.__file__).resolve().parents[1]
+    bs.build_model_package(src, tmp_path / "sub", mcts=True)
+    assert (tmp_path / "sub" / "model" / "deck_prior.py").exists()
+    assert not (tmp_path / "sub" / "model" / "belief_posterior.py").exists()
+
+
+def test_bundled_deck_prior_has_no_unrewritten_imports(bs, tmp_path, monkeypatch):
+    """A missed rewrite rule fails only at agent runtime, on Kaggle.
+
+    Checks actual import statements, not a bare substring: deck_prior.py's
+    docstring legitimately cross-references ``ptcg_il.belief_labels`` in prose
+    (comparing this module's behavior to a validated definition elsewhere),
+    which is not an unrewritten import and must not fail this guard.
+    """
+    import re
+
+    monkeypatch.chdir(tmp_path)
+    src = Path(bs.__file__).resolve().parents[1]
+    bs.build_model_package(src, tmp_path / "sub", mcts=True)
+    for name in ("deck_prior.py", "search_infer.py"):
+        text = (tmp_path / "sub" / "model" / name).read_text()
+        assert not re.search(r"(?m)^\s*(from|import)\s+ptcg_il\b", text), (
+            f"{name} has an unrewritten ptcg_il import")
+        assert not re.search(r"(?m)^\s*(from|import)\s+ptcg_rl\b", text), (
+            f"{name} has an unrewritten ptcg_rl import")
+
+
+def test_greedy_main_py_calls_no_search(bs):
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE_GREEDY)
 
     assert not any("search_infer" in m for m in imported), imported
+    assert not any("deck_prior" in m for m in imported), imported
     assert "mcts_search" not in called
-    assert "predict_opponent_deck" not in called
+    assert "OpponentDeckPredictor" not in called
     assert "select_multi" in called, "multi-select decisions still need the AR path"
     assert "featurize" in called
 
@@ -313,11 +370,129 @@ def test_find_libcg_runs_without_dunder_file(bs, tmp_path, monkeypatch):
     assert ns["_find_libcg"]() == str(tmp_path / name)
 
 
+def _exec_find_libcg(bs, ns_extra=None):
+    """Exec the template's engine-discovery fragments into a fresh namespace."""
+    import ast
+
+    src = bs.MAIN_PY_TEMPLATE
+    tree = ast.parse(src)
+    wanted = {"_AGENT_DIR", "_libcg_name", "_find_libcg"}
+    chunks = []
+    for node in tree.body:
+        names = ({t.id for t in node.targets if isinstance(t, ast.Name)}
+                 if isinstance(node, ast.Assign)
+                 else {node.name} if isinstance(node, ast.FunctionDef) else set())
+        if names & wanted:
+            chunks.append(ast.get_source_segment(src, node))
+            wanted -= names
+    assert not wanted, f"template no longer defines {wanted}"
+    ns = {"os": __import__("os"), "__name__": "main"}
+    ns.update(ns_extra or {})
+    exec(compile("\n".join(chunks), "main.py", "exec"), ns)
+    return ns
+
+
+def test_find_libcg_finds_the_engine_the_builder_bundles(bs, tmp_path, monkeypatch):
+    """The builder puts the engine in ``data/`` — next to libptcg_search.so —
+    so discovery has to look there.
+
+    It did not, and that is the whole bug: on Kaggle the agent process has no
+    importable ``cg`` package (the ``import cg.sim`` branch never fires), so
+    every candidate missed, `_find_libcg` returned the bare name, `puct_init`
+    got a path dlopen could not resolve, and every decision fell to greedy.
+    """
+    monkeypatch.chdir(tmp_path)
+    ns = _exec_find_libcg(bs)
+    name = ns["_libcg_name"]()
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / name).write_bytes(b"\x7fELF")
+    assert ns["_find_libcg"]() == str(data / name), (
+        "the engine sits in data/ in the bundle; discovery must look there")
+
+
+# ── Kaggle picks the entry point by position, not by name ────────────────
+#
+# `kaggle_environments.agent.get_last_callable` execs main.py and returns
+# ``[v for v in env.values() if callable(v)][-1]`` — the *last* callable bound
+# at module level.  Nothing looks for the name `agent`.  `MAIN_PY_TEMPLATE`
+# defined `_libcg_name`/`_find_libcg` after `agent`, so Kaggle called
+# `_find_libcg`, whose `co_argcount` is 0 (`agent.py` truncates the args to the
+# callee's arity, so it does not even raise).  It returned a *path string*,
+# which failed the `"type": "array"` action schema, so the action became the
+# default `[]` and cabt's interpreter reported
+# ``Player 1's deck does not have 60 cards.`` — with both players INVALID at
+# step 0, an empty stdout, and no traceback anywhere.
+#
+# `verify_model_imports` cannot see this: it reaches the agent by name.
+
+
+def _exec_module_level_defs(bs, template):
+    """Bind the template's module-level `def`/`class` statements, in order.
+
+    Only definitions — executing the real top level would load torch and the
+    packaged checkpoints.  That is enough to reproduce Kaggle's choice, because
+    a `def` binds its name at exactly the point it appears, which is the order
+    `env.values()` preserves.  Annotations are deferred so a definition needing
+    a name the fragment never binds still compiles.
+    """
+    src = getattr(bs, template)
+    chunks = [
+        ast.get_source_segment(src, node)
+        for node in ast.parse(src).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    assert chunks, f"{template} defines nothing at module level"
+
+    ns = {"__name__": "main"}
+    exec(compile("from __future__ import annotations\n" + "\n".join(chunks),
+                 "main.py", "exec"), ns)
+    return ns
+
+
+@pytest.mark.parametrize("template", ["MAIN_PY_TEMPLATE", "MAIN_PY_TEMPLATE_GREEDY"])
+def test_agent_is_the_last_callable_kaggle_sees(bs, template):
+    ns = _exec_module_level_defs(bs, template)
+
+    callables = [v for v in ns.values() if callable(v)]  # kaggle agent.py:64
+    assert callables, f"{template} bound no callable"
+    picked = callables[-1]
+
+    assert getattr(picked, "__name__", None) == "agent", (
+        f"{template}: Kaggle would call {picked.__name__}(), not agent(). "
+        f"Move it above `def agent` — the runner takes the last callable bound "
+        f"at module level, and re-assigning `agent = agent` does not help "
+        f"(a dict keeps a re-bound key in its original position).")
+
+
+@pytest.mark.parametrize("template", ["MAIN_PY_TEMPLATE", "MAIN_PY_TEMPLATE_GREEDY"])
+def test_no_callable_is_bound_after_agent(bs, template):
+    """The `def` check above misses `f = lambda: ...` and `f = partial(...)`,
+    which bind a callable just as well and would take the slot back."""
+    src = getattr(bs, template)
+    body = ast.parse(src).body
+
+    agent_at = [i for i, n in enumerate(body)
+                if isinstance(n, ast.FunctionDef) and n.name == "agent"]
+    assert len(agent_at) == 1, f"{template} defines agent {len(agent_at)} times"
+
+    trailing = [
+        t.id
+        for node in body[agent_at[0] + 1:] if isinstance(node, ast.Assign)
+        for t in node.targets if isinstance(t, ast.Name)
+        if isinstance(node.value, (ast.Lambda, ast.Call))
+    ]
+    assert not trailing, (
+        f"{template} binds {trailing} after `agent`; if any of them is callable "
+        f"Kaggle calls it instead of the agent")
+
+
 # ── Feature widths belong to the checkpoint, not to a literal ────────────
 #
 # `F_CARD` moved 94 → 212 when the ability/attack keyword features landed.
 # Every other architecture dim in the template is read from the checkpoint's
-# `config` (`D`, `heads`, `layers`, `ff`, `n_opp_arch`, `n_all_cards`), and the
+# `config` (`D`, `heads`, `layers`, `ff`, `n_all_cards`), and the
 # packaged `.npy` tables are rebuilt from `ptcg_mine.cards` at packaging time,
 # so both ends moved on their own — a hardcoded width is the one thing that
 # cannot.  It fails at `verify_model_imports`, which is the good case; the same
@@ -418,7 +593,7 @@ def _exec_table_fragment(bs, template):
         "np": np,
         "torch": torch,
         "sys": sys,
-        "_cfg": {"D": 32, "heads": 2, "layers": 1, "ff": 64, "n_opp_arch": 1,
+        "_cfg": {"D": 32, "heads": 2, "layers": 1, "ff": 64,
                  "feat_dims": {"F_CARD": F_CARD, "F_ATK": F_ATK}},
         "_engine_card_features": {
             7: np.zeros(F_CARD, dtype=np.float32),
@@ -457,9 +632,7 @@ def test_agent_policy_can_gather_every_card_feature(bs, template):
     """
     import torch
 
-    from ptcg_il.featurizer import (
-        CARD_FEAT_SOURCES, F_ATK, F_CARD, LOG_CARD_ID_COLUMN,
-    )
+    from ptcg_il.featurizer import CARD_FEAT_SOURCES, F_ATK, F_CARD
     from ptcg_il.model.policy import Policy
 
     ns = _exec_table_fragment(bs, template)
@@ -473,7 +646,6 @@ def test_agent_policy_can_gather_every_card_feature(bs, template):
 
     x = {id_key: torch.ones(1, 4, dtype=torch.long)
          for id_key, _kind in CARD_FEAT_SOURCES.values()}
-    x["log_feat"] = torch.ones(1, 4, LOG_CARD_ID_COLUMN + 1)
     out = policy._gather_card_feats(x)
 
     widths = {"card": F_CARD, "attack": F_ATK}
@@ -482,7 +654,6 @@ def test_agent_policy_can_gather_every_card_feature(bs, template):
         assert out[feat_key].shape[-1] == widths[kind], (
             f"{template} builds a {kind} table {out[feat_key].shape[-1]} wide, "
             f"not {widths[kind]}")
-    assert out["log_card_feat"].shape[-1] == F_CARD
 
 
 def _template_func(bs, template, name):
@@ -651,3 +822,256 @@ def test_no_packaged_module_still_imports_ptcg_il(bs):
         + "\n  ".join(survivors)
         + "\nAdd a REWRITE_RULES entry for the import form, or justify it in "
           "_DEAD_IN_BUNDLE.")
+
+
+# ── Ensemble + MCTS support ───────────────────────────────────────────────
+#
+# Before the ensemble+MCTS change, MAIN_PY_TEMPLATE had no ensemble detection
+# and `is_ensemble` forced `mcts=False`.  Now ensemble mode also supports MCTS,
+# and the MCTS main.py template detects and loads EnsemblePolicy when the
+# bundle carries an ensemble.json manifest.
+
+
+def test_mcts_template_now_detects_ensemble(bs):
+    """MAIN_PY_TEMPLATE must reference _ENSEMBLE_MANIFEST and EnsemblePolicy
+    so that an ensemble+MCTS bundle loads the right model."""
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE)
+
+    assert "EnsemblePolicy" in imported, (
+        "MAIN_PY_TEMPLATE must import EnsemblePolicy for ensemble+MCTS support")
+    assert "OpponentDeckPredictor" in called, (
+        "ensemble+MCTS must still use the opponent deck prior")
+    assert "mcts_search" in called, (
+        "ensemble+MCTS must still run tree search")
+
+
+def test_mcts_template_ensemble_path_loads_from_checkpoints(bs):
+    """The EnsemblePolicy.load path in MAIN_PY_TEMPLATE must be present."""
+    # Parse the template to find the from_checkpoints call
+    call = _template_call(
+        bs, "MAIN_PY_TEMPLATE",
+        lambda n: isinstance(n.func, ast.Attribute)
+        and n.func.attr == "from_checkpoints")
+    assert call, (
+        "MAIN_PY_TEMPLATE must call EnsemblePolicy.from_checkpoints "
+        "when an ensemble manifest is present")
+
+
+def test_ensemble_mcts_package_bundles_search_modules(bs, tmp_path, monkeypatch):
+    """Ensemble+MCTS must bundle search_infer.py, deck_prior.py — the files
+    that the old ensemble=greedy-only code deliberately dropped."""
+    import shutil
+
+    monkeypatch.chdir(tmp_path)
+    # Build a fake repo under tmp_path so we never touch real source files.
+    # build_model_package reads from src/python/ptcg_il/model/ etc.
+    src = tmp_path / "repo"
+    model_src = src / "python" / "ptcg_il" / "model"
+    model_src.mkdir(parents=True)
+    for fname in bs.MODEL_FILES:
+        (model_src / fname).write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "ref_map.py").write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "featurizer.py").write_text("# stub\n")
+    # ensemble.py lives in ptcg_il/ directly (not model/)
+    (src / "python" / "ptcg_il" / "ensemble.py").write_text("# stub\n")
+    for rel, _dest in bs.EXTRA_FILES:
+        p = src / "python" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# stub\n")
+
+    # Ensemble + MCTS
+    bs.build_model_package(src, tmp_path / "ens_mcts", mcts=True)
+    for _rel, dest in bs.EXTRA_FILES:
+        assert (tmp_path / "ens_mcts" / "model" / dest).exists(), (
+            f"{dest} must be bundled for ensemble+MCTS")
+
+    # Ensemble + greedy still drops them
+    bs.build_model_package(src, tmp_path / "ens_greedy", mcts=False)
+    for _rel, dest in bs.EXTRA_FILES:
+        assert not (tmp_path / "ens_greedy" / "model" / dest).exists(), (
+            f"{dest} must NOT be bundled for ensemble+greedy")
+
+
+def test_ensemble_mcts_data_includes_archetypes(bs, tmp_path, monkeypatch):
+    """Ensemble+MCTS builds must copy archetypes.json (the opponent prior needs it)."""
+    monkeypatch.chdir(tmp_path)
+    # An MCTS build now refuses to package without the engine, so the fake repo
+    # has to carry one (see test_missing_engine_aborts_an_mcts_build).
+    src = _fake_repo_with_engine(bs, tmp_path)
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "vocab.json").write_text('{"size": 10}')
+    archetypes = {
+        "archetypes": [{"id": 0, "representative": list(range(60)), "frequency": 100}],
+        "self_ids": [0],
+        "opp_ids": [0],
+        "fixed_deck": list(range(60)),
+    }
+    (data / "archetypes.json").write_text(json.dumps(archetypes))
+
+    # Provide pre-built engine feature files so _build_engine_features_from_engine
+    # is skipped (it writes to dst, not data, and the test doesn't need it).
+    import numpy as np
+    np.save(data / "engine_card_features.npy", {})
+    np.save(data / "engine_attack_features.npy", {})
+    np.save(data / "evolution_map.npy", {})
+
+    # Mock _build_engine_features_from_engine so we don't need the real engine.
+    monkeypatch.setattr(bs, "_build_engine_features_from_engine",
+                        lambda src_dir, dst_dir: None)
+
+    deck = list(range(60))
+
+    # Ensemble + MCTS: must copy archetypes.json
+    mcts_data = tmp_path / "mcts_data"
+    bs.build_data_files(data, mcts_data, deck=deck, src_dir=src, mcts=True)
+    assert (mcts_data / "archetypes.json").exists(), (
+        "archetypes.json must be in the bundle for the opponent prior")
+
+    # Ensemble + greedy: must NOT copy archetypes.json
+    greedy_data = tmp_path / "greedy_data"
+    bs.build_data_files(data, greedy_data, deck=deck, src_dir=src, mcts=False)
+    assert not (greedy_data / "archetypes.json").exists(), (
+        "archetypes.json must NOT be in a greedy bundle")
+
+
+def _fake_repo_with_engine(bs, tmp_path, engine: bool = True):
+    """A repo tree holding just what `build_data_files` reads."""
+    src = tmp_path / "repo"
+    if engine:
+        cg = src.joinpath(*bs.ENGINE_DIR_PARTS)
+        cg.mkdir(parents=True)
+        (cg / "libcg.so").write_bytes(b"\x7fELF" + b"\0" * 64)
+    return src
+
+
+def test_mcts_bundle_carries_the_engine(bs, tmp_path, monkeypatch):
+    """`libcg.so` must be copied into the bundle for an MCTS build.
+
+    The Rust tree dlopens the engine by path, and the Kaggle agent process has
+    no `cg` package to borrow one from — so an engine missing from the bundle
+    means `puct_init` returns null and the agent plays greedy for the whole
+    competition.  Nothing at build or import time notices, because the repo
+    path this copies *from* exists locally.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bs, "_build_engine_features_from_engine",
+                        lambda src_dir, dst_dir: None)
+    src = _fake_repo_with_engine(bs, tmp_path)
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "vocab.json").write_text('{"size": 10}')
+    (data / "archetypes.json").write_text(json.dumps({
+        "archetypes": [{"id": 0, "representative": list(range(60)), "frequency": 1}],
+        "self_ids": [0], "opp_ids": [0], "fixed_deck": list(range(60)),
+    }))
+    deck = list(range(60))
+
+    mcts_data = tmp_path / "mcts_data"
+    bs.build_data_files(data, mcts_data, deck=deck, src_dir=src, mcts=True)
+    assert (mcts_data / "libcg.so").exists(), (
+        "MCTS bundles must carry libcg.so; the Rust tree cannot dlopen what "
+        "is not there")
+
+    # The greedy agent dlopens nothing, so it must not pay the 1.3 MB.
+    greedy_data = tmp_path / "greedy_data"
+    bs.build_data_files(data, greedy_data, deck=deck, src_dir=src, mcts=False)
+    assert not (greedy_data / "libcg.so").exists(), (
+        "a greedy bundle loads no engine; libcg.so must not be in it")
+
+
+def test_missing_engine_aborts_an_mcts_build(bs, tmp_path, monkeypatch):
+    """A missing engine must be fatal, not a warning.
+
+    Unlike libptcg_search.so — which is absent whenever cargo is — the engine
+    is vendored in the repo, so it can only be missing if the build is wrong.
+    Warning and continuing is what shipped the greedy-fallback submission.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bs, "_build_engine_features_from_engine",
+                        lambda src_dir, dst_dir: None)
+    src = _fake_repo_with_engine(bs, tmp_path, engine=False)
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "vocab.json").write_text('{"size": 10}')
+    (data / "archetypes.json").write_text(json.dumps({
+        "archetypes": [{"id": 0, "representative": list(range(60)), "frequency": 1}],
+        "self_ids": [0], "opp_ids": [0], "fixed_deck": list(range(60)),
+    }))
+
+    with pytest.raises(FileNotFoundError, match="libcg.so"):
+        bs.build_data_files(data, tmp_path / "out", deck=list(range(60)),
+                            src_dir=src, mcts=True)
+
+
+def test_build_main_py_ensemble_mcts_uses_mcts_template(bs, tmp_path):
+    """When mcts=True, build_main_py writes the MCTS template (now with
+    ensemble support), not the greedy one."""
+    bs.build_main_py(tmp_path, mcts=True)
+    text = (tmp_path / "main.py").read_text()
+    assert "mcts_search" in text
+    assert "OpponentDeckPredictor" in text
+    assert "from model.search_infer import mcts_search" in text
+
+    bs.build_main_py(tmp_path, mcts=False)
+    text = (tmp_path / "main.py").read_text()
+    assert "mcts_search" not in text
+    assert "OpponentDeckPredictor" not in text
+
+
+def test_greedy_template_still_has_no_search(bs):
+    """MAIN_PY_TEMPLATE_GREEDY must NOT gain MCTS imports — it is the
+    escape hatch for when search is unavailable."""
+    imported, called = _imports_and_calls(bs.MAIN_PY_TEMPLATE_GREEDY)
+    assert "mcts_search" not in called
+    assert "OpponentDeckPredictor" not in called
+    assert not any("search_infer" in m for m in imported), imported
+
+
+# ── Deck-out guard (mechanism A/B) wiring ─────────────────────────────────
+
+
+def test_greedy_template_wires_the_deck_guard(bs):
+    """The greedy submission must mask guaranteed deck-out options.
+
+    Mechanism A edits ``opt_mask`` before the forward pass (so both the
+    single-select masked_fill and select_multi's picked-mask honor it);
+    mechanism B re-ranks near-ties by deck delta in the single-select path.
+    Both live in model/deck_guard.py so live_eval shares one source.
+    """
+    imported, _called = _imports_and_calls(bs.MAIN_PY_TEMPLATE_GREEDY)
+    assert any("deck_guard" in m for m in imported), imported
+
+    src = _template_func(bs, "MAIN_PY_TEMPLATE_GREEDY", "agent")
+    assert "_guard.apply_mask" in src, "mechanism A is not applied in agent()"
+    assert "_guard.pick" in src, "mechanism B is not applied in agent()"
+
+
+def test_mcts_template_stays_unguarded(bs):
+    """Scope decision: only the greedy build carries the guard."""
+    imported, _called = _imports_and_calls(bs.MAIN_PY_TEMPLATE)
+    assert not any("deck_guard" in m for m in imported), imported
+
+
+def test_deck_guard_shipped_in_both_packages(bs, tmp_path):
+    """deck_guard.py vendors verbatim (like ref_map.py) in greedy AND mcts."""
+    src = tmp_path / "src"
+    model_src = src / "python" / "ptcg_il" / "model"
+    model_src.mkdir(parents=True)
+    for fname in bs.MODEL_FILES:
+        (model_src / fname).write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "ref_map.py").write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "featurizer.py").write_text("# stub\n")
+    (src / "python" / "ptcg_il" / "deck_guard.py").write_text(
+        "MARKER = 1\n")
+
+    bs.build_model_package(src, tmp_path / "greedy", mcts=False)
+    bs.build_model_package(src, tmp_path / "with_mcts", mcts=True)
+
+    for build in ("greedy", "with_mcts"):
+        out = tmp_path / build / "model" / "deck_guard.py"
+        assert out.exists(), f"deck_guard.py missing from {build} build"
+        assert "MARKER" in out.read_text(), "deck_guard.py was not copied verbatim"

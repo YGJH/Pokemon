@@ -1,5 +1,9 @@
 """Inference-only PUCT MCTS search for Kaggle submission agent.
 
+The opponent's decklist is supplied by the caller (see
+``ptcg_il.deck_prior.OpponentDeckPredictor``); this module only forwards it to
+the Rust determinizer.
+
 Bundles with ``libptcg_search.so`` and ``cg.api`` (provided by Kaggle).
 Lightweight — no torch, no training deps — just numpy + ctypes.
 """
@@ -9,6 +13,8 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -146,130 +152,62 @@ def _read_and_free(lib: ctypes.CDLL, ptr) -> str:
         lib.puct_free_result(ptr)
 
 
-# ── Belief-based opponent deck prediction ─────────────────────────────────
+# ── Decision time budget ──────────────────────────────────────────────────
+#
+# Kaggle's `cabt` env sets `actTimeout: 0`, so there is no per-move allowance:
+# every second an agent spends — including the ~12 s of import — is drawn from
+# one 600 s bank (`remainingOverageTime`), and `agent.py`'s
+# `duration > remainingOverageTime` check turns a single overlong call into
+# `DeadlineExceeded`, i.e. a loss.
+#
+# A fixed iteration count cannot be sized against that, because it is a count
+# of *work* and the bank is a budget of *time*: 16 iterations measure 0.22 s
+# here and 5.02 s on the competition CPU (episode 92329678, first decision).
+# Calibrating the constant on a dev box therefore either wastes ~7/8 of the
+# bank or overruns it, and which one is not knowable without a Kaggle sample.
+#
+# So spend a slice of the *remaining* bank per decision and let the iteration
+# count fall out of it.  MCTS is anytime and the iteration loop is driven from
+# Python, so the deadline is just a `break` — the same bundle then adapts to
+# whatever hardware it lands on.
+#
+# Sizing is p99, measured over 59,496 real archetype-1 player-games in
+# meta.parquet: mean 91 single-select decisions per player-game, p99 166,
+# max 280.  Budgeting for the p99 game gives ~3.2 s per decision at the start.
+# `MIN_LEFT` keeps a game that outruns p99 from dividing by a vanishing
+# denominator, and `RESERVE_S` is the cushion that makes the floor survivable:
+# past the expected length, moves cost `MIN_S` and 60 s buys hundreds of them.
+DECISION_BUDGET_TOTAL = 166
+DECISION_BUDGET_MIN_LEFT = 24
+DECISION_BUDGET_RESERVE_S = 60.0
+DECISION_BUDGET_MIN_S = 0.15
+DECISION_BUDGET_MAX_S = 10.0
 
 
-def predict_opponent_deck(
-    obs_dict: dict,
-    policy: Any,       # model.Policy (with belief heads)
-    vocab: dict,       # normalized vocab
-    archetypes: dict,  # parsed archetypes.json
-    device: Any,       # torch device
-    observed_card_ids: list[int] | None = None,
-    rng: np.random.Generator | None = None,
-) -> list[int]:
-    """Predict opponent's 60-card decklist using belief model.
+def decision_time_budget(
+    remaining_overage_s: float | None,
+    decisions_made: int = 0,
+) -> float | None:
+    """Seconds this decision may spend, from the bank left and moves played.
 
-    Fallback chain:
-    1. Learned arch head (confident → representative decklist)
-    2. ArchetypePosterior (elimination via observed cards)
-    3. Card distribution head (bag-of-cards sampling)
-    4. Empty list (Rust mirror fallback)
+    ``None`` (the observation carried no ``remainingOverageTime``) means "no
+    deadline" — the caller is not on Kaggle's clock and the iteration cap
+    applies instead.
 
-    Uses the same ``OpponentDeckOracle`` logic but inline for bundling.
+    Spending less than the budget leaves the bank fuller for later decisions,
+    which is why this reads `remaining` every call rather than dividing the
+    bank once: the allowance rises as a game turns out shorter than p99.
     """
+    if remaining_overage_s is None:
+        return None
     try:
-        from model.featurizer import featurize
+        remaining = float(remaining_overage_s)
+    except (TypeError, ValueError):
+        return None
 
-        feats = featurize(obs_dict, vocab,
-                          engine_card_features=_engine_card_features,
-                          engine_attack_features=_engine_attack_features,
-                          evolution_map=_evolution_map)
-        batch = _dict_to_batch(feats, device)
-
-        with _no_grad():
-            belief_logits = policy.belief_logits(batch)
-
-        arch_logits = belief_logits.get("arch")
-        reps = _representatives(archetypes)
-
-        # ── Tier 1: learned arch head ────────────────────────────────
-        if arch_logits is not None and arch_logits.shape[-1] > 1 and reps:
-            arch = arch_logits[0].cpu().numpy()
-            arch = arch - arch.max()
-            p = np.exp(arch[:len(reps)])
-            p = p / p.sum()
-            best = int(p.argmax())
-            if p[best] >= 0.5 and len(reps[best]) == 60:
-                return list(reps[best])
-
-        # ── Tier 2: Bayesian posterior ────────────────────────────────
-        if observed_card_ids and reps:
-            try:
-                from model.belief_posterior import ArchetypePosterior
-                posterior = ArchetypePosterior(archetypes)
-                probs = posterior.posterior(observed_card_ids)
-                best = int(np.argmax(probs))
-                if probs[best] >= 0.80 and best < len(reps):
-                    rep = reps[best]
-                    if len(rep) == 60:
-                        return list(rep)
-            except Exception:
-                pass
-
-        # ── Tier 3: card distribution ─────────────────────────────────
-        # `deck` is [n_all_cards] and indexed by **engine card id**, not by
-        # vocab index: `belief_labels.deck_counts_dense` writes `out[cid]` for
-        # a raw engine id, and `cli` sizes the head from the engine feature
-        # matrix.  Routing it through `_index_to_id(vocab)` (≈311 entries
-        # against a 1268-wide head) both relabelled every card and silently
-        # dropped every id past the end of the vocab, so this tier returned a
-        # short deck of the wrong cards — inside a bare `except Exception`,
-        # with the empty-list mirror fallback right below it to absorb the
-        # damage.  Positions are already engine ids; there is no hop to make.
-        deck_logits = belief_logits.get("deck")
-        if deck_logits is not None:
-            probs = deck_logits[0].float().cpu().numpy()
-            probs[0] = 0.0  # id 0 is "no card"; 1 is a real card, keep it
-            total = probs.sum()
-            if total > 0:
-                probs = probs / total
-                return _deck_from_distribution(probs, None, rng=rng)
-
-    except Exception:
-        pass
-
-    return []  # Rust mirror fallback
-
-
-def extract_opp_visible_cards(obs_dict: dict) -> list[int]:
-    """Extract visible opponent card ids from observation."""
-    current = obs_dict.get("current", {})
-    your_idx = current.get("yourIndex", 0)
-    opp_idx = 1 - your_idx
-    players = current.get("players", [])
-    if opp_idx >= len(players):
-        return []
-    opp = players[opp_idx]
-    ids = []
-
-    for poke in (opp.get("active") or []):
-        if isinstance(poke, dict) and "id" in poke:
-            ids.append(poke["id"])
-            for pre in (poke.get("preEvolution") or []):
-                if isinstance(pre, dict) and "id" in pre:
-                    ids.append(pre["id"])
-
-    for poke in (opp.get("bench") or []):
-        if isinstance(poke, dict) and "id" in poke:
-            ids.append(poke["id"])
-            for pre in (poke.get("preEvolution") or []):
-                if isinstance(pre, dict) and "id" in pre:
-                    ids.append(pre["id"])
-
-    for card in (opp.get("discard") or []):
-        if isinstance(card, dict) and "id" in card:
-            ids.append(card["id"])
-
-    for card in (opp.get("prize") or []):
-        if isinstance(card, dict) and "id" in card:
-            ids.append(card["id"])
-
-    for card in (current.get("stadium") or []):
-        if isinstance(card, dict) and "id" in card:
-            ids.append(card["id"])
-
-    return ids
+    left = max(DECISION_BUDGET_TOTAL - int(decisions_made), DECISION_BUDGET_MIN_LEFT)
+    budget = (remaining - DECISION_BUDGET_RESERVE_S) / left
+    return max(DECISION_BUDGET_MIN_S, min(DECISION_BUDGET_MAX_S, budget))
 
 
 # ── MCTS inference ────────────────────────────────────────────────────────
@@ -311,6 +249,7 @@ def mcts_search(
     iterations: int = 64,
     c_puct: float = 2.0,
     seed: int = 0,
+    time_budget_s: float | None = None,
 ) -> dict:
     """Run PUCT MCTS via Rust libptcg_search.so for one decision point.
 
@@ -349,11 +288,28 @@ def mcts_search(
             iterations,
             c_puct,
             seed,
-            1,  # host_initialized: Python always calls GameInitialize first
+            # host_initialized — asked, not assumed.  Importing `cg.sim` calls
+            # GameInitialize at module level, so its presence in sys.modules is
+            # exactly the question the Rust side is asking.  This used to be a
+            # hardcoded 1 justified as "Python always calls GameInitialize
+            # first": true from the repo (live_eval, RL, tournament all import
+            # cg), and false in the Kaggle bundle, which ships no cg package
+            # and falls back to a shim `to_observation_class`.  Both errors are
+            # fatal and neither is recoverable — a second GameInitialize aborts
+            # the process, a skipped one drives an uninitialised engine.
+            1 if "cg.sim" in sys.modules else 0,
         )
 
         if handle == 0:
             raise RuntimeError("puct_init returned null")
+
+        # Clock starts after init: `puct_init` determinizes the root, which is
+        # setup the deadline cannot shorten, and charging it to the search
+        # budget would only cut real iterations.
+        deadline = (
+            None if time_budget_s is None
+            else time.monotonic() + float(time_budget_s)
+        )
 
         # MCTS loop
         while True:
@@ -379,6 +335,13 @@ def mcts_search(
                 json.dumps(priors).encode("utf-8"),
                 float(value),
             )
+
+            # Checked *after* expanding, so even a budget smaller than one
+            # iteration still builds a one-node tree.  Breaking before the
+            # first expand would leave `visit_counts` empty, which is the
+            # greedy-fallback path — legal, but silently no search at all.
+            if deadline is not None and time.monotonic() >= deadline:
+                break
 
         raw = _read_and_free(lib, lib.puct_result(handle))
         lib.puct_free(handle)
@@ -440,18 +403,15 @@ def _policy_evaluate_leaf(
                       evolution_map=_evolution_map)
     batch = _dict_to_batch(feats, device)
 
-    # Mirror Policy.forward: _encode returns (x, h, history_h) -- the batch it
-    # returns carries the gathered *_card_feat tensors, and PointerHead needs
-    # them -- and returns (logits, o).  The old call
-    # `policy.pointer(h, batch["opt_mask"])` predated the pure-feature pointer
-    # and raised TypeError on every leaf.
     with _no_grad():
-        batch, h, _history = policy._encode(batch)
-        logits, _o = policy.pointer(h, batch["tok_mask"], policy.embed.card, batch)
-        value = policy.value(h[:, 0])          # [B]
+        logits, value, _history = policy(batch)
 
     mask = batch["opt_mask"][0].cpu().numpy()
     l = logits[0].float().cpu().numpy()
+    # Policy.forward() already masks padding options with -1e9; re-masking is
+    # idempotent.  EnsemblePolicy.forward() returns log(mean(softmax(logits))),
+    # so softmax here recovers mean(probs) as the MCTS prior — exactly what we
+    # want: the ensemble's averaged probabilities guide the search.
     l = np.where(mask, l, -np.inf)
     l = l - l.max()
     probs = np.exp(l)
@@ -552,16 +512,6 @@ def _dict_to_batch(feats: dict, device: Any) -> dict:
     return batch
 
 
-def _representatives(archetypes: dict) -> list[list[int]]:
-    """Representative decklists for each opp archetype, in opp_ids order."""
-    by_id = {int(a["id"]): a for a in archetypes.get("archetypes", [])}
-    out = []
-    for gid in archetypes.get("opp_ids", []):
-        rep = by_id.get(int(gid), {}).get("representative") or []
-        out.append([int(c) for c in rep])
-    return out
-
-
 def _index_to_id(vocab: dict) -> list[int]:
     """vocab index → engine card id."""
     index_to_id = vocab.get("index_to_id")
@@ -572,39 +522,3 @@ def _index_to_id(vocab: dict) -> list[int]:
             if 0 <= int(idx) < size:
                 index_to_id[int(idx)] = int(cid)
     return [int(c) if int(c) >= 0 else -1 for c in index_to_id]
-
-
-def _deck_from_distribution(
-    probs: np.ndarray,
-    index_to_id: list[int] | None,
-    deck_size: int = 60,
-    rng: np.random.Generator | None = None,
-) -> list[int]:
-    """Sample *deck_size* cards from a card distribution.
-
-    *index_to_id* maps position → engine card id.  Pass ``None`` when *probs*
-    is already indexed by engine card id — the same convention
-    ``featurizer._ids_to_feat`` uses, and what the belief ``deck`` head emits.
-    """
-    if rng is not None:
-        counts = rng.multinomial(deck_size, probs)
-    else:
-        exact = probs * deck_size
-        counts = np.floor(exact).astype(np.int64)
-        short = deck_size - int(counts.sum())
-        if short > 0:
-            order = np.argsort(-(exact - counts))
-            counts[order[:short]] += 1
-
-    deck = []
-    for idx in np.nonzero(counts)[0]:
-        if index_to_id is None:
-            cid = int(idx)
-        elif idx >= len(index_to_id):
-            continue
-        else:
-            cid = index_to_id[idx]
-        if cid < 0:
-            continue
-        deck.extend([cid] * int(counts[idx]))
-    return deck

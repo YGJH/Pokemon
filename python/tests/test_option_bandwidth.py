@@ -214,11 +214,13 @@ class TestDimAssertions:
         from ptcg_mine.keywords import K_EFFECT
         from ptcg_il.featurizer import F_ATK, F_CARD
 
-        assert F_ATK == 16 + K_EFFECT, (
-            f"F_ATK={F_ATK}, expected {16 + K_EFFECT}"
+        # +1 for bench damage at col 16 (the Active `damage` field is col 0).
+        assert F_ATK == 17 + K_EFFECT, (
+            f"F_ATK={F_ATK}, expected {17 + K_EFFECT}"
         )
-        assert F_CARD == 52 + K_EFFECT + 2 + 3 * F_ATK, (
-            f"F_CARD={F_CARD}, expected {52 + K_EFFECT + 2 + 3 * F_ATK}"
+        # +2 for the card-level draw counts at 83:85 (deck-out features).
+        assert F_CARD == 52 + K_EFFECT + 2 + 2 + 3 * F_ATK, (
+            f"F_CARD={F_CARD}, expected {52 + K_EFFECT + 2 + 2 + 3 * F_ATK}"
         )
 
 

@@ -2,14 +2,15 @@
 
 Layout is exact Appendix A.3 (feature slices) / A.2 (normalizers) of
 TRANSFORMER_IL_SPEC.md:
-  card_static_row[218] = base[52] + 3 × attack_static_row[45]
+  card_static_row[223] = base[52] + keywords[29] + counts[2] + draw[2]
+                         + 3 × attack_static_row[46]
   base[52]             = [hp/HP_N, retreat/RETREAT_N, cardType-onehot(7),
                           stage-onehot(3), energyType-onehot(12),
                           weakness-onehot(12), resistance-onehot(12),
                           [ex, megaEx, tera, aceSpec](4)]
-  attack_static_row[45] = [damage/ATKDMG_N, energy-cost histogram(12)/ATKCOST_N,
-                           len(energies)/ATKCOST_N,
-                           draw_fixed/DRAW_N, draw_to_hand/DRAW_N]
+  attack_static_row[46] = [damage/ATKDMG_N (to the Active), energy-cost hist(12)/ATKCOST_N,
+                           len(energies)/ATKCOST_N, draw_fixed/DRAW_N,
+                           draw_to_hand/DRAW_N, bench_damage/ATKDMG_N, keywords(29)]
 
 Engine access: `all_card_data()` / `all_attack()` live in the bundled `cg`
 package at pokemon-tcg-ai-battle/sample_submission/sample_submission/cg;
@@ -31,24 +32,31 @@ N_CARDTYPE = 7
 N_ENERGY = 12
 
 from ptcg_il.featurizer import F_ATK, F_CARD
-from ptcg_mine.keywords import K_EFFECT, ability_keyword_row, attack_keyword_row, draw_fixed, draw_to_hand
+from ptcg_mine.keywords import (K_EFFECT, ability_keyword_row, attack_bench_damage,
+                                attack_keyword_row, card_draw_counts, draw_fixed,
+                                draw_to_hand)
 
 # ptcg_il.featurizer owns the dims but cannot import K_EFFECT (it is vendored
 # into the Kaggle bundle, where ptcg_mine does not exist).  Assert agreement
 # here instead: appending a keyword without bumping the featurizer would
 # otherwise emit a row of the old width, which every downstream shape check
 # accepts until the first forward pass.
-assert F_ATK == 16 + K_EFFECT, (
+assert F_ATK == 17 + K_EFFECT, (
     f"F_ATK={F_ATK} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
-    f"in ptcg_mine.keywords (expected {16 + K_EFFECT})"
+    f"in ptcg_mine.keywords (expected {17 + K_EFFECT})"
 )
-assert F_CARD == 52 + K_EFFECT + 2 + 3 * F_ATK, (
+assert F_CARD == 52 + K_EFFECT + 2 + 2 + 3 * F_ATK, (
     f"F_CARD={F_CARD} in ptcg_il.featurizer disagrees with K_EFFECT={K_EFFECT} "
-    f"(expected {52 + K_EFFECT + 2 + 3 * F_ATK})"
+    f"(expected {52 + K_EFFECT + 2 + 2 + 3 * F_ATK})"
 )
 
 #: Offset of the first embedded attack block inside ``card_static_row``.
-CARD_ATTACK_BLOCK_START = 52 + K_EFFECT + 2   # == 83
+#: The two card-level draw counts sit at 83:85, **before** the attack blocks
+#: rather than appended at the end.  ``ptcg_il.featurizer`` derives the same
+#: offset as ``F_CARD - 3 * F_ATK``; appending would leave that expression
+#: pointing 2 columns early and every embedded attack would decode as garbage
+#: while every shape check still passed.
+CARD_ATTACK_BLOCK_START = 52 + K_EFFECT + 2 + 2   # == 85
 
 import logging
 
@@ -82,9 +90,9 @@ def _onehot(index: int | None, size: int) -> np.ndarray:
 
 
 def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
-    """float32[218] static feature row for a CardData.
+    """float32[223] static feature row for a CardData.
 
-    Layout: 52 base features + ability keywords + 2 counts + 3 attacks × 45.
+    Layout: 52 base + ability keywords + 2 counts + 2 card draw counts + 3 attacks × 45.
     Attacks beyond the card's actual attacks are zero-padded.
 
     ``card.attacks`` holds attack *ids*, not Attack objects, so *attacks_by_id*
@@ -108,7 +116,13 @@ def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
     attack_ids = getattr(card, "attacks", []) or []
     row[52 + K_EFFECT] = min(len(skills), 3) / 3.0
     row[52 + K_EFFECT + 1] = min(len(attack_ids), 3) / 3.0
-    # Attack features (83:212) — up to 3 attacks, each F_ATK, same layout as
+    # Card-level draw counts (83:85) — how much deck this card burns when
+    # played.  Same DRAW_N divisor as attack_static_row[14:16], so the two views
+    # of "cards drawn" are directly comparable in the option-cost feature.
+    c_fixed, c_to_hand = card_draw_counts(card)
+    row[52 + K_EFFECT + 2] = min(c_fixed / DRAW_N, 1.0)
+    row[52 + K_EFFECT + 3] = min(c_to_hand / DRAW_N, 1.0)
+    # Attack features (85:223) — up to 3 attacks, each F_ATK, same layout as
     # attack_static_row so the two views of an attack cannot drift apart.
     for ai in range(min(len(attack_ids), 3)):
         atk = attacks_by_id.get(int(attack_ids[ai]))
@@ -120,10 +134,10 @@ def card_static_row(card, attacks_by_id: dict) -> np.ndarray:
 
 
 def attack_static_row(attack) -> np.ndarray:
-    """float32[45] static feature row for an Attack.
+    """float32[46] static feature row for an Attack.
 
-    Layout: damage, energy-cost histogram(12), total-cost-count,
-    draw_fixed, draw_to_hand, then K_EFFECT keyword flags (16:45).
+    Layout: damage (to the Active), energy-cost histogram(12), total-cost-count,
+    draw_fixed, draw_to_hand, bench_damage, then K_EFFECT keyword flags (17:46).
     """
     row = np.zeros(F_ATK, dtype=np.float32)
     row[0] = attack.damage / ATKDMG_N
@@ -136,19 +150,22 @@ def attack_static_row(attack) -> np.ndarray:
     # Draw counts (14:16) — normalised by DRAW_N per the fixed-divisor scheme
     row[14] = draw_fixed(attack) / DRAW_N
     row[15] = draw_to_hand(attack) / DRAW_N
-    # Effect keywords from the attack's oracle text (16:45).
-    row[16:16 + K_EFFECT] = attack_keyword_row(attack)
+    # Bench damage (16) -- the `damage` field above is the *Active* number and
+    # never the bench one; see ptcg_mine.keywords.attack_bench_damage.
+    row[16] = min(attack_bench_damage(attack) / ATKDMG_N, 1.0)
+    # Effect keywords from the attack's oracle text (17:46).
+    row[17:17 + K_EFFECT] = attack_keyword_row(attack)
     return row
 
 
 def build_static_tables(vocab: dict, card_data: list, attack_data: list):
-    """Build the [V,218] card table and [A,45] attack table for the given vocab.
+    """Build the [V,223] card table and [A,46] attack table for the given vocab.
 
     Returns (card_table, attack_id_to_index, attack_table):
-      - card_table[V,218] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
+      - card_table[V,223] float32: row 0 = PAD (zeros), row 1 = UNKNOWN (mean of
         in-vocab card rows), rows 2..V-1 = card_static_row(card) per vocab id.
       - attack_id_to_index: {attackId: index}, index >= 1 (0 is PAD).
-      - attack_table[A,45] float32: row 0 = PAD (zeros); A = 1 + number of
+      - attack_table[A,46] float32: row 0 = PAD (zeros); A = 1 + number of
         distinct attackIds referenced by vocab cards.
     """
     cards_by_id = {c.cardId: c for c in card_data}

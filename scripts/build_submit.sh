@@ -16,8 +16,11 @@
 #   ./scripts/build_submit.sh a1                      # a1, 自動選最高 ELO
 #   ./scripts/build_submit.sh a0 path/to/ckpt.pt      # 手動指定 checkpoint
 #   ./scripts/build_submit.sh a0 --no-mcts            # 純 policy，不含任何搜尋
+#   ./scripts/build_submit.sh --ensemble "..." --mcts  # ensemble+MCTS+對手牌組先驗
 #   ./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s*/ckpt-best.pt" \
-#       --ensemble-top 7                              # 10 個成員裡挑最好的 7 個
+#       --ensemble-top 7                              # 10 個成員裡挑最好的 7 個（greedy）
+#   ./scripts/build_submit.sh --ensemble "python/checkpoints_a1_s*/ckpt-best.pt" \
+#       --ensemble-top 2 --mcts                       # ensemble + MCTS + 對手牌組先驗推斷
 #
 # --ensemble-top N: Kaggle 限制一次能提交幾個 checkpoint，所以 10 個成員要砍到
 # N 個。挑法是讀 data/il_baselines.json 裡記錄的 greedy forward selection 順序
@@ -43,12 +46,16 @@ set -euo pipefail
 ENSEMBLE=0
 ENSEMBLE_PATHS=()
 ENSEMBLE_TOP=""
+ENSEMBLE_MCTS=0
+FORCE=0
 DATA_DIR="python/data"
 NO_MCTS=0
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-mcts) NO_MCTS=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --mcts) ENSEMBLE_MCTS=1; shift ;;
         --ensemble-top) ENSEMBLE_TOP="${2:?--ensemble-top needs a number}"; shift 2 ;;
         --ensemble)
             ENSEMBLE=1
@@ -195,6 +202,12 @@ fi
 fi  # ENSEMBLE == 0
 
 # ── Build Rust MCTS library ─────────────────────────────────────────────
+# Ensemble without --mcts keeps backward compat: MCTS was always off before
+# ensemble support was added, so default to greedy unless explicitly requested.
+if [[ "$ENSEMBLE" == 1 && "$ENSEMBLE_MCTS" == 0 ]]; then
+    NO_MCTS=1
+fi
+
 RUST_DIR="python/ptcg_search"
 if [[ "$NO_MCTS" == 1 ]]; then
     echo "--no-mcts: 跳過 Rust build，打包純 policy submission"
@@ -211,19 +224,43 @@ if [[ "$ENSEMBLE" == 1 ]]; then
     for p in "${ENSEMBLE_PATHS[@]}"; do
         CKPT_ARGS+=(--ckpt "$p")
     done
+    MCTS_FLAG=()
+    if [[ "$NO_MCTS" == 1 ]]; then
+        MCTS_FLAG=(--no-mcts)
+    fi
+    FORCE_FLAG=()
+    if [[ "$FORCE" == 1 ]]; then
+        FORCE_FLAG=(--force)
+    fi
+    PREFIX="submission"
+    if [[ "$NO_MCTS" == 1 ]]; then
+        PREFIX="submission-greedy"
+    fi
     uv run python scripts/build_submission.py \
         --data-dir python/data \
         "${CKPT_ARGS[@]}" \
-        --out "submission-greedy-ens${#ENSEMBLE_PATHS[@]}.tar.gz"
+        "${MCTS_FLAG[@]}" \
+        "${FORCE_FLAG[@]}" \
+        --out "${PREFIX}-ens${#ENSEMBLE_PATHS[@]}.tar.gz"
 elif [[ "$NO_MCTS" == 1 ]]; then
+    FORCE_FLAG=()
+    if [[ "$FORCE" == 1 ]]; then
+        FORCE_FLAG=(--force)
+    fi
     uv run python scripts/build_submission.py \
         --data-dir python/data \
         --ckpt "$CKPT" \
         --no-mcts \
+        "${FORCE_FLAG[@]}" \
         --out submission-greedy.tar.gz
 else
+    FORCE_FLAG=()
+    if [[ "$FORCE" == 1 ]]; then
+        FORCE_FLAG=(--force)
+    fi
     uv run python scripts/build_submission.py \
         --data-dir python/data \
         --ckpt "$CKPT" \
+        "${FORCE_FLAG[@]}" \
         --out submission.tar.gz
 fi

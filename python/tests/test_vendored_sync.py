@@ -106,3 +106,71 @@ def test_vendored_pointer_signature_matches():
     assert "opt_bench_idx" in vendored_src, "vendored pointer missing opt_bench_idx"
     assert "bench" in real_src, "real pointer missing bench term"
     assert "bench" in vendored_src, "vendored pointer missing bench term"
+
+
+def test_vendored_slot_ko_block_matches_values():
+    """Dim parity is not enough -- the two copies must agree on the numbers.
+
+    ``model/featurizer.py`` is what the Kaggle bundle runs at inference time.  A
+    KO block that exists in both but computes different values feeds the
+    deployed policy a feature it was never trained on, and nothing raises: the
+    shapes match, so it scores like a plausible model on a shifted input.
+    """
+    import numpy as np
+
+    from ptcg_il import featurizer as real
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    import model.featurizer as vendored  # noqa: E402
+
+    assert hasattr(vendored, "_slot_ko_block"), (
+        "model/featurizer.py is missing _slot_ko_block -- the bundle would feed "
+        "the policy an all-zero KO block it was not trained on"
+    )
+    for name in ("POKE_KO_RATIO_COL", "POKE_KO_FLAG_COL"):
+        assert getattr(real, name) == getattr(vendored, name), f"{name} drifted"
+
+    from ptcg_mine.cards import build_engine_card_features, load_engine
+
+    card_data, attack_data = load_engine()
+    ecf = build_engine_card_features(card_data, attack_data)
+
+    def _poke(cid, serial, hp, energies=()):
+        energies = list(energies)
+        return {"id": cid, "serial": serial, "hp": hp, "maxHp": hp,
+                "appearThisTurn": False, "energies": energies,
+                "energyCards": [{"id": 1, "serial": 900 + i, "playerIndex": 0}
+                                for i in range(len(energies))],
+                "tools": [], "preEvolution": []}
+
+    def _player(active, bench):
+        return {"active": active, "bench": bench, "benchMax": 5, "deckCount": 40,
+                "discard": [], "prize": [None] * 6, "handCount": 0, "hand": [],
+                "poisoned": False, "burned": False, "asleep": False,
+                "paralyzed": False, "confused": False}
+
+    state = {
+        "turn": 5, "turnActionCount": 0, "yourIndex": 0, "firstPlayer": 0,
+        "supporterPlayed": False, "stadiumPlayed": False,
+        "energyAttached": False, "retreated": False, "result": -1,
+        "stadium": [], "looking": None,
+        "players": [
+            _player([_poke(675, 10, 70)], [_poke(305, 11, 100)]),
+            _player([_poke(676, 20, 110, [6])], [_poke(675, 21, 70)]),
+        ],
+    }
+
+    outs = []
+    for mod in (real, vendored):
+        poke_id, poke_feat, _, _ = mod._build_poke_tokens(state, 0)
+        pcf = mod._feat_gatherer(ecf, mod.F_CARD)(poke_id)
+        mod._slot_ko_block(pcf, poke_feat)
+        outs.append(poke_feat[:, [mod.POKE_KO_RATIO_COL, mod.POKE_KO_FLAG_COL]])
+
+    assert outs[0].any(), "fixture produced an all-zero KO block -- test is vacuous"
+    np.testing.assert_allclose(
+        outs[0], outs[1], rtol=0, atol=0,
+        err_msg="ptcg_il and model/ disagree on the KO block values",
+    )

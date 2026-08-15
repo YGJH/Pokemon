@@ -12,6 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from ptcg_il.featurizer import F_GLOBAL  # noqa: E402
 from ptcg_il.model.policy import Policy  # noqa: E402
 from ptcg_rl.config import RLConfig  # noqa: E402
 from ptcg_rl.critic import CriticDiagnostics, diagnose  # noqa: E402

@@ -15,7 +15,7 @@ model contains:
 The partition is by **out-features**, not by ``min(shape)``, and that distinction
 is the point of these tests: ``embed.hand_mlp.0.weight`` is ``[256, 7]`` and
 belongs on Muon (a real 7->256 map, which is exactly what the aspect-ratio scale
-factor exists for), while ``belief_heads.arch_head.2.weight`` is ``[9, 256]`` and
+factor exists for), while ``value.f.2.weight`` is ``[1, 256]`` and
 does not.  A ``min(shape)`` rule cannot tell those apart.
 """
 
@@ -30,7 +30,7 @@ from tests.test_model_policy import make_policy
 
 @pytest.fixture(scope="module")
 def policy():
-    return make_policy(D=64, heads=4, layers=2, ff=128, n_opp_arch=9)
+    return make_policy(D=64, heads=4, layers=2, ff=128)
 
 
 def _named(policy, params):
@@ -43,7 +43,7 @@ class TestPartition:
         """Two groups holding one tensor would update it twice per step.
 
         Not hypothetical here: one ``CardEncoder`` is aliased into
-        ``pointer.card``, ``belief.card_emb`` and ``belief_heads``, so the same
+        ``pointer.card`` and ``belief.card_emb``, so the same
         tensors are reachable under several names.
         """
         groups = partition_parameters(policy)
@@ -65,11 +65,9 @@ class TestPartition:
         muon = _named(policy, partition_parameters(policy)["muon"])
         assert muon, "nothing was assigned to Muon"
         for n in muon:
-            # belief_heads.arch_head.0 is [D, D] -- the head's *hidden* layer,
-            # a real map.  Only its [9, D] output layer is carved out.
+            # Every Muon parameter should be in the trunk, not an output head.
             assert n.startswith(
-                ("encoder.", "embed.", "pointer.", "belief.", "belief_heads.",
-                 "value.")
+                ("encoder.", "embed.", "pointer.", "belief.", "value.")
             ), n
 
         encoder_mats = {
@@ -89,7 +87,7 @@ class TestPartition:
 
         n_checked = 0
         for name in ("pointer.score.weight", "value.f.2.weight",
-                     "belief_heads.arch_head.2.weight", "belief_heads.card_bias"):
+                     "embed.no_stadium", "pointer.null_token"):
             assert name in adamw, f"{name} must not be orthogonalized"
             assert name not in muon
             n_checked += 1

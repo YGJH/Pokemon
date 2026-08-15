@@ -86,12 +86,11 @@ STAGES: dict[str, StageSpec] = {
     ),
     "shards": StageSpec(
         # Selection (episode/stats/archetype) decides which games are kept;
-        # featurizer/ref_map/belief_labels decide what each sample contains.
+        # featurizer/ref_map decide what each sample contains.
         code=(
             "ptcg_il/shard_writer.py",
             "ptcg_il/featurizer.py",
             "ptcg_il/ref_map.py",
-            "ptcg_il/belief_labels.py",
             "ptcg_mine/episode.py",
             "ptcg_mine/stats.py",
             "ptcg_mine/archetype.py",

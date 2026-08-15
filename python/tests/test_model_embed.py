@@ -159,7 +159,7 @@ class TestTokenEmbedder:
 
         # Set PAD for all poke slots
         x["poke_card_feat"] = torch.zeros(2, P_MAX, F_CARD)
-        x["poke_feat"] = torch.zeros(2, P_MAX, 26)
+        x["poke_feat"] = torch.zeros(2, P_MAX, F_POKE)
 
         rows = embed(x)
         # Row 0 (CLS) should differ from poke rows

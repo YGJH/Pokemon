@@ -425,6 +425,24 @@ class TestTrainStep:
         avg_late = sum(losses[-5:]) / 5
         assert avg_late < avg_early, f"Loss did not decrease: early={avg_early:.4f}, late={avg_late:.4f}"
 
+    def test_train_step_splits_ce_by_outcome(self):
+        """ce is a convex combination of ce_won/ce_lost — the split is real."""
+        policy = _tiny_policy()
+        opt = create_optimizer(policy)
+        ema = _EMA(policy)
+        data_dir = _build_tiny_data(32)
+        ds = ShardDataset(data_dir, split="train")
+        loader = DataLoader(ds, batch_size=8, collate_fn=collate_fn)
+        batch = next(iter(loader))
+        batch_gpu = {k: v for k, v in batch.items() if k != "encoder_padding_mask"}
+
+        metrics = train_step(policy, batch_gpu, opt, ema, torch.device("cpu"),
+                             grad_scaler=None)
+        vt = batch_gpu["value_target"]
+        assert int((vt > 0).sum()) > 0 and int((vt < 0).sum()) > 0
+        lo, hi = sorted((metrics["ce_won"], metrics["ce_lost"]))
+        assert lo - 1e-6 <= metrics["ce"] <= hi + 1e-6
+
 
 # ============================================================
 # Tests — checkpoint

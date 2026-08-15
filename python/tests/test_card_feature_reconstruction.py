@@ -155,11 +155,11 @@ class TestFeaturizerEmitsIdsAndNotFeatures:
             n_checked += 1
         assert n_checked >= 8, f"only checked {n_checked} feature keys"
 
-    def test_log_card_feat_is_not_emitted_but_its_ids_are(self, featurized):
-        """``log_feat`` column 2 is the id source; the gather happens on device."""
+    def test_log_card_feat_is_no_longer_emitted(self, featurized):
+        """The game-log featurizer was removed (Task 13). Neither the ids nor
+        the gathered features should appear in the output."""
         assert "log_card_feat" not in featurized
-        log_ids = featurized["log_feat"][:, 2].astype(np.int64)
-        assert log_ids.any(), "fixture must carry some log card ids"
+        assert "log_feat" not in featurized
 
     def test_emitted_ids_still_resolve_to_real_features(self, featurized):
         """Not vacuous: the ids must index the table to something nonzero.
@@ -253,7 +253,7 @@ class TestWriterStoresIds:
 
         # The writer's contract, asserted against the featurizer's own map so
         # the two cannot drift apart silently.
-        assert _DERIVED_KEYS == set(CARD_FEAT_SOURCES) | {"log_card_feat"}
+        assert _DERIVED_KEYS == set(CARD_FEAT_SOURCES)
         assert _INT32_KEYS == {id_key for id_key, _ in CARD_FEAT_SOURCES.values()}
 
     def test_write_shard_downcasts_ids_to_int32(self, tmp_path):
@@ -355,12 +355,6 @@ class TestDatasetPassesIdsThrough:
             assert got[feat_key].dtype == torch.float32, feat_key
             n_nonzero += int(np.count_nonzero(want) > 0)
         assert n_nonzero > 0, "every gathered feature was zero — test is vacuous"
-
-        want_log = gather_static_feats(
-            raw["log_feat"][:, 2].astype(np.int64), tables["card"]
-        )
-        np.testing.assert_array_equal(got["log_card_feat"][0].numpy(), want_log)
-        assert want_log.any(), "log_card_feat gathered to all zeros — test is vacuous"
 
     def test_legacy_shards_with_stored_features_raise(self, tmp_path, engine_tables):
         """A shard predating the id format carries features and no ids.

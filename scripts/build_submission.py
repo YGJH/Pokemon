@@ -33,7 +33,6 @@ REWRITE_RULES: list[tuple[str, str]] = [
     (r"from ptcg_il\.model\.encoder import", r"from model.encoder import"),
     (r"from ptcg_il\.model\.pointer import", r"from model.pointer import"),
     (r"from ptcg_il\.model\.value import", r"from model.value import"),
-    (r"from ptcg_il\.model\.belief import", r"from model.belief import"),
     (r"from ptcg_il\.model\.policy import", r"from model.policy import"),
     # ensemble.py imports (lives in ptcg_il/, bundled as model/ensemble.py)
     (r"from ptcg_il\.ensemble import", r"from model.ensemble import"),
@@ -50,6 +49,11 @@ REWRITE_RULES: list[tuple[str, str]] = [
     # at `Policy.__init__` — so missing this rule is not a latent bug, it is
     # every packaged agent failing to construct.
     (r"from ptcg_il import featurizer", r"from model import featurizer"),
+    # deck_prior (copied into model/ so modules import it as model.deck_prior).
+    # Both forms are listed deliberately: the module-object form has been
+    # missed before, and a missed rule fails only at agent runtime on Kaggle.
+    (r"from ptcg_il\.deck_prior import", r"from model.deck_prior import"),
+    (r"from ptcg_il import deck_prior", r"from model import deck_prior"),
 ]
 
 MODEL_FILES: list[str] = [
@@ -58,16 +62,15 @@ MODEL_FILES: list[str] = [
     "encoder.py",
     "pointer.py",
     "value.py",
-    "belief.py",
     "policy.py",
     "ensemble.py",
 ]
 
-# Additional Python files to bundle (from ptcg_il/ or ptcg_rl/)
+# Additional Python files to bundle (from ptcg_il/)
 EXTRA_FILES: list[tuple[str, str]] = [
     # (source_rel, dest_name_in_model)
     ("ptcg_il/search_infer.py", "search_infer.py"),
-    ("ptcg_rl/belief.py", "belief_posterior.py"),
+    ("ptcg_il/deck_prior.py", "deck_prior.py"),
 ]
 
 # __init__.py for the submission model package.
@@ -104,9 +107,14 @@ from model.policy import Policy, select_multi  # noqa: E402
 
 MAIN_PY_TEMPLATE = r'''"""Pokémon TCG AI Agent — Kaggle submission entry point.
 
-Uses belief model to predict opponent's deck, then PUCT MCTS (via bundled
-libptcg_search.so) to search for the best action.  Falls back to greedy
-policy if MCTS is unavailable.
+Uses the mined archetype prior to predict the opponent's deck, then PUCT MCTS
+(via bundled libptcg_search.so) to search for the best action.  Falls back to
+greedy policy if MCTS is unavailable.
+
+The opponent model is a Bayesian posterior over every archetype in
+archetypes.json, seeded by mined frequency and sharpened by elimination.  No
+learned belief head is involved: the packaged weights still carry them, they
+are simply never called.
 
 Model loads at import time.  Any failure raises immediately.
 """
@@ -127,11 +135,8 @@ except ImportError:
 
 from model import Policy, select_multi
 from model.featurizer import featurize
-from model.search_infer import (
-    mcts_search,
-    predict_opponent_deck,
-    extract_opp_visible_cards,
-)
+from model.search_infer import mcts_search, decision_time_budget
+from model.deck_prior import OpponentDeckPredictor
 
 DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,9 +153,19 @@ _AGENT_DIR = (
 
 # ── MCTS config (inference-time) ─────────────────────────────────────────
 
-_MCTS_ITERATIONS = int("16")
+# The iteration count is now a *ceiling*, not the operating point: the search
+# stops on a wall-clock deadline derived from `remainingOverageTime` (see
+# `search_infer.decision_time_budget`).  It is set high enough that time is
+# what binds on fast hardware, and harmless on slow hardware, where the
+# deadline fires first.  A count low enough to bind (it was 16) pins the agent
+# to whichever CPU it was measured on.
+_MCTS_ITERATIONS = int("512")
 _MCTS_C_PUCT = float("2.0")
 _MCTS_SEED = int("0")
+
+# Decisions played this game, for the time budget.  Reset at deck selection,
+# which is the only signal a new game has started.
+_decisions_made = 0
 
 
 def _load_json(path: str) -> dict:
@@ -209,8 +224,18 @@ _evolution_map_path = os.path.join(DATA_DIR, "evolution_map.npy")
 _evolution_map = (np.load(_evolution_map_path, allow_pickle=True).item()
                   if os.path.exists(_evolution_map_path) else None)
 
-_ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
-_cfg = _ckpt.get("config", {})
+# Detect ensemble: an ensemble.json manifest means multiple checkpoints were
+# packaged as model_0.pt, model_1.pt, ...  Load the config from member 0
+# (or model.pt for single-model) to resolve feature dimensions.
+_ENSEMBLE_MANIFEST = os.path.join(DATA_DIR, "ensemble.json")
+if os.path.exists(_ENSEMBLE_MANIFEST):
+    _manifest = json.loads(open(_ENSEMBLE_MANIFEST).read())
+    _member0 = torch.load(os.path.join(DATA_DIR, _manifest["members"][0]),
+                          map_location=_device, weights_only=True)
+    _cfg = _member0.get("config", {})
+else:
+    _ckpt = torch.load(os.path.join(DATA_DIR, "model.pt"), map_location=_device, weights_only=True)
+    _cfg = _ckpt.get("config", {})
 
 # All-card feature matrix for belief heads (sorted by card id).
 #
@@ -250,45 +275,52 @@ _all_attack_feat = torch.zeros(_max_aid + 1, _attack_feat_dim)
 for _aid, _feat in _engine_attack_features.items():
     _all_attack_feat[int(_aid)] = torch.from_numpy(np.asarray(_feat, dtype=np.float32))
 
-_model = Policy(
-    D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
-    layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
-    n_opp_arch=_cfg.get("n_opp_arch", 1),
-    n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
-    all_card_feat=_all_card_feat,
-    all_attack_feat=_all_attack_feat,
-)
-_missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
-if _missing:
-    _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
-    _other = [k for k in _missing if not k.startswith("belief_heads.")]
-    # Policy ties one CardEncoder into three places (`policy.py`:
-    # `self.pointer.card = self.embed.card`, same for the belief heads), and
-    # EMA's shadow de-duplicates shared parameters, so those aliases are absent
-    # from the packaged state dict while the tensors they name are loaded
-    # through `embed.card.*`.  Reporting them as missing cried wolf on every
-    # single run, which is how a real gap would have gone unnoticed.  Compare
-    # object identity rather than guessing at name prefixes.
-    # remove_duplicate=False is the whole point: the default de-duplicates
-    # shared parameters, so the alias names are absent and would be misread as
-    # genuinely missing — the exact false alarm this is here to stop.
-    _params = dict(_model.named_parameters(remove_duplicate=False))
-    _params.update(dict(_model.named_buffers(remove_duplicate=False)))
-    _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
-    _other = [k for k in _other
-              if k not in _params or id(_params[k]) not in _loaded_ids]
-    if _other:
-        print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
-_model.to(_device)
-_model.eval()
+# ── Model construction (single or ensemble) ──────────────────────────────
+if os.path.exists(_ENSEMBLE_MANIFEST):
+    from model.ensemble import EnsemblePolicy
+    _member_paths = [os.path.join(DATA_DIR, m) for m in _manifest["members"]]
+    _model = EnsemblePolicy.from_checkpoints(
+        _member_paths, _all_card_feat, _all_attack_feat, device=_device)
+else:
+    _model = Policy(
+        D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
+        layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
+        n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
+        all_card_feat=_all_card_feat,
+        all_attack_feat=_all_attack_feat,
+    )
+    _missing, _unexpected = _model.load_state_dict(_ckpt["model_state_dict"], strict=False)
+    if _missing:
+        _belief_keys = [k for k in _missing if k.startswith("belief_heads.")]
+        _other = [k for k in _missing if not k.startswith("belief_heads.")]
+        # Policy ties one CardEncoder into three places (`policy.py`:
+        # `self.pointer.card = self.embed.card`, same for the belief heads), and
+        # EMA's shadow de-duplicates shared parameters, so those aliases are absent
+        # from the packaged state dict while the tensors they name are loaded
+        # through `embed.card.*`.  Reporting them as missing cried wolf on every
+        # single run, which is how a real gap would have gone unnoticed.  Compare
+        # object identity rather than guessing at name prefixes.
+        # remove_duplicate=False is the whole point: the default de-duplicates
+        # shared parameters, so the alias names are absent and would be misread as
+        # genuinely missing — the exact false alarm this is here to stop.
+        _params = dict(_model.named_parameters(remove_duplicate=False))
+        _params.update(dict(_model.named_buffers(remove_duplicate=False)))
+        _loaded_ids = {id(_params[k]) for k in _ckpt["model_state_dict"] if k in _params}
+        _other = [k for k in _other
+                  if k not in _params or id(_params[k]) not in _loaded_ids]
+        if _other:
+            print(f"[agent] WARNING: {len(_other)} unexpected missing weights: {_other[:6]}")
+    _model.to(_device)
+    _model.eval()
 
 _fixed_deck = _read_deck_csv()
 
-# Load archetypes for belief posterior
+# Load archetypes and build the opponent model once.  This is the entire
+# opponent model now, so archetypes.json is load-bearing: a bundle whose
+# archetypes.json does not match the checkpoint's archetypes_sha1 is refused
+# at packaging time, not here.
 _archetypes = _load_json(os.path.join(DATA_DIR, "archetypes.json"))
-
-# Track visible opponent cards across the game (for belief posterior)
-_opp_visible_cards: list[int] = []
+_opp_predictor = OpponentDeckPredictor(_archetypes)
 
 # ── Agent function ───────────────────────────────────────────────────────
 
@@ -298,45 +330,6 @@ import model.search_infer as _si
 _si._engine_card_features = _engine_card_features
 _si._engine_attack_features = _engine_attack_features
 _si._evolution_map = _evolution_map
-
-
-def agent(obs_dict: dict) -> list[int]:
-    global _opp_visible_cards
-
-    obs = to_observation_class(obs_dict)
-
-    # Deck selection step
-    if obs.select is None:
-        _opp_visible_cards = []  # reset for new game
-        return list(_fixed_deck)
-
-    # Update visible opponent cards
-    try:
-        _opp_visible_cards = extract_opp_visible_cards(obs_dict)
-    except Exception:
-        pass
-
-    # Predict opponent deck using belief model
-    opp_deck = predict_opponent_deck(
-        obs_dict, _model, _vocab, _archetypes, _device,
-        observed_card_ids=_opp_visible_cards,
-    )
-
-    # Run MCTS via bundled libptcg_search.so
-    result = mcts_search(
-        obs_dict,
-        fixed_deck=_fixed_deck,
-        opp_deck=opp_deck,
-        policy=_model,
-        vocab=_vocab,
-        device=_device,
-        libcg_path=_find_libcg(),
-        iterations=_MCTS_ITERATIONS,
-        c_puct=_MCTS_C_PUCT,
-        seed=_MCTS_SEED,
-    )
-
-    return result.get("indices", [])
 
 
 def _libcg_name() -> str:
@@ -360,13 +353,24 @@ def _find_libcg() -> str:
     decision into a greedy forward pass with no search at all.  So this has to
     actually find the file, not return a hopeful bare name.
 
-    The most reliable source is the ``cg`` package itself: ``cg/sim.py``
-    resolves the library next to its own ``__file__``, so if ``cg`` is
-    importable at all, that directory holds the engine.
+    The bundle carries its own copy in ``data/``, next to
+    ``libptcg_search.so``, and that is the only source that exists on Kaggle:
+    the agent process there has no importable ``cg`` package, so the branch
+    below never fires and every other candidate is a local-development path.
+    Looking only at those is what shipped a submission that played greedy for
+    every decision of every game.
+
+    The ``cg`` package, when there is one, still knows where its own engine is:
+    ``cg/sim.py`` resolves the library next to its own ``__file__``.
     """
     name = _libcg_name()
     here = _AGENT_DIR
     candidates = [
+        # Bundled by build_submission.build_data_files — mirrors the search
+        # library's own lookup order in search_infer._load_search_lib.
+        f"/kaggle_simulations/agent/data/{name}",
+        os.path.join(here, "data", name),
+        os.path.join("data", name),
         f"/kaggle_simulations/agent/{name}",
         name,
         os.path.join(here, name),
@@ -388,6 +392,56 @@ def _find_libcg() -> str:
     print(f"[agent] WARNING: {name} not found; MCTS will fall back to greedy. "
           f"Looked in: {candidates}")
     return name
+
+
+# `agent` must be the LAST callable bound at module level: the Kaggle runner
+# takes `[v for v in env.values() if callable(v)][-1]`, by position and not by
+# name, so anything defined below this point is what it calls instead.  That
+# shipped once — `_find_libcg` above used to live here, and every episode died
+# at step 0 with "Player 1's deck does not have 60 cards" because a path string
+# is not a 60-card deck.  Re-binding `agent = agent` at the end does not fix it;
+# a dict keeps a re-bound key in its original position.
+def agent(obs_dict: dict) -> list[int]:
+    global _decisions_made
+    obs = to_observation_class(obs_dict)
+
+    # Deck selection step — a new game starts here.
+    if obs.select is None:
+        _opp_predictor.reset()
+        _decisions_made = 0
+        return list(_fixed_deck)
+
+    # Fold this observation into the opponent model, then read out one
+    # decklist for the determinizer.  `template()` never abstains: the mirror
+    # heuristic it would otherwise fall back to shares 19.4 of their 60 cards,
+    # against 44.6 for an argmax with no evidence at all.
+    _opp_predictor.observe(obs_dict)
+    opp_deck = _opp_predictor.template()
+
+    # How long this move may take.  Read from the observation every decision:
+    # the bank is shared across the whole game and a short game leaves more for
+    # each remaining move.  Absent on a non-Kaggle caller, which means no
+    # deadline and the iteration ceiling applies instead.
+    _budget = decision_time_budget(
+        obs_dict.get("remainingOverageTime"), _decisions_made)
+    _decisions_made += 1
+
+    # Run MCTS via bundled libptcg_search.so
+    result = mcts_search(
+        obs_dict,
+        fixed_deck=_fixed_deck,
+        opp_deck=opp_deck,
+        policy=_model,
+        vocab=_vocab,
+        device=_device,
+        libcg_path=_find_libcg(),
+        iterations=_MCTS_ITERATIONS,
+        c_puct=_MCTS_C_PUCT,
+        seed=_MCTS_SEED,
+        time_budget_s=_budget,
+    )
+
+    return result.get("indices", [])
 '''
 
 
@@ -421,6 +475,7 @@ except ImportError:
 
 from model import Policy, select_multi
 from model.featurizer import featurize
+from model.deck_guard import DeckGuard, GuardConfig
 
 DATA_DIR = "/kaggle_simulations/agent/data" if os.path.exists("/kaggle_simulations/agent/") else "data"
 _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -547,7 +602,6 @@ else:
     _model = Policy(
         D=_cfg.get("D", 256), heads=_cfg.get("heads", 8),
         layers=_cfg.get("layers", 4), ff=_cfg.get("ff", 1024),
-        n_opp_arch=_cfg.get("n_opp_arch", 1),
         n_all_cards=_cfg.get("n_all_cards", _max_cid + 1),
         all_card_feat=_all_card_feat,
         all_attack_feat=_all_attack_feat,
@@ -577,6 +631,12 @@ else:
     _model.eval()
 
 _fixed_deck = _read_deck_csv()
+
+# Anti-deck-out guard: mechanism A hard-masks options that provably empty the
+# deck before the next-turn draw (prize-winning KOs exempt); mechanism B
+# re-ranks near-ties by net deck delta when the deck is low and the hand is
+# large.  Thresholds come from GuardConfig's corpus-measured defaults.
+_guard = DeckGuard(GuardConfig(), _engine_card_features)
 
 
 # ── Inference helpers ────────────────────────────────────────────────────
@@ -648,6 +708,15 @@ def agent(obs_dict: dict) -> list[int]:
     min_count = int(select.get("minCount", 1) or 0)
     max_count = int(select.get("maxCount", 1) or 0)
 
+    # Raw state for the deck guard — straight from the observation, no
+    # featurizer involvement: my deck, my hand size, my prizes remaining.
+    _cur = obs_dict.get("current") or {}
+    _players = _cur.get("players") or [{}]
+    _me = _players[int(_cur.get("yourIndex", 0))]
+    _deck = int(_me.get("deckCount", 0) or 0)
+    _hand = int(_me.get("handCount", 0) or 0)
+    _prizes = len(_me.get("prize") or [])
+
     # Deliberately unguarded.  A featurizer or shape failure here is not a bad
     # position, it is a bundle that cannot play at all: a static table that was
     # never attached, a renamed key, a checkpoint whose widths moved.  The
@@ -664,12 +733,21 @@ def agent(obs_dict: dict) -> list[int]:
     )
     batch = _to_batch(feats)
     feat_max_count = int(feats.get("maxCount", max_count))
+    _sel_type = int(feats.get("sel_type", select.get("type", 0)) or 0)
+    # Mechanism A: guaranteed deck-out options become mask-illegal here, so
+    # both the single-select masked_fill below and select_multi's cloned
+    # picked-mask honor them.  In-place, zero inference overhead.
+    _guard.apply_mask(batch, sel_type=_sel_type,
+                      deck=_deck, hand=_hand, prizes=_prizes)
 
     with torch.no_grad():
         if feat_max_count == 1:
             logits, _value, _hist = _model(batch)
-            logits = logits.masked_fill(~batch["opt_mask"], -1e9)
-            indices = [int(logits.argmax(dim=-1)[0].item())]
+            # Mechanism B is inside pick(): near-tie re-ranking by deck delta
+            # under (deck low, hand large); plain masked argmax otherwise.
+            indices = [_guard.pick(logits, batch, sel_type=_sel_type,
+                                   max_count=feat_max_count,
+                                   deck=_deck, hand=_hand, prizes=_prizes)]
         else:
             chosen = select_multi(_model, batch)
             # -1 pads beyond maxCount, -2 marks the STOP pick.
@@ -698,7 +776,7 @@ def write_init(dst_dir: Path) -> None:
 def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None:
     """Copy model files from ptcg_il/model/ to submission/model/, rewriting imports.
 
-    Also bundles ``search_infer.py``, ``belief_posterior.py``, and
+    Also bundles ``search_infer.py``, ``deck_prior.py``, and
     ``libptcg_search.so`` for MCTS inference.
 
     Parameters
@@ -709,7 +787,7 @@ def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None
         Submission root (``submission/``).  Model files land in
         ``dst_dir / "model" /``.
     mcts : bool
-        When False, ``search_infer.py`` and ``belief_posterior.py`` are left
+        When False, ``search_infer.py`` and ``deck_prior.py`` are left
         out: the greedy ``main.py`` imports neither, and shipping the MCTS
         module in a bundle with no ``libptcg_search.so`` only invites a
         fallback path that reads as working search.
@@ -731,7 +809,7 @@ def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None
         (model_dst / fname).write_text(text)
         print(f"  Copied + rewrote {fname}")
 
-    # Extra files: search_infer.py, belief_posterior.py
+    # Extra files: search_infer.py, deck_prior.py
     python_src = src_dir / "python"
     for rel_path, dest_name in (EXTRA_FILES if mcts else []):
         src = python_src / rel_path
@@ -739,11 +817,7 @@ def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None
             print(f"WARNING: {src} not found — skipping")
             continue
         text = src.read_text()
-        # Rewrite belief_posterior imports (from ptcg_rl -> relative)
-        if "ptcg_il" in text or "ptcg_rl" in text:
-            text = text.replace("from ptcg_il.featurizer import", "from model.featurizer import")
-            text = text.replace("from ptcg_il.model.policy import", "from model.policy import")
-            text = text.replace("from ptcg_rl.belief import", "from model.belief_posterior import")
+        text = rewrite_imports(text)
         (model_dst / dest_name).write_text(text)
         print(f"  Copied + rewrote {dest_name}")
 
@@ -754,6 +828,16 @@ def build_model_package(src_dir: Path, dst_dir: Path, mcts: bool = True) -> None
         print(f"  Copied ref_map.py (verbatim)")
     else:
         print(f"WARNING: {ref_src} not found — skipping")
+
+    # deck_guard.py — self-contained (numpy + stdlib only), copy verbatim.
+    # Ships in BOTH builds (not an EXTRA_FILES member): it is part of the
+    # greedy agent's inference path, not search-only machinery.
+    guard_src = src_dir / "python" / "ptcg_il" / "deck_guard.py"
+    if guard_src.exists():
+        shutil.copy(guard_src, model_dst / "deck_guard.py")
+        print(f"  Copied deck_guard.py (verbatim)")
+    else:
+        print(f"WARNING: {guard_src} not found — skipping")
 
     # featurizer.py — has ptcg_il.ref_map import, needs rewriting
     feat_src = src_dir / "python" / "ptcg_il" / "featurizer.py"
@@ -779,16 +863,6 @@ def build_main_py(dst_dir: Path, mcts: bool = True) -> None:
 # Section 2: Model weights — extract EMA weights from checkpoint
 # ============================================================
 
-def _infer_n_opp_arch(model_state: dict) -> int:
-    """Recover n_opp_arch from the belief arch head's output width.
-
-    Checkpoints written before `Policy.config` existed carry no record, and
-    guessing 1 produces a bundle that raises on load.
-    """
-    for key, tensor in model_state.items():
-        if key.endswith("belief_heads.arch_head.2.bias"):
-            return int(tensor.shape[0])
-    return 1
 
 
 # What each pinned artifact actually controls at inference.  These are not
@@ -922,7 +996,6 @@ def _build_member_weights(ckpt_path: Path, dst_dir: Path, index: int,
         "heads": int(cfg.get("heads", 8)),
         "layers": int(cfg.get("layers", 4)),
         "ff": int(cfg.get("ff", 1024)),
-        "n_opp_arch": int(cfg.get("n_opp_arch", _infer_n_opp_arch(model_state))),
         "n_all_cards": int(cfg.get("n_all_cards", 0)),
     }
 
@@ -972,7 +1045,6 @@ def build_model_weights(ckpt_path: Path, dst_dir: Path,
         "heads": int(cfg.get("heads", 8)),
         "layers": int(cfg.get("layers", 4)),
         "ff": int(cfg.get("ff", 1024)),
-        "n_opp_arch": int(cfg.get("n_opp_arch", _infer_n_opp_arch(model_state))),
         "n_all_cards": int(cfg.get("n_all_cards", 0)),
     }
     if cfg:
@@ -1007,6 +1079,14 @@ def read_ckpt_deck(ckpt_path: Path) -> tuple[list[int] | None, dict | None]:
     return [int(c) for c in record["deck"]], record
 
 
+# The vendored engine, relative to the repo root.  Both the feature builder
+# (which imports `cg.api` from it) and the bundler (which copies the shared
+# library out of it) read this one place, so a moved checkout breaks loudly in
+# both rather than silently in one.
+ENGINE_DIR_PARTS = ("python", "pokemon-tcg-ai-battle", "sample_submission",
+                    "sample_submission", "cg")
+
+
 def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
     """Build engine_card_features.npy and engine_attack_features.npy from the
     bundled engine's card/attack data.
@@ -1015,8 +1095,7 @@ def _build_engine_features_from_engine(src_dir: Path, dst_dir: Path) -> None:
     competition — cards added after training still get correct features.
     """
     import numpy as np
-    sys.path.insert(0, str(src_dir / "python" / "pokemon-tcg-ai-battle"
-                            / "sample_submission" / "sample_submission"))
+    sys.path.insert(0, str(src_dir.joinpath(*ENGINE_DIR_PARTS).parent))
     # ptcg_mine lives under python/, and this script is run from the repo root
     # (see scripts/build_submit.sh), so python/ has to be on the path too.
     sys.path.insert(0, str(src_dir / "python"))
@@ -1096,8 +1175,38 @@ def build_data_files(data_dir: Path, dst_dir: Path, deck: list[int] | None = Non
                 break
         if not bundled:
             print(f"  WARNING: libptcg_search.so not found — MCTS will fall back to greedy policy")
+
+        # The engine itself.  libptcg_search.so dlopens libcg.so by the path
+        # `main.py`'s `_find_libcg()` hands `puct_init`, and the Kaggle agent
+        # process has no importable `cg` package to borrow one from — so an
+        # engine that is not *in the bundle* means `puct_init` returns null and
+        # every decision degrades to a greedy forward pass, reported only as a
+        # line in the competition's stdout.  Bundling it locally is invisible:
+        # the repo path this copies from exists here.
+        #
+        # Always `libcg.so`: the target is Kaggle's Linux x86-64 runner, so the
+        # name is fixed regardless of what this build happens to run on.
+        engine_candidates = [
+            src_dir.joinpath(*ENGINE_DIR_PARTS) / "libcg.so",
+            src_dir / "cg" / "libcg.so",
+        ]
+        for eng_path in engine_candidates:
+            if eng_path.exists():
+                shutil.copy(eng_path, dst_dir / "libcg.so")
+                size_kb = eng_path.stat().st_size / 1024
+                print(f"  Copied libcg.so ({size_kb:.0f} KB)")
+                break
+        else:
+            # Fatal, unlike libptcg_search.so above: that one is missing
+            # whenever cargo is, but the engine is vendored in the repo, so its
+            # absence means the build is wrong. Warning and continuing is
+            # exactly what shipped a greedy submission labelled as MCTS.
+            raise FileNotFoundError(
+                "libcg.so not found — an MCTS bundle cannot run search without "
+                "the engine, and the agent would silently play greedy. Looked "
+                f"in: {[str(p) for p in engine_candidates]}")
     else:
-        print(f"  Skipped archetypes.json + libptcg_search.so (no-MCTS build)")
+        print(f"  Skipped archetypes.json + libptcg_search.so + libcg.so (no-MCTS build)")
 
     # deck.csv (one card ID per line) — MUST be the deck this checkpoint was
     # trained on, not archetypes.json's `fixed_deck`.
@@ -1150,8 +1259,8 @@ def verify_model_imports(dst_dir: Path) -> bool:
     # Import main.py, not just the model package: main.py is where Policy is
     # actually constructed and model.pt loaded, and that is where the bundle
     # breaks.  Verifying only `from model import ...` passed a submission whose
-    # agent raised at import (wrong n_opp_arch => belief-head shape mismatch,
-    # fatal even under strict=False) and therefore forfeited every game.
+    # agent raised at import (architecture mismatch, fatal even under
+    # strict=False) and therefore forfeited every game.
     result = subprocess.run(
         [sys.executable, "-c",
          "import main; assert callable(main.agent); print('OK')"],
@@ -1212,17 +1321,14 @@ def main():
     p.add_argument("--no-mcts", action="store_true",
                    help="Build a pure-policy bundle: one greedy forward pass per "
                         "decision, no tree search. Drops search_infer.py, "
-                        "belief_posterior.py, archetypes.json and libptcg_search.so.")
+                        "deck_prior.py, archetypes.json and libptcg_search.so.")
     args = p.parse_args()
     ckpt_paths = args.ckpt  # list[str] (action="append")
     is_ensemble = len(ckpt_paths) > 1
+    mcts = not args.no_mcts
     if is_ensemble:
-        if args.no_mcts:
-            print("Note: --no-mcts is redundant in ensemble mode (always greedy)")
-        mcts = False  # ensemble is greedy-only
-        print(f"Ensemble mode: {len(ckpt_paths)} checkpoints, implicit --no-mcts")
-    else:
-        mcts = not args.no_mcts
+        print(f"Ensemble mode: {len(ckpt_paths)} checkpoints"
+              f"{' (MCTS)' if mcts else ' (greedy)'}")
 
     work = Path(args.work_dir)
     if work.exists():
@@ -1271,11 +1377,11 @@ def main():
             deck = override
 
         check_artifact_pairing(deck_record, Path(args.data_dir), force=args.force,
-                               mcts=False)
+                               mcts=mcts)
 
         print("Building data files...")
         build_data_files(Path(args.data_dir), data_dir, deck=deck, src_dir=Path.cwd(),
-                         mcts=False)
+                         mcts=mcts)
 
         # Write per-member weight files
         for i, ckpt_p in enumerate(ckpt_paths):
@@ -1291,7 +1397,8 @@ def main():
         # Auto-suffix --out for ensemble
         out_path = Path(args.out)
         if args.out == "submission.tar.gz":
-            out_path = Path(f"submission-greedy-ens{len(ckpt_paths)}.tar.gz")
+            prefix = "submission" if mcts else "submission-greedy"
+            out_path = Path(f"{prefix}-ens{len(ckpt_paths)}.tar.gz")
             print(f"Ensemble default output: {out_path}")
     else:
         # ── Single checkpoint: original flow, byte-identical ──

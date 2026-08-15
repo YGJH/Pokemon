@@ -16,18 +16,20 @@ shift 2
 
 # Archetype id: strip 'a' prefix if present
 ARCH_ID="${ARCH#a}"
-
+# --w-lost 0.7
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/../python"
 
-for S in $(seq 0 $((N - 1))); do
+for S in $(seq 11 $((N - 1))); do
     echo "=== Training member $S/$N (seed=$S, archetype=$ARCH_ID) ==="
+
     uv run python -m ptcg_il.cli train \
         --data-dir data \
         --out-dir "checkpoints_a${ARCH_ID}_s${S}" \
         --archetype-self "$ARCH_ID" \
         --seed "$S" \
-        "$@"
+	--exclude-arch-before 1:2026-07-04 \
+	"$@"
     echo "=== Member $S done ==="
 done
 

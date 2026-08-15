@@ -15,6 +15,7 @@ previous one passes makes failures compound and become unattributable.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 from rich.logging import RichHandler
@@ -157,9 +158,8 @@ def _load_policies(args: argparse.Namespace, device):
     """Build θ (trainable) and π_IL (frozen) from the same IL checkpoint.
 
     Both come from the checkpoint's own ``config`` record rather than from
-    inferred shapes.  A wrong ``n_opp_arch`` would not raise — the belief head
-    just changes width and ``load_policy_state`` forgives missing belief keys —
-    so a guessed architecture yields a plausible model with random heads.
+    inferred shapes.  A guessed architecture that happens to load is worse than
+    one that raises: it yields a plausible model with random parameters.
     """
     import copy
 
@@ -226,14 +226,13 @@ def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> int:
     """Load *ckpt_sd* into *policy*, handling size-mismatched params.
 
     For any parameter whose checkpoint shape differs from the model, only
-    the overlapping prefix is copied.  Missing belief-head keys are tolerated.
+    the overlapping prefix is copied.  Keys the checkpoint does not carry are
+    left at their initial values.
     """
     loaded = 0
     for key, model_param in model_sd.items():
         ckpt_param = ckpt_sd.get(key)
         if ckpt_param is None:
-            if key.startswith("belief_heads."):
-                continue
             continue
         if ckpt_param.shape != model_param.shape:
             slices = tuple(
@@ -653,7 +652,7 @@ def _run_mcts_distillation(
     Uses stored ``obs_json`` from rollout Decisions (Phase 3d) to
     construct determinized search roots.  Each tagged state gets K
     determinizations with different opponent deck guesses sampled from
-    the belief posterior.
+    the archetype prior posterior.
 
     Returns a list of ``SearchTarget`` (or ``None`` for untagged
     decisions) aligned with the decision indices.
@@ -695,10 +694,11 @@ def _run_mcts_distillation(
             opp_visible = getattr(dec, "opp_visible_card_ids", None) or []
 
             # ── K weighted determinizations per state ──────────────────
-            for k in range(cfg.mcts_k_determinizations):
-                opp_template = _sample_opp_deck(
-                    args, obs_dict, opp_visible, seed=cfg.seed + i * 1000 + k
-                )
+            templates = _opp_deck_templates(
+                args, obs_dict, opp_visible,
+                k=cfg.mcts_k_determinizations, seed=cfg.seed + i * 1000,
+            )
+            for k, opp_template in enumerate(templates):
                 tree_id = forest.add_root(
                     obs_dict,
                     fixed_deck,
@@ -776,38 +776,45 @@ def _run_mcts_distillation(
     return targets
 
 
-def _sample_opp_deck(
-    args, obs_dict: dict, observed_card_ids: list[int], seed: int
-) -> list[int]:
-    """Sample an opponent deck template for one determinization.
+@functools.lru_cache(maxsize=4)
+def _deck_predictor(data_dir: str):
+    """The archetype-prior predictor for *data_dir*, built once.
 
-    Uses ``OpponentDeckOracle.predict()`` with multinomial sampling (rng),
-    so each call produces a potentially different distribution sample.
-    K calls with different seeds give K diverse determinizations.
+    Cached because the predecessor reloaded ``vocab.json`` and
+    ``archetypes.json`` on every one of K x batch calls.  Keyed on the path
+    string so ``lru_cache`` can hash it.
+    """
+    from ptcg_il.deck_prior import OpponentDeckPredictor
+
+    with open(Path(data_dir) / "archetypes.json") as f:
+        archetypes = json.load(f)
+    return OpponentDeckPredictor(archetypes)
+
+
+def _opp_deck_templates(
+    args, obs_dict: dict, observed_card_ids: list[int], k: int, seed: int
+) -> list[list[int]]:
+    """*k* opponent decklists for *k* determinized worlds.
+
+    Draws from the archetype posterior rather than taking its argmax: K worlds
+    exist to cover uncertainty, and k copies of the same deck would collapse
+    ``mcts_k_determinizations`` to 1 while leaving the knob looking effective.
+
+    **No exception handling.**  The version this replaces wrapped everything in
+    ``except Exception: return []`` and therefore hid an ``AttributeError`` in
+    its own constructor for the lifetime of the code — every determinization
+    silently ran on the Rust mirror heuristic instead.  A broken artifact must
+    stop the run.
     """
     import numpy as np
 
-    data_dir = Path(args.data_dir)
-    vocab = _load_vocab(data_dir)
-    archetypes = _load_archetypes(data_dir)
-
-    try:
-        from ptcg_il.belief_infer import OpponentDeckOracle
-
-        oracle = OpponentDeckOracle(
-            policy=None,  # Will be set below
-            vocab=vocab,
-            archetypes=archetypes,
-        )
-        # We need the policy for belief heads.  If unavailable, fall
-        # back to ArchetypePosterior (no NN needed).
-        return oracle.predict(
-            obs_dict,
-            rng=np.random.default_rng(seed),
-            observed_card_ids=observed_card_ids,
-        )
-    except Exception:
-        return []  # Empty = Rust mirror fallback
+    predictor = _deck_predictor(str(Path(args.data_dir)))
+    predictor.reset()
+    if obs_dict:
+        predictor.observe(obs_dict)
+    if observed_card_ids:
+        predictor.observe_cards(observed_card_ids)
+    return predictor.sample_templates(k, np.random.default_rng(seed))
 
 
 def _load_archetypes(data_dir: Path) -> dict:

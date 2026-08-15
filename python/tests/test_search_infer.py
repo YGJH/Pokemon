@@ -136,10 +136,9 @@ def test_card_encoder_is_shared_across_heads():
     and reads ``named_parameters(remove_duplicate=False)``.  Both halves of
     that depend on this tie; if Policy ever stops sharing, the check silently
     becomes a no-op and a real missing weight ships unnoticed."""
-    m = Policy(D=64, heads=4, layers=1, ff=128, n_opp_arch=2, n_all_cards=10,
+    m = Policy(D=64, heads=4, layers=1, ff=128, n_all_cards=10,
                all_card_feat=torch.zeros(10, 94))
     assert m.pointer.card is m.embed.card
-    assert m.belief_heads.card_emb is m.embed.card
 
     dedup = dict(m.named_parameters())
     full = dict(m.named_parameters(remove_duplicate=False))
@@ -155,7 +154,7 @@ def test_loading_without_alias_keys_still_populates_them():
     """The packaged state dict omits the aliases (EMA de-duplicates); loading
     ``embed.card.*`` must be enough, or the submission would run a randomly
     initialised card encoder inside the pointer head."""
-    src = Policy(D=64, heads=4, layers=1, ff=128, n_opp_arch=2, n_all_cards=10,
+    src = Policy(D=64, heads=4, layers=1, ff=128, n_all_cards=10,
                  all_card_feat=torch.zeros(10, 94))
     sd = {k: v for k, v in src.state_dict().items()
           if not (k.startswith("pointer.card.") or "card_emb.mlp" in k)}
@@ -163,7 +162,7 @@ def test_loading_without_alias_keys_still_populates_them():
         if k.startswith("embed.card.mlp"):
             sd[k] = torch.full_like(sd[k], 0.1234)
 
-    dst = Policy(D=64, heads=4, layers=1, ff=128, n_opp_arch=2, n_all_cards=10,
+    dst = Policy(D=64, heads=4, layers=1, ff=128, n_all_cards=10,
                  all_card_feat=torch.zeros(10, 94))
     dst.load_state_dict(sd, strict=False)
 
@@ -172,62 +171,316 @@ def test_loading_without_alias_keys_still_populates_them():
                        dst.embed.card.mlp[0].weight)
 
 
-# ── Tier 3: the belief `deck` head is engine-id indexed ──────────────────
-#
-# `belief_labels.deck_counts_dense` writes `out[cid]` for a raw engine card id
-# and `cli` sizes the head from the engine feature matrix, so position i of
-# `deck` means engine card i — there is no vocab hop.  Tier 3 used to route it
-# through `_index_to_id(vocab)`, a ~311-entry table against a 1268-wide head.
+# ── Ensemble MCTS support: _policy_evaluate_leaf must use forward(), ───────
+# not the Policy-specific low-level API (_encode/pointer/value), so that
+# EnsemblePolicy — which has none of those methods — can serve as the MCTS
+# leaf evaluator.
 
 
-def test_deck_from_distribution_treats_none_as_engine_ids():
-    probs = np.zeros(1268, dtype=np.float64)
-    probs[900] = 0.5   # past the end of any plausible vocab
-    probs[1200] = 0.5
-    deck = search_infer._deck_from_distribution(probs, None, deck_size=60)
-    assert len(deck) == 60, "engine-id positions must not be dropped"
-    assert set(deck) == {900, 1200}
+def _policy_evaluate_leaf_ast():
+    """Parse the function source so assertions move with edits."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(search_infer._policy_evaluate_leaf)
+    # De-dent: inspect.getsource returns the function body indented; the
+    # try/except block is easier to parse as module-level.
+    lines = src.splitlines()
+    if lines and lines[0].startswith((" ", "\t")):
+        indent = len(lines[0]) - len(lines[0].lstrip())
+        src = "\n".join(line[indent:] for line in lines)
+    return ast.parse(src)
 
 
-def test_deck_from_distribution_still_maps_when_given_a_table():
-    """The explicit-table path is unchanged — None is opt-in, not a rewrite."""
-    probs = np.zeros(4, dtype=np.float64)
-    probs[2] = 1.0
-    deck = search_infer._deck_from_distribution(probs, [-1, -1, 77, 88],
-                                                deck_size=60)
-    assert set(deck) == {77}
+def test_policy_evaluate_leaf_uses_forward_not_low_level_api():
+    """After ensemble-MCTS: _policy_evaluate_leaf calls policy(batch), not
+    policy._encode() + policy.pointer() + policy.value()."""
+    import ast
+
+    tree = _policy_evaluate_leaf_ast()
+
+    attr_calls: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                attr_calls.append(node.func.attr)
+
+    # The old code had three Policy-specific attribute calls.
+    assert "_encode" not in attr_calls, (
+        "_policy_evaluate_leaf still calls policy._encode(); "
+        "use policy(batch) so EnsemblePolicy works")
+    assert "pointer" not in attr_calls, (
+        "_policy_evaluate_leaf still calls policy.pointer(); "
+        "EnsemblePolicy has no pointer attribute")
+    # value-head access is now through forward()'s return tuple
+    assert "value" not in attr_calls, (
+        "_policy_evaluate_leaf still calls policy.value(); "
+        "read value from forward()'s return tuple instead")
 
 
-def test_tier3_keeps_full_deck_for_high_engine_ids(monkeypatch):
-    """End-to-end through `predict_opponent_deck`, with vocab far smaller than
-    the head.  The old code returned a short deck of relabelled cards."""
-    n_all_cards = 1268
-    probs = np.zeros(n_all_cards, dtype=np.float32)
-    for cid in (700, 850, 1100):
-        probs[cid] = 1 / 3
+def test_policy_evaluate_leaf_calls_policy_as_callable():
+    """The policy is invoked as ``policy(batch)``, which dispatches to
+    Policy.forward() or EnsemblePolicy.forward() depending on type."""
+    import ast
 
-    class _FakePolicy:
-        def belief_logits(self, batch):
-            # No confident arch head, no reps -> falls through to Tier 3.
-            return {"arch": torch.zeros(1, 1), "deck": torch.tensor(probs)[None]}
+    tree = _policy_evaluate_leaf_ast()
 
-    # `predict_opponent_deck` does `from model.featurizer import featurize` —
-    # a name that only exists inside the packaged bundle.  Unstubbed it raises
-    # ImportError into the function's bare `except Exception`, so the test
-    # would pass vacuously on an empty deck for the wrong reason.
+    policy_calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            policy_calls.append(node)
+
+    # Find the ``policy(batch)`` call.
+    batch_calls = [c for c in policy_calls
+                   if len(c.args) >= 1
+                   and isinstance(c.args[0], ast.Name)
+                   and c.args[0].id == "batch"]
+    assert batch_calls, (
+        "_policy_evaluate_leaf must contain ``policy(batch)``; "
+        "found calls: " + ", ".join(
+            f"{c.func.id}({', '.join(a.id if isinstance(a, ast.Name) else '...' for a in c.args)})"
+            for c in policy_calls))
+
+
+def test_policy_evaluate_leaf_works_with_ensemble_like_object(monkeypatch):
+    """An object with only forward() — no _encode/pointer/value — must work."""
+    import json
     import sys
     import types
-    pkg = types.ModuleType("model")
-    pkg.__path__ = []
-    feat_mod = types.ModuleType("model.featurizer")
-    feat_mod.featurize = lambda *a, **k: {}
-    monkeypatch.setitem(sys.modules, "model", pkg)
-    monkeypatch.setitem(sys.modules, "model.featurizer", feat_mod)
-    monkeypatch.setattr(search_infer, "_dict_to_batch", lambda *a, **k: {})
 
-    vocab = {"size": 311, "id_to_index": {str(i): i for i in range(311)}}
-    deck = search_infer.predict_opponent_deck(
-        {}, _FakePolicy(), vocab, {"self_ids": [], "clusters": []}, "cpu")
+    import numpy as np
 
-    assert len(deck) == 60, f"got {len(deck)} cards: {sorted(set(deck))}"
-    assert set(deck) == {700, 850, 1100}
+    # Mock _dict_to_batch to return batch-shaped torch tensors.
+    # _policy_evaluate_leaf indexes opt_mask with [0], which fails on raw numpy.
+    def _mock_dict_to_batch(feats, device):
+        out = {}
+        for k, v in feats.items():
+            if isinstance(v, np.ndarray):
+                t = torch.from_numpy(v).unsqueeze(0)
+                out[k] = t.bool() if v.dtype == np.bool_ else t.float()
+            else:
+                out[k] = v
+        return out
+
+    monkeypatch.setattr(search_infer, "_dict_to_batch", _mock_dict_to_batch)
+
+    # Mock model.featurizer.featurize so the lazy import inside
+    # _policy_evaluate_leaf returns our stub.
+    _fake_featurize = types.ModuleType("model.featurizer")
+    _fake_featurize.featurize = lambda obs_dict, vocab, **kw: {
+        "opt_mask": np.ones(3, dtype=bool),
+        "stop_column": None,
+    }
+    _fake_model = types.ModuleType("model")
+    _fake_model.featurizer = _fake_featurize
+    # setitem, not raw assignment: a bare `sys.modules["model"] = ...` outlives
+    # this test, and `model` is also the name of the real vendored Kaggle-bundle
+    # package.  `test_vendored_sync` sorts after this file, so it imported this
+    # stub instead and failed on the whole suite while passing in isolation --
+    # a guard that only works when run alone is not a guard.
+    monkeypatch.setitem(sys.modules, "model", _fake_model)
+    monkeypatch.setitem(sys.modules, "model.featurizer", _fake_featurize)
+
+    # An ensemble-like object: only __call__, no _encode/pointer/value.
+    calls_log: list[str] = []
+
+    class EnsembleLike:
+        def __call__(self, batch):
+            calls_log.append("forward")
+            n_opt = int(batch["opt_mask"].sum())
+            return (
+                torch.zeros(1, n_opt),   # logits
+                torch.zeros(1),           # value
+                torch.zeros(1, 1),        # history_h
+            )
+
+    policy = EnsembleLike()
+    obs_json = json.dumps({"select": {"option": [{}]}})
+
+    priors, val = search_infer._policy_evaluate_leaf(
+        obs_json, n_options=3, is_terminal=False,
+        policy=policy, vocab={}, device="cpu",
+    )
+
+    assert "forward" in calls_log, (
+        "policy.__call__ (forward) was not invoked; ensemble cannot work")
+    assert len(priors) == 3, f"expected 3 priors, got {len(priors)}"
+    assert isinstance(val, float)
+
+
+def test_policy_evaluate_leaf_uses_policy_not_pointer_attribute():
+    """The function body must not dereference ``policy.pointer`` or
+    ``policy.embed`` — those are Policy-specific and would fail on
+    EnsemblePolicy."""
+    import ast
+    import inspect
+
+    src = inspect.getsource(search_infer._policy_evaluate_leaf)
+    tree = ast.parse(src)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            if isinstance(node.value, ast.Name) and node.value.id == "policy":
+                attr = node.attr
+                assert attr not in ("pointer", "embed", "value", "_encode"), (
+                    f"_policy_evaluate_leaf still references policy.{attr}; "
+                    "EnsemblePolicy has none of these — use policy(batch) instead"
+                )
+
+
+
+
+# ── Who calls GameInitialize is a question, not an assumption ────────────
+#
+# `puct_init`'s last argument tells the Rust tree whether this process has
+# already called `GameInitialize` on libcg.so.  Getting it wrong is fatal in
+# both directions: a second call aborts the process, a skipped one drives an
+# uninitialised engine.  It was hardcoded to 1 with the comment "Python always
+# calls GameInitialize first" — true from the repo, where importing `cg.sim`
+# does it, and false in the Kaggle bundle, which ships no `cg` package at all
+# and falls back to a shim `to_observation_class`.
+
+def test_host_initialized_is_derived_from_whether_cg_sim_was_imported(monkeypatch):
+    import sys
+    import types
+
+    recorded: list[tuple] = []
+
+    class _Lib:
+        def puct_init(self, *args):
+            recorded.append(args)
+            return 0  # null handle -> greedy fallback; we only want the args
+
+    monkeypatch.setattr(search_infer, "_load_search_lib", lambda: _Lib())
+    monkeypatch.setattr(search_infer, "_register_basic_pokemon", lambda lib: None)
+    monkeypatch.setattr(search_infer, "_greedy_action",
+                        lambda *a, **k: {"indices": []})
+
+    obs = {"select": {"maxCount": 1}}
+
+    # The bundle: no cg package anywhere, so nothing has initialised the engine
+    # and the Rust side must do it.
+    monkeypatch.delitem(sys.modules, "cg.sim", raising=False)
+    search_infer.mcts_search(obs, [], [], None, {}, None)
+    assert recorded[-1][-1] == 0, (
+        "no cg.sim in the process means no GameInitialize has run; the tree "
+        "must call it or it drives an uninitialised engine")
+
+    # The repo (live_eval, RL, tournament): cg.sim's import already did it.
+    monkeypatch.setitem(sys.modules, "cg.sim", types.ModuleType("cg.sim"))
+    search_infer.mcts_search(obs, [], [], None, {}, None)
+    assert recorded[-1][-1] == 1, (
+        "cg.sim imported means GameInitialize already ran; a second call "
+        "aborts the process")
+
+    assert len(recorded) == 2
+
+
+# ── Decision time budget ──────────────────────────────────────────────────
+#
+# Kaggle gives one 600 s bank per game (`actTimeout: 0`), and a single call
+# that exceeds what is left is a TIMEOUT, i.e. a loss.  These pin the two
+# properties that matter: the budget must never bust the bank in a long game,
+# and it must not collapse to nothing in one.
+
+
+def test_no_budget_without_a_clock():
+    """A caller off Kaggle's clock passes no remaining time and gets no
+    deadline — the iteration ceiling applies instead."""
+    assert search_infer.decision_time_budget(None) is None
+    assert search_infer.decision_time_budget("not a number") is None
+
+
+def test_first_decision_budget_is_the_p99_slice():
+    """~588 s usable after import, spread over the p99 game length."""
+    budget = search_infer.decision_time_budget(588.0, decisions_made=0)
+    expected = (588.0 - search_infer.DECISION_BUDGET_RESERVE_S) / search_infer.DECISION_BUDGET_TOTAL
+    assert budget == pytest.approx(expected)
+    assert 2.5 < budget < 4.0, "p99 sizing should land near 3 s/decision"
+
+
+def test_budget_grows_as_the_game_turns_out_short():
+    """Spending less than budgeted leaves more for each remaining move, which
+    is the point of reading `remaining` every call instead of dividing once."""
+    early = search_infer.decision_time_budget(500.0, decisions_made=10)
+    later = search_infer.decision_time_budget(500.0, decisions_made=100)
+    assert later > early
+
+
+def test_budget_is_clamped_at_both_ends():
+    assert search_infer.decision_time_budget(1e9, 0) == search_infer.DECISION_BUDGET_MAX_S
+    # Bank below the reserve: the raw slice is negative, the floor is not.
+    assert search_infer.decision_time_budget(1.0, 500) == search_infer.DECISION_BUDGET_MIN_S
+
+
+@pytest.mark.parametrize("n_decisions", [91, 166, 280, 600])
+def test_a_full_game_never_busts_the_bank(n_decisions):
+    """The safety property, simulated over real game lengths.
+
+    91 = mean, 166 = p99, 280 = longest archetype-1 game in meta.parquet, and
+    600 is well past anything measured.  Each decision is assumed to spend its
+    whole budget, which is the worst case; `remaining` is decremented by it.
+    """
+    remaining = 600.0 - 12.0  # bank less the one-off import cost
+    spent_at_all = 0
+    for i in range(n_decisions):
+        budget = search_infer.decision_time_budget(remaining, i)
+        assert budget is not None
+        assert budget > 0, f"decision {i} got a non-positive budget"
+        if budget > search_infer.DECISION_BUDGET_MIN_S:
+            spent_at_all += 1
+        remaining -= budget
+        assert remaining > 0, (
+            f"bank exhausted after {i + 1}/{n_decisions} decisions — "
+            f"a call with no bank left is a TIMEOUT, which is a loss")
+    assert spent_at_all > 0, "budget never exceeded the floor; nothing was searched"
+
+
+def test_the_deadline_stops_the_search_loop(monkeypatch):
+    """A budget smaller than one iteration still expands once, then stops.
+
+    Breaking *before* the first expand would leave `visit_counts` empty and
+    silently take the greedy fallback — legal moves, no search.
+    """
+    expands = []
+
+    class _Lib(_FakeLib):
+        def puct_init(self, *a, **k):
+            return 1234
+
+        def puct_select(self, handle):
+            # The real tree reports `tree_done` once the iteration ceiling is
+            # reached; mirror that, so removing the deadline makes this test
+            # fail with a count instead of hanging forever.
+            if len(expands) >= 50:
+                return b'{"tree_done": true}'
+            return b'{"leaf_obs_json": "{}", "n_options": 2, "is_terminal": false, "player_role": 0}'
+
+        def puct_expand(self, handle, priors, value):
+            expands.append(value)
+            return 0
+
+        def puct_result(self, handle):
+            return b'{"visit_counts": [[0, 1]]}'
+
+        def puct_free(self, handle):
+            return None
+
+        def puct_free_result(self, ptr):
+            return None
+
+    lib = _Lib()
+    monkeypatch.setattr(search_infer, "_load_search_lib", lambda: lib)
+    monkeypatch.setattr(search_infer, "_register_basic_pokemon", lambda _l: None)
+    monkeypatch.setattr(search_infer, "_read_and_free", lambda _l, raw: raw)
+    monkeypatch.setattr(
+        search_infer, "_policy_evaluate_leaf", lambda *a, **k: ([0.5, 0.5], 0.0))
+
+    res = search_infer.mcts_search(
+        {"select": {"minCount": 1, "maxCount": 1, "option": [{}, {}]}},
+        fixed_deck=[1] * 60, opp_deck=[1] * 60, policy=None, vocab={},
+        device="cpu", iterations=10_000, time_budget_s=0.0,
+    )
+    assert len(expands) == 1, (
+        f"expected exactly one expansion before the deadline, got {len(expands)}")
+    assert res.get("indices") == [0], "a one-node tree must still yield a move"

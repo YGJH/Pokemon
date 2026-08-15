@@ -21,7 +21,7 @@ def _from_checkpoints(paths, **kw):
 
     Members are saved by ``make_policy``, which attaches those tables, so the
     card matrix is in their state dicts; rebuilding without it makes
-    ``belief_heads.all_card_feat`` an unexpected key.
+    the static table buffers unexpected keys.
     """
     card, atk = make_static_tables()
     kw.setdefault("all_card_feat", card)
@@ -98,7 +98,7 @@ class TestEnsemblePolicyConstruction:
 
         The shadow is built the same way _EMA.__init__ builds it — via
         named_parameters() with remove_duplicate=True (the default), so tied
-        parameter aliases (pointer.card, belief.card_emb) are absent.
+        parameter aliases (e.g. pointer.card tied to embed.card) are absent.
         """
         m0 = _make_member(seed=0)
         # Build shadow matching _EMA.__init__: named_parameters() deduplicates

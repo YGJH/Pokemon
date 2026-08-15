@@ -196,7 +196,7 @@ class TestCheckpointConfig:
 
         from ptcg_il.model.policy import current_feature_dims
 
-        p = Policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
+        p = Policy(D=32, heads=4, layers=1, ff=64)
         # No V/A: cards are static features, so there is no vocab width to
         # record.  No static_table_shapes either: this policy was built without
         # tables, and the key appears only once they are attached.
@@ -204,7 +204,7 @@ class TestCheckpointConfig:
         # The dropout rates are provenance, not shapes: they add no parameters
         # and ``policy_from_config`` deliberately rebuilds at 0.0 regardless.
         assert arch == {"D": 32, "heads": 4, "layers": 1, "ff": 64,
-                        "n_opp_arch": 6, "n_all_cards": 0, "seed": 42,
+                        "n_all_cards": 0, "seed": 42,
                         "attn_dropout": 0.0, "ffn_dropout": 0.0}
         # ...plus the featurizer widths the weights were shaped by, so a
         # featurizer edit cannot silently redefine the checkpoint.
@@ -215,20 +215,15 @@ class TestCheckpointConfig:
         pytest.importorskip("torch")
         from ptcg_il.model.policy import Policy, load_policy_state, policy_from_config
 
-        original = make_policy(D=32, heads=4, layers=1, ff=64, n_opp_arch=6)
+        original = make_policy(D=32, heads=4, layers=1, ff=64)
         card, atk = make_static_tables()
         rebuilt = policy_from_config(original.config, all_card_feat=card,
                                      all_attack_feat=atk)
-        # A strict-enough load: only belief keys may be missing, and here none are.
+        # A strict-enough load: only retired-prefix keys may be missing.
         assert load_policy_state(rebuilt, original.state_dict()) == []
 
     def test_missing_config_raises_rather_than_guessing(self):
-        """A guessed n_opp_arch would not raise — it would just be wrong.
-
-        ``load_policy_state`` forgives missing ``belief_heads.*`` keys, so a
-        wrong belief width yields a plausible model with randomly-initialised
-        heads instead of an error.
-        """
+        """A missing config key should raise, not silently guess a shape."""
         pytest.importorskip("torch")
         from ptcg_il.model.policy import policy_from_config
 

@@ -20,17 +20,20 @@ per-agent skill score in the JSON**. So we build our own expert set from the sam
 3. **Expert set = top-K teams** by `win_rate` with `games ≥ G_min` (e.g. K≈10, G_min≈50). Optionally
    cross-check against the public leaderboard names.
 4. **Training samples = ALL ACTIVE decisions made by an expert team**, in won *and* lost games, with
-   lost-game decisions down-weighted (`W_LOST ≈ 0.6`, folded into `sample_weight`). Rationale below.
+   lost-game decisions signed (`W_LOST = -0.3`, folded into `sample_weight`): a lost game's action
+   probability is pushed *down* at 0.3x the rate a won game's is pushed up. Rationale below.
 
 > Rationale: we already selected experts by team-level win-rate, so their moves are good *regardless
 > of the single game's outcome*. Game outcome is a **noisy proxy for move quality**: a won game can
 > contain bad moves (won despite them), a lost game usually contains good moves (lost to prize/coin
 > variance). Filtering those experts' decisions *again* by per-game result discards ~half the data for
 > marginal signal **and** starves the policy of even/losing board states — exactly the states a
-> sub-expert policy drifts into at inference, worsening BC covariate shift. So keep both outcomes and
-> down-weight losses instead of dropping them. (Wins-only is retained as an **ablation**, not the
-> default — see §7. This also un-blocks the value head: with both outcomes, `value_target ∈ {+1,-1}`
-> is informative from v1, giving the free warm-start critic `AGENT_SPEC.md` §8 wants.)
+> sub-expert policy drifts into at inference, worsening BC covariate shift. So keep both outcomes.
+> The loss signal on losses is **signed** (`W_LOST = -0.3`): lost-game actions are pushed down, not
+> imitated — but at 0.3x rate so the noisy outcome signal never overwhelms the imitation signal.
+> (Wins-only and down-weight are retained as **ablations**, not the default — see §7. Keeping both
+> outcomes also un-blocks the value head: with both outcomes, `value_target ∈ {+1,-1}` is informative
+> from v1, giving the free warm-start critic `AGENT_SPEC.md` §8 wants.)
 
 ### 1.2 Fixed-deck restriction (bounded card universe) — **M = 3–8**
 The deck is the `action` at the `select=None` step (a 60-card id list). Canonicalize each deck to a
@@ -83,7 +86,7 @@ for i in range(len(steps)-1):              # NB: drops the final step's action (
         and deck(p) in 𝒟_self and deck(1-p) in 𝒟_opp):     # won/lost both kept (§1.1)
         yield  obs   = steps[i][p].observation          # the obs_dict
                action= steps[i+1][p].action             # expert's chosen indices
-               weight_scale = 1.0 if won(p) else W_LOST  # §1.1 loss down-weight
+               weight_scale = 1.0 if won(p) else W_LOST  # §1.1 signed outcome weight
 ```
 `range(len(steps)-1)` intentionally **drops the last ACTIVE decision** (its action would live at
 `steps[len]`), which is usually the game-ending attack — an acceptable loss, noted so it is not
@@ -240,9 +243,11 @@ Ship `main.py` + `deck.csv` (FIXED_DECK) + `cg/` + weights; loaded from `/kaggle
 
 ## 7. Decisions
 **Locked:**
-- **Expert data = ALL decisions of top agents**, won *and* lost games, lost down-weighted
-  `W_LOST≈0.6` (§1.1). Team-level win-rate already selects skill; per-game outcome is a noisy quality
-  proxy and dropping losses worsens covariate shift. *Wins-only is the ablation, not the default.*
+- **Expert data = ALL decisions of top agents**, won *and* lost games, lost signed
+  `W_LOST=-0.3` (§1.1): won-game actions are imitated, lost-game actions are pushed down at
+  0.3x rate. Team-level win-rate already selects skill; per-game outcome is a noisy quality
+  proxy, which is why the negative side stays small — imitation dominates at 1 : 0.3.
+  *Wins-only (`W_LOST=0`) and down-weight (`W_LOST=0.6`) remain ablations.*
 - **Value head active from v1**: with both outcomes `value_target ∈ {+1,-1}` is informative, so
   `LAMBDA_V=0.5` (warm-start critic for RL, `AGENT_SPEC.md` §8).
 - **Vocab decoupled from the archetype filter** (§1.2): games are filtered by archetype for clean
@@ -368,7 +373,7 @@ the sample only carries **ids**, not repeated static rows).
 ### State — dense features
 | key | shape | dtype | contents |
 |---|---|---|---|
-| `poke_feat` | `[P_MAX, F_POKE=26]` | float32 | see A.5 |
+| `poke_feat` | `[P_MAX, F_POKE=29]` | float32 | see A.5 |
 | `hand_feat` | `[H_MAX, F_HAND=2]` | float32 | `[idx/H_MAX, dup_count_in_hand/COUNT_N]` |
 | `sum_feat` | `[SUM, F_SUM=11]` | float32 | see A.5 |
 | `cls_feat` | `[F_GLOBAL=93]` | float32 | see A.6 (holds the select conditioning) |
@@ -406,7 +411,7 @@ the sample only carries **ids**, not repeated static rows).
 > Deck-selection steps (`select is None`) are **excluded** from this featurizer — the deck is fixed
 > (`FIXED_DECK`), not predicted (§1.2).
 
-## A.5 `poke_feat` (F_POKE = 26) and `sum_feat` (F_SUM = 11)
+## A.5 `poke_feat` (F_POKE = 29) and `sum_feat` (F_SUM = 12)
 
 `poke_feat[slot]` (all-zero for empty/face-down slots):
 | slice | dim | contents |
@@ -422,13 +427,32 @@ the sample only carries **ids**, not repeated static rows).
 | `[19]` | 1 | `appearThisTurn` |
 | `[20]` | 1 | `is_active` |
 | `[21:26]` | 5 | active-only condition flags `[poison,burn,sleep,paralyze,confuse]` (0 on bench) |
+| `[26]` | 1 | KO damage ratio, `min(dmg/hp, 2.0)` — see below |
+| `[27]` | 1 | KO flag, `1.0` when the ratio reaches `1.0` |
+| `[28]` | 1 | `1/(1+ceil(hp/10))` — damage counters still needed to KO |
 
-(21 + 5 = 26; conditions read from the owning `PlayerState` flags and applied to that player's active
-slot only.)
+(21 + 5 + 2 + 1 = 29; conditions read from the owning `PlayerState` flags and applied to that player's
+active slot only.)
+
+**The KO block (`[26:28]`, written by `_slot_ko_block`) flips polarity by owner**, matching
+`_card_target_preview`: opportunity on their side, danger on mine.
+
+* **my slots 0..5** — their Active's best attack against this slot, over the slot's current HP; the
+  flag means *this one dies*. Affordability is **ignored**, matching `_ko_pressure`'s opponent side:
+  their energy is theirs to spend next turn. Bench slots are scored as if gusted into the Active
+  spot, which is the question a promote or a Boss's Orders read actually asks.
+* **their slots 6..11** — my Active's best **affordable** attack against this slot, over its HP; the
+  flag means *I can kill it*.
+
+`tok_owner` is in the embedder's input, so the two readings are separable. Every unresolvable case
+(no static tables, empty slot, dead attacker, HP <= 0) stays `(0.0, 0.0)` — the same "no information"
+signal a PAD row carries. The ratio is on `[0, 2]` like every other damage ratio in the featurizer
+(`cls_feat[91]`/`[93]`, `opt_scalar[6]`/`[11]`), not `[0, 1]`: the extra headroom separates "barely
+lethal" from "overkill".
 
 `sum_feat[player]`:
 `[is_me, deckCount/DECK_N, handCount/HAND_N, len(bench)/BENCH_N, benchMax/BENCH_N, prizes_left/PRIZE_N,
-len(discard)/DECK_N, poisoned, burned, asleep, paralyzed]` → 11. (5th condition `confused` is dropped
+len(discard)/DECK_N, poisoned, burned, asleep, paralyzed, 1/(1+deckCount)]` → 12. (5th condition `confused` is dropped
 here to keep 11; it is already in `poke_feat`. Adjust to 12 if you prefer symmetry.)
 
 ## A.6 `cls_feat` (F_GLOBAL = 93) — global state + **decision conditioning**
@@ -750,8 +774,8 @@ re-weighting never re-featurizes — see D.4):
 ```
 w_ctx[c]   = (N_total / N_ctx[c])   ** ALPHA_CTX      # ALPHA_CTX = 0.5   (rare-context balance)
 w_arch[a]  = (N_total / N_arch_self[a]) ** ALPHA_ARCH  # ALPHA_ARCH = 0.5 (balance 𝒟_self piloting)
-w_out      = 1.0 if won else W_LOST                    # W_LOST = 0.6      (§1.1 outcome down-weight)
-sample_weight = normalize( w_ctx[sel_ctx] * w_arch[archetype_self] * w_out )   # mean ≈ 1 over train
+w_out      = 1.0 if won else W_LOST                    # W_LOST = -0.3     (§1.1 signed outcome weight)
+sample_weight = normalize( w_ctx[sel_ctx] * w_arch[archetype_self] * w_out )   # mean|w| ≈ 1 over train
 ```
 (`won` is a `meta` column; the wins-only ablation is simply `keep rows where won`.)
 Training uses a **`WeightedRandomSampler`** over train rows with these weights (sampling *with*
@@ -782,7 +806,7 @@ Every tensor is already fixed-shape ⇒ **default collate = `torch.stack`**, no 
 | Label smoothing | `0.05` (single-select CE) |
 | Weight EMA | decay `0.999`, evaluate & ship the **EMA** weights |
 | `LAMBDA_V` | **0.5 from v1** (both outcomes ⇒ informative `value_target ∈ {±1}`); `0.0` only in the wins-only ablation |
-| `W_LOST` | **0.6** — sample-weight multiplier on decisions from lost expert games (§1.1) |
+| `W_LOST` | **-0.3** — signed sample weight on decisions from lost expert games; negative = push the action's probability down (§1.1) |
 | Seed | fixed; `torch.use_deterministic_algorithms(False)` (perf) but log seed |
 
 ## C.6 Training step (pseudocode)
@@ -891,7 +915,7 @@ regressing for `>patience` evals (ties into early-stop, C.8).
 D_MODEL=256  LAYERS=4  HEADS=8  FF=1024  DROPOUT=0.1
 BATCH=2048   EPOCHS=10  PEAK_LR=3e-4  WARMUP=1000  MIN_LR=3e-5
 WD=0.01  BETAS=(0.9,0.95)  GRAD_CLIP=1.0  LABEL_SMOOTH=0.05  EMA=0.999
-ALPHA_CTX=0.5  ALPHA_ARCH=0.5  LAMBDA_V=0.5  W_LOST=0.6
+ALPHA_CTX=0.5  ALPHA_ARCH=0.5  LAMBDA_V=0.5  W_LOST=-0.3
 LOG_EVERY=50  VAL_EVERY=1000  CKPT_EVERY=2000  LIVE_EVERY=10000
 WANDB_PROJECT="pokemon-tcg-il"  WANDB_ENTITY=<team>  WANDB_MODE=online  # offline on Kaggle, sync later
 ```
@@ -1086,3 +1110,63 @@ manifest.csv ─▶ [P0 sample] ─▶ [P1 download → raw/<day>/<id>.json] ─
    ─▶ freeze EXPERTS, 𝒟_self, 𝒟_opp, vocab.json, archetypes.json, FIXED_DECK
    ─▶ [P3 featurize kept games] ─▶ shards/ + meta.parquet ─▶ [P4 QA] ─▶ Appendix C training
 ```
+
+
+## A.5.1 Deck-out features
+
+Losing by deck-out is **7.8% of corpus games**, and **10.4% of all decision points sit at
+`deck <= 5`** — so this is neither an edge case nor a data-scarcity problem.
+
+**`sum_feat[:, 11] = 1/(1+deckCount)`** (`SUM_DECK_OUT_COL`), written for *both* players because
+decking the opponent is a win condition. `sum_feat[:, 1]` remains `deckCount/DECK_N` and is *linear*
+in a quantity whose decision-utility is *hyperbolic*: deck 50→48 and deck 3→1 are both a 0.033 step
+there, and only one of them ends the game. The reciprocal is already in `[0, 1]` with no clipping
+and needs no tuned threshold — deck 3→1 moves 0.250→0.500 while 50→48 moves 0.020→0.020, roughly
+**250× more gradient where the game is decided**. It is an *additional* fixed divisor, never a
+replacement: the all-zero row is still the PAD sentinel.
+
+**`opt_scalar[:, 13] = min(draw_est / deckCount, 1.0)`** (`OPT_DECK_COST_COL`) — how much of what is
+left *this* option burns, for **every** option type. `opt_scalar[:, 8]` carries the same quantity but
+is filled only inside the `otype == 13` ATTACK branch, and an attack is rarely what decks you out;
+the PLAY options are, and they were getting dims 0–5 and nothing else. ATTACK options copy dim 8 so
+the two columns cannot disagree. An unresolvable card (PAD, hidden, absent from the table) stays
+`0.0` rather than being assigned a guess, which would read as "safe to play" on exactly the cards we
+cannot see.
+
+**`card_static_row[83:85]`** (`CARD_DRAW_FIXED_COL`, `CARD_DRAW_TO_HAND_COL`) supplies the counts,
+normalised by `DRAW_N` exactly as `attack_static_row[14:16]` is, so one formula reads either source.
+`ptcg_mine.keywords.card_draw_counts` parses them from `card.skills[].text` — Trainers store oracle
+text there just as Pokémon abilities do — and yields a numeric count for **38 of the 42**
+draw-mentioning engine cards (90%); the rest fall back to the binary `draw` keyword already in the
+ability row.
+
+The two columns sit **before** the embedded attack blocks, not appended. `CARD_ATTACK_BLOCK_START` is
+derived as `F_CARD - 3 * F_ATK` in the featurizer and `52 + K_EFFECT + 2 + 2` in `cards.py`;
+appending would leave those disagreeing by exactly 2, and every embedded attack would decode as
+garbage while every shape check still passed.
+
+
+## A.5.2 Counters-to-KO and bench damage
+
+**`poke_feat[:, 28] = 1/(1+ceil(hp/10))`** (`POKE_COUNTERS_TO_KO_COL`). A damage counter is 10 HP, so
+this is the unit every counter-placement decision is denominated in. Measured on a real archetype-16
+(Dragapult ex) game, **18 of that player's 96 decisions — 19% — were exactly that select**:
+`select(type=1, context=14)` with `remainDamageCounter` counting 6 down to 1, choosing among 4–5
+benched Pokémon. Reciprocal for the same reason the deck-out curve is: `hp/HP_N` is linear, so 70 HP
+and 10 HP sit 0.15 apart while "1 counter away" versus "7 counters away" is the entire decision.
+
+**`attack_static_row[16] = bench_damage/ATKDMG_N`** (`ATK_BENCH_DMG_COL`), pushing the keyword flags
+to `17:46` and `F_ATK` to 46, hence `F_CARD` to 223.
+
+**An attack's `damage` field is always the number dealt to the Active, never to a benched Pokémon.**
+Measured over the engine's pool, 27 attacks reach the bench and every one states that figure only in
+its oracle text, in three forms: *"this attack **also** does N damage to 1 of your opponent's Benched
+Pokémon"* (19), *"put N damage counters on your opponent's Benched Pokémon"* (2, worth N×10 on a
+single target), and *"also does N damage to each Benched"* (6). One (Pinpoint Dive) is a pure snipe
+whose `damage` field is `0`.
+
+`_attack_damage_ratio` previously scored bench targets with col 0, over-reporting all 27 — Phantom
+Dive read **200 against a 70 HP benched Pokémon (ratio 2.0, KO flag set)** when the truth is at most
+60. It now reads `ATK_BENCH_DMG_COL` for any `tgt_slot != 6`, and applies it **raw**: 25 of the 27
+spell out *"Don't apply Weakness and Resistance for Benched Pokémon"*, which is the printed rule for
+bench damage generally.

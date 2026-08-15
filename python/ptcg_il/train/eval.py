@@ -29,7 +29,6 @@ def offline_eval(
     lambda_v: float = 0.5,
     label_smoothing: float = 0.05,
     max_batches: int | None = None,
-    belief: bool = False,
 ) -> dict[str, float | list]:
     """Run offline metrics on the val split (C.8).
 
@@ -106,11 +105,6 @@ def offline_eval(
     collision_total_rows = 0
     multi_exact_collision = 0
 
-    # (weighted sum, row count) per belief term; only touched when belief=True.
-    belief_acc: dict[str, list[float]] = {
-        k: [0.0, 0.0] for k in ("arch", "deck", "hidden", "hand")
-    }
-
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
             break
@@ -127,11 +121,7 @@ def offline_eval(
             torch.amp.autocast(device_type, dtype=torch.bfloat16)
             if use_amp else nullcontext()
         ):
-            if belief:
-                logits, value, _history_h, belief_preds = policy.forward_with_belief(batch_gpu)
-                _accum_belief(belief_acc, belief_preds, batch_gpu)
-            else:
-                logits, value, _history_h = policy(batch_gpu)  # [B, O], [B], [B, D]
+            logits, value, _history_h = policy(batch_gpu)  # [B, O], [B], [B, D]
 
         maxcount = batch_gpu["maxCount"]
         single_mask = (maxcount == 1)
@@ -350,63 +340,7 @@ def offline_eval(
 
     metrics["val/best_top1_macro"] = 0.0  # placeholder, filled by loop
 
-    if belief:
-        metrics.update(_belief_metrics(belief_acc))
-
     return metrics
-
-
-def _accum_belief(
-    acc: dict[str, list[float]],
-    preds: dict[str, torch.Tensor],
-    batch: dict[str, torch.Tensor],
-) -> None:
-    """Accumulate belief quality over one batch, in place.
-
-    The card heads are scored by *hit mass* -- how much of the predicted
-    distribution lands on cards the opponent actually holds -- rather than by
-    top-1 accuracy.  A decklist is a multiset of ~20 distinct cards, so "did
-    the argmax match" answers almost nothing; hit mass is the quantity the
-    determinizing sampler cares about, because it is the fraction of draws it
-    will get right.
-    """
-    valid = batch["bel_valid"].bool()
-    n_valid = int(valid.sum())
-    if n_valid == 0:
-        return
-
-    for key, tgt_key, mask in (
-        ("deck", "bel_deck", valid),
-        ("hidden", "bel_hidden", valid),
-        ("hand", "bel_hand", valid & batch["bel_hand_valid"].bool()),
-    ):
-        n = int(mask.sum())
-        if n == 0:
-            continue
-        p = torch.softmax(preds[key].float(), dim=-1)
-        hit = (p * (batch[tgt_key] > 0).to(p.dtype)).sum(-1)
-        acc[key][0] += float(hit[mask].sum())
-        acc[key][1] += n
-
-    arch_t = batch["bel_arch"].long()
-    arch_mask = valid & (arch_t >= 0)
-    n_arch = int(arch_mask.sum())
-    if n_arch and preds["arch"].shape[-1] > 1:
-        correct = preds["arch"].argmax(-1) == arch_t
-        acc["arch"][0] += float(correct[arch_mask].sum())
-        acc["arch"][1] += n_arch
-
-
-def _belief_metrics(acc: dict[str, list[float]]) -> dict[str, float]:
-    """Finalize :func:`_accum_belief` sums into logged scalars."""
-    out: dict[str, float] = {}
-    names = {"arch": "val/belief_arch_top1", "deck": "val/belief_deck_mass",
-             "hidden": "val/belief_hidden_mass", "hand": "val/belief_hand_mass"}
-    for key, name in names.items():
-        total, n = acc[key]
-        out[name] = total / n if n else 0.0
-        out[f"{name}_n"] = float(n)
-    return out
 
 
 def _value_health(predictions: list[float], targets: list[float]) -> dict[str, float]:

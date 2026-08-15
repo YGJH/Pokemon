@@ -452,3 +452,169 @@ class TestPolicyAgentLoadsEngineFeatures:
         assert restored.data_dir == str(tmp_path)
         # ...and the worker rebuilds them on demand.
         assert restored._tables()["engine_card_features"] is not None
+
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Deck-out guard integration
+# ---------------------------------------------------------------------------
+
+class TestPolicyAgentDeckGuard:
+    """PolicyAgent wires the deck-out guard the same way the submission does.
+
+    featurize is monkeypatched: it is not the unit under test, and a
+    synthetic sample gives the test exact control over the option set.
+    """
+
+    class _LogitPolicy(torch.nn.Module):
+        """Returns fixed logits so the test controls the masked argmax."""
+
+        def __init__(self, logits):
+            super().__init__()
+            self._l = logits
+
+        def forward(self, batch):
+            return self._l, None, None
+
+    @staticmethod
+    def _sample():
+        """PLAY Poké Pad(0) / PLAY Lillie's(1) / END(2), single-select MAIN."""
+        n, o_max = 3, 64
+        opt_type = np.zeros(o_max, dtype=np.int64)
+        opt_type[:n] = [7, 7, 14]
+        opt_card_id = np.zeros(o_max, dtype=np.int64)
+        opt_card_id[:n] = [1152, 1227, 0]
+        opt_mask = np.zeros(o_max, dtype=bool)
+        opt_mask[:n] = True
+        return {
+            "opt_type": opt_type,
+            "opt_card_id": opt_card_id,
+            "opt_scalar": np.zeros((o_max, 14), dtype=np.float32),
+            "opt_mask": opt_mask,
+            "maxCount": np.int64(1),
+            "sel_type": np.int64(0),
+            "stop_column": np.int64(-1),
+        }
+
+    @staticmethod
+    def _obs(deck, hand=9):
+        return {
+            "select": {"type": 0, "minCount": 1, "maxCount": 1,
+                       "option": [{}, {}, {}]},
+            "current": {"yourIndex": 0,
+                        "players": [
+                            {"deckCount": deck, "handCount": hand,
+                             "prize": [None] * 3},
+                            {"deckCount": 40, "handCount": 5,
+                             "prize": [None] * 6},
+                        ]},
+        }
+
+    def _agent(self, logits, monkeypatch, use_deck_guard=True):
+        monkeypatch.setattr(
+            "ptcg_il.featurizer.featurize", lambda *a, **k: self._sample())
+        vocab = {"id_to_index": {"1152": 2}, "attack_id_to_index": {"1": 2}}
+        return make_agent_from_policy(
+            self._LogitPolicy(logits), vocab, list(range(60)),
+            use_deck_guard=use_deck_guard)
+
+    def test_mechanism_a_masks_the_deckout_play(self, monkeypatch):
+        import torch
+
+        logits = torch.zeros(1, 64)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 5.0, 4.0, 1.0
+        agent = self._agent(logits, monkeypatch)
+
+        # deck 1 + Poké Pad (-1) = certain deck-out; Lillie's (+3) survives.
+        assert agent(self._obs(deck=1)) == [1]
+        assert agent._guard.stats.a_masked == 1
+
+    def test_guard_disabled_restores_the_plain_argmax(self, monkeypatch):
+        import torch
+
+        logits = torch.zeros(1, 64)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 5.0, 4.0, 1.0
+        agent = self._agent(logits, monkeypatch, use_deck_guard=False)
+        assert agent(self._obs(deck=1)) == [0]
+
+    def test_mechanism_b_tiebreak_changes_the_pick(self, monkeypatch):
+        import torch
+
+        logits = torch.zeros(1, 64)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 3.0, 2.8, 1.0
+        agent = self._agent(logits, monkeypatch)
+
+        # deck 5: no mask (Poké Pad leaves 4), but the tie-break prefers
+        # Lillie's (+3) within margin 0.5.
+        assert agent(self._obs(deck=5)) == [1]
+        assert agent._guard.stats.b_changed == 1
+
+    def test_stop_column_still_means_decline(self, monkeypatch):
+        import torch
+
+        sample = self._sample()
+        sample["stop_column"] = np.int64(2)
+        monkeypatch.setattr(
+            "ptcg_il.featurizer.featurize", lambda *a, **k: sample)
+        logits = torch.zeros(1, 64)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 5.0, 4.0, 6.0
+        vocab = {"id_to_index": {"1152": 2}, "attack_id_to_index": {"1": 2}}
+        agent = make_agent_from_policy(
+            self._LogitPolicy(logits), vocab, list(range(60)))
+
+        # deck high: ungated argmax lands on the STOP column -> decline.
+        assert agent(self._obs(deck=40)) == []
+
+
+class TestPolicyAgentPrizeExemption:
+    """Deliverable check: prizes==1 with a KO attack available must not mask
+    the attack — the game ends before the deck matters."""
+
+    class _LogitPolicy(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self._l = logits
+
+        def forward(self, batch):
+            return self._l, None, None
+
+    def test_last_prize_ko_attack_survives_at_deck_one(self, monkeypatch):
+        o_max = 64
+        opt_type = np.zeros(o_max, dtype=np.int64)
+        opt_type[:3] = [13, 7, 14]                 # ATTACK / PLAY Poké Pad / END
+        opt_card_id = np.zeros(o_max, dtype=np.int64)
+        opt_card_id[:3] = [0, 1152, 0]
+        opt_scalar = np.zeros((o_max, 14), dtype=np.float32)
+        opt_scalar[0, 7] = 1.0                     # KO flag on the attack
+        opt_scalar[0, 8] = 1.0                     # attack draws >= deck
+        opt_mask = np.zeros(o_max, dtype=bool)
+        opt_mask[:3] = True
+        sample = {
+            "opt_type": opt_type, "opt_card_id": opt_card_id,
+            "opt_scalar": opt_scalar, "opt_mask": opt_mask,
+            "maxCount": np.int64(1), "sel_type": np.int64(0),
+            "stop_column": np.int64(-1),
+        }
+        monkeypatch.setattr(
+            "ptcg_il.featurizer.featurize", lambda *a, **k: sample)
+        logits = torch.zeros(1, 64)
+        logits[0, 0], logits[0, 1], logits[0, 2] = 5.0, 4.0, 1.0
+        vocab = {"id_to_index": {"1152": 2}, "attack_id_to_index": {"1": 2}}
+        agent = make_agent_from_policy(
+            self._LogitPolicy(logits), vocab, list(range(60)))
+
+        obs = {
+            "select": {"type": 0, "minCount": 1, "maxCount": 1,
+                       "option": [{}, {}, {}]},
+            "current": {"yourIndex": 0,
+                        "players": [
+                            {"deckCount": 1, "handCount": 2,
+                             "prize": [None]},     # last prize
+                            {"deckCount": 40, "handCount": 5,
+                             "prize": [None] * 6},
+                        ]},
+        }
+        # Poké Pad (-1, post 0) is masked; the KO attack is exempt and picked.
+        assert agent(obs) == [0]
+        assert agent._guard.stats.a_masked == 1

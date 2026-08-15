@@ -11,6 +11,8 @@ Raises ``ValueError`` if ``select is None`` (deck-selection steps are excluded
 — the deck is fixed, not predicted).
 """
 
+import math
+
 import numpy as np
 
 from ptcg_il.ref_map import build_ref_map, card_id_at, serial_row
@@ -67,19 +69,59 @@ STAD = 1
 CLS = 1
 L_STATE = 46  # CLS + P_MAX + H_MAX + SUM + STAD
 O_MAX = 64
-L_LOG_MAX = 32   # max log entries per decision
-LOG_FEAT_DIM = 6 # log_type, player_rel, card_id, area_from, area_to, scalar
 
 # ============================================================
 # Feature dims (A.1)
 # ============================================================
-F_CARD = 218  # 52 base + 29 ability keywords + 2 counts + 3 attacks × 45
-F_ATK = 45    # 16 numeric + 29 attack keywords
-F_POKE = 26
+F_CARD = 223  # 52 base + 29 ability keywords + 2 counts + 2 draw + 3 attacks × 46
+F_ATK = 46    # 17 numeric (incl. bench damage) + 29 attack keywords
+F_POKE = 29  # 26 base + 2 KO block + 1 counters-to-KO curve
 F_HAND = 7
-F_SUM = 11
-F_GLOBAL = 97
-F_OPT = 13
+F_SUM = 12   # 11 base + 1 deck-out curve
+F_GLOBAL = 95
+F_OPT = 14   # 13 base + 1 per-option deck cost
+
+#: Named ``cls_feat`` columns that modules outside this file read.  They are
+#: named rather than written as literals at the use site because the global
+#: block gets reordered (the absolute-seat columns were removed from it), and a
+#: stale literal reads a *different, valid-looking* feature rather than raising:
+#: ``embed.py`` would scale the context-card embedding by a prize count, and
+#: ``critic.py``'s progress term would read a condition flag.  Import these.
+CLS_AM_I_FIRST = 2
+CLS_TOSS_UNDECIDED = 4
+CLS_OUR_PRIZES = 9
+CLS_OPP_PRIZES = 10
+CLS_HAS_CONTEXT_CARD = 85
+CLS_HAS_EFFECT = 86
+
+#: Columns of the per-slot KO block on ``poke_feat`` (see ``_slot_ko_block``).
+#: Exported for the same reason as the CLS constants above, and — like
+#: ``CLS_HAS_CONTEXT_CARD`` — the writer uses literals, not these names.  A
+#: column written *and* read through one constant moves with it, so a test
+#: asserting the constant names the right column would follow it and catch
+#: nothing.  The literal is what makes these an independent, falsifiable claim.
+POKE_KO_RATIO_COL = 26
+POKE_KO_FLAG_COL = 27
+POKE_COUNTERS_TO_KO_COL = 28
+
+#: Card-level draw counts inside a card static row, written by
+#: ``ptcg_mine.cards.card_static_row``.  They sit **before** the embedded attack
+#: blocks (83:85, with attacks at 85:220), not appended, so that
+#: ``CARD_ATTACK_BLOCK_START = F_CARD - 3 * F_ATK`` keeps naming the same
+#: column in both modules.  Same ``DRAW_N`` divisor as ``attack_static_row``'s
+#: cols 14/15, which is what lets one option-cost formula read either source.
+CARD_DRAW_FIXED_COL = 83
+CARD_DRAW_TO_HAND_COL = 84
+
+#: Column of an attack static row holding damage dealt to a *benched* target.
+#: Col 0 is the Active number and is never the bench one -- see
+#: ``ptcg_mine.keywords.attack_bench_damage``.
+ATK_BENCH_DMG_COL = 16
+
+#: ``sum_feat`` column holding the deck-out curve, and ``opt_scalar``'s
+#: per-option deck cost.  Literals at the write sites, as above.
+SUM_DECK_OUT_COL = 11
+OPT_DECK_COST_COL = 13
 
 # Columns 9:12 of a card static row are (basic, stage1, stage2) — see
 # ``ptcg_mine.cards.card_static_row``.  Named here rather than written as a
@@ -260,7 +302,7 @@ _CARD_WEAKNESS = slice(24, 36)
 _CARD_RESISTANCE = slice(36, 48)
 # Derived from F_CARD and F_ATK so a future K_EFFECT change can't drift the
 # offset without also bumping both dims.
-CARD_ATTACK_BLOCK_START = F_CARD - 3 * F_ATK  # == 83
+CARD_ATTACK_BLOCK_START = F_CARD - 3 * F_ATK  # == 85
 
 
 def _onehot_index(vec) -> int | None:
@@ -290,6 +332,22 @@ def _effective_damage(base, atk_type, weakness, resistance) -> float:
 # so any tolerance below 1 is safe; 1e-3 is far above fp32 noise and far below
 # one energy.
 _ENERGY_EPS = 1e-3
+
+
+# The same round-trip trap as `_ENERGY_EPS`, one step further downstream.  A
+# slot's HP reaches the KO comparison as `float32(hp/HP_N) * HP_N` and damage as
+# `float32(dmg/ATKDMG_N) * ATKDMG_N`, so an *exactly* lethal attack lands either
+# side of 1.0 depending purely on whether those divisors round up or down.
+# Measured over real HP values, `dmg == hp` yields a ratio < 1.0 for 110, 60,
+# 30, 80, 120, 170 and 220 -- 110 being the single most common HP in the corpus.
+# The failure is silent: the KO flag just reads 0.0, which is indistinguishable
+# from "survives comfortably".
+#
+# The measured relative error is ~2.4e-8, and damage is quantised to 10s so the
+# nearest genuinely-not-lethal ratio is (hp-10)/hp -- 0.909 at 110 HP.  Anything
+# between those two bounds works; 1e-6 is ~40x the noise and ~90000x below one
+# damage step.
+_KO_EPS = 1e-6
 
 
 def _attack_is_affordable(cost_hist, attached_hist) -> bool:
@@ -349,8 +407,8 @@ def _ko_pressure(poke_card_feat, poke_feat) -> tuple[float, float, float, float]
 
     my_ratio = min(my_dmg / opp_hp, 2.0) if opp_hp > 0 else 0.0
     opp_ratio = min(opp_dmg / my_hp, 2.0) if my_hp > 0 else 0.0
-    return (my_ratio, 1.0 if my_ratio >= 1.0 else 0.0,
-            opp_ratio, 1.0 if opp_ratio >= 1.0 else 0.0)
+    return (my_ratio, 1.0 if my_ratio >= 1.0 - _KO_EPS else 0.0,
+            opp_ratio, 1.0 if opp_ratio >= 1.0 - _KO_EPS else 0.0)
 
 
 def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
@@ -376,6 +434,22 @@ def _attack_damage_ratio(attack_id, tgt_slot, poke_card_feat, poke_feat,
     tgt_hp = float(poke_feat[tgt_slot][0]) * HP_N
     if tgt_hp <= 0.0:
         return 0.0
+
+    if tgt_slot != 6:
+        # A **benched** target.  Col 0 is the damage dealt to the *Active* and
+        # is never the bench number -- measured over the engine, all 27 attacks
+        # that reach the bench state that figure only in their oracle text, so
+        # using col 0 here over-reported every one of them.  Phantom Dive read
+        # 200 against a 70 HP bench Pokémon (ratio 2.0, KO flag set) when the
+        # truth is at most 60.
+        #
+        # Raw, *not* weakness-adjusted: 25 of those 27 spell out "Don't apply
+        # Weakness and Resistance for Benched Pokémon", and it is the printed
+        # rule for bench damage generally.
+        bench_dmg = float(arow[ATK_BENCH_DMG_COL]) * ATKDMG_N
+        if bench_dmg <= 0.0:
+            return 0.0
+        return min(bench_dmg / tgt_hp, 2.0)
 
     dmg = _effective_damage(
         float(arow[0]) * ATKDMG_N,
@@ -437,7 +511,7 @@ def _card_target_preview(
         my_energy = np.asarray(poke_feat[0][3:15], dtype=np.float64) * ENERGY_N
         dmg = _best_damage(attacker, target, my_energy, require_affordable=True)
         ratio = min(dmg / tgt_hp, 2.0)
-        return ratio, (1.0 if ratio >= 1.0 else 0.0)
+        return ratio, (1.0 if ratio >= 1.0 - _KO_EPS else 0.0)
 
     # My board: what does this candidate threaten, and does it survive arriving?
     opp_active = poke_card_feat[6]
@@ -452,8 +526,108 @@ def _card_target_preview(
     # Incoming damage ignores affordability: their Active's energy is theirs to
     # spend next turn, and the corpus shows it usually already can.
     incoming = _best_damage(opp_active, target, None, require_affordable=False)
-    ko = 1.0 if (cand_hp > 0.0 and incoming >= cand_hp) else 0.0
+    # Relative tolerance, not the ratio one: both sides are fp32 round-trips, so
+    # an exactly-lethal hit compares as `incoming < cand_hp` by ~1e-8 of the HP.
+    ko = 1.0 if (cand_hp > 0.0 and incoming >= cand_hp * (1.0 - _KO_EPS)) else 0.0
     return ratio, ko
+
+
+#: A damage counter is 10 HP.
+DAMAGE_COUNTER_HP = 10.0
+
+
+def _counters_to_ko_curve(hp) -> float:
+    """``1 / (1 + ceil(hp / 10))`` -- damage counters still needed to KO a slot.
+
+    A counter is 10 HP, so this is the unit every counter-placement decision is
+    actually denominated in.  Measured on a real archetype-16 game, **18 of the
+    player's 96 decisions (19%)** were exactly that select -- placing Phantom
+    Dive's 6 counters one at a time across 4-5 benched Pokémon -- and the only
+    columns that varied across those options described a *different* action
+    (my Active's 200-damage attack), not the 10 damage a counter does.
+
+    Reciprocal for the same reason the deck-out curve is: ``hp/HP_N`` is linear,
+    so 70 HP and 10 HP sit 0.15 apart while "1 counter away" versus "7 counters
+    away" is the entire decision.  Additional to ``f[0]``, never a replacement,
+    so the all-zero PAD row still reads as PAD.
+    """
+    h = float(hp)
+    if h <= 0.0:
+        return 0.0
+    counters = math.ceil(h / DAMAGE_COUNTER_HP)
+    return 1.0 / (1.0 + counters)
+
+
+def _slot_ko_block(
+    poke_card_feat: np.ndarray | None,
+    poke_feat: np.ndarray | None,
+) -> None:
+    """Fill each Pokémon token's own KO reading, in place.
+
+    Writes ``poke_feat[s, 26]`` (damage ratio, clipped to [0, 2]) and
+    ``poke_feat[s, 27]`` (KO flag) for every slot.
+
+    Before this, ``poke_feat`` carried HP, energy and conditions but no damage
+    term at all, so the 12 state tokens the encoder attends over were blind to
+    the fact that decides most turns: does this die, and can I kill it.
+    ``_ko_pressure`` answered it only for the Active pair, into ``cls_feat``,
+    and ``_card_target_preview`` only for options that *name* a Pokémon — so
+    every other option type saw a board with the KO math stripped out.  Putting
+    it on the tokens means the pointer reads it for all option types at once.
+
+    Polarity flips by owner, exactly as ``_card_target_preview`` does, and for
+    the same reason: opportunity on their side, danger on mine.
+
+    * **my slots 0..5** — their Active's best attack against this slot, over the
+      slot's current HP; the flag means *this one dies*.  Affordability is
+      **ignored**, matching ``_ko_pressure``'s opponent side: their energy is
+      theirs to spend next turn.  Bench slots are scored as if gusted into the
+      Active spot — that is the question a promote or a Boss's Orders read
+      actually asks, and scoring them 0.0 instead would make five of the six
+      slots carry nothing.
+    * **their slots 6..11** — my Active's best **affordable** attack against
+      this slot, over its HP; the flag means *I can kill it*.
+
+    ``tok_owner`` is in the embedder's input, so the two readings are separable.
+
+    Every unresolvable case — no static tables, an empty slot, a dead attacker,
+    HP <= 0 — leaves the pair at ``(0.0, 0.0)``, the same "no information"
+    signal a PAD row carries.
+
+    Pure-Python arithmetic like its neighbours: 12 slots x <=3 attacks, on the
+    RL rollout path.
+    """
+    if poke_card_feat is None or poke_feat is None:
+        return
+
+    my_active = poke_card_feat[0]
+    opp_active = poke_card_feat[6]
+    my_active_live = bool(np.asarray(my_active).any())
+    opp_active_live = bool(np.asarray(opp_active).any())
+
+    # My Active's energy is what limits *my* reach; theirs is not consulted.
+    my_energy = np.asarray(poke_feat[0][3:15], dtype=np.float64) * ENERGY_N
+
+    for slot in range(P_MAX):
+        target = poke_card_feat[slot]
+        if not np.asarray(target).any():
+            continue
+        tgt_hp = float(poke_feat[slot][0]) * HP_N
+        if tgt_hp <= 0.0:
+            continue
+
+        if slot < 6:
+            if not opp_active_live:
+                continue
+            dmg = _best_damage(opp_active, target, None, require_affordable=False)
+        else:
+            if not my_active_live:
+                continue
+            dmg = _best_damage(my_active, target, my_energy, require_affordable=True)
+
+        ratio = min(dmg / tgt_hp, 2.0)
+        poke_feat[slot][26] = ratio
+        poke_feat[slot][27] = 1.0 if ratio >= 1.0 - _KO_EPS else 0.0
 
 
 def _best_bench_damage_ratio(
@@ -587,6 +761,7 @@ def _build_poke_tokens(
             f[18] = _clip_norm(len(poke.get("preEvolution", [])), 2.0)
             f[19] = 1.0 if poke.get("appearThisTurn", False) else 0.0
             f[20] = 1.0  # is_active
+            f[28] = _counters_to_ko_curve(poke["hp"])
             # Condition flags (active only, A.5)
             f[21] = 1.0 if player.get("poisoned", False) else 0.0
             f[22] = 1.0 if player.get("burned", False) else 0.0
@@ -614,6 +789,7 @@ def _build_poke_tokens(
             f[18] = _clip_norm(len(poke.get("preEvolution", [])), 2.0)
             f[19] = 1.0 if poke.get("appearThisTurn", False) else 0.0
             f[20] = 0.0  # is_active = False on bench
+            f[28] = _counters_to_ko_curve(poke["hp"])
             # Condition flags zero on bench (A.5)
 
     return poke_card_id, poke_feat, poke_tool_ids, poke_energy_ids
@@ -720,6 +896,18 @@ def _build_summary_tokens(state: dict, your_index: int) -> np.ndarray:
         f[8] = 1.0 if player.get("burned", False) else 0.0
         f[9] = 1.0 if player.get("asleep", False) else 0.0
         f[10] = 1.0 if player.get("paralyzed", False) else 0.0
+        # [11] deck-out curve.  `f[1]` is deckCount/DECK_N, which is *linear* in
+        # a quantity whose decision-utility is hyperbolic: 50->48 and 3->1 are
+        # both a 0.033 step there, and only one of them ends the game.  Measured
+        # on this corpus, deck-out is 7.8% of games and 10.4% of all decision
+        # points sit at deck <= 5, so this is a curve problem, not a data one.
+        #
+        # 1/(1+deck) is already in [0, 1] with no clipping and needs no tuned
+        # threshold: deck 3->1 moves 0.250 -> 0.500 while 50->48 moves 0.020 ->
+        # 0.020, i.e. ~250x more gradient where the game is actually decided.
+        # `f[1]` stays as-is -- this is an *additional* fixed divisor, not a
+        # replacement, because the all-zero row is still the PAD sentinel.
+        f[11] = 1.0 / (1.0 + float(player["deckCount"]))
 
     return sum_feat
 
@@ -754,60 +942,79 @@ def _build_cls_features(
 
     # [0] turn
     cls_feat[0] = _clip_norm(float(state["turn"]), TURN_N)
-    # [1] turn % 2
+    # [1] turn % 2.  Seat-invariant: the turn counter is global and does not
+    # move when the seats are relabelled.  Read against [2] it says whose turn
+    # it is *relative to the actor*, which is the only reading that survives.
     cls_feat[1] = float(state["turn"] % 2)
-    # [2] yourIndex
-    cls_feat[2] = float(your_index)
+    # [2] am_i_first -- the turn order, derived, never the raw seat.
+    #
+    # This used to be `yourIndex`, with the absolute `firstPlayer` one-hot at
+    # [4:7] beside it.  Both are absolute-seat quantities, and their XOR is the
+    # only part either contributes: relabelling seat 0 <-> seat 1 changes
+    # nothing else in this entire tensor dict (`test_featurizer_seat_invariance`
+    # pins that over every decision of a real episode).
+    #
+    # Keeping them cost accuracy rather than merely wasting two floats.  Seat 0
+    # wins the coin toss in every corpus episode measured (3000/3000) and elects
+    # to go first in 99.1% of them, so `yourIndex` was 96.25% collinear with
+    # "am I going second" and the policy learned the seat as the proxy.  On a
+    # real Kaggle replay, flipping only these columns changed the agent's chosen
+    # action on 11 of 126 decisions -- under a relabelling that, by definition,
+    # changes no legal move.
+    fp = state["firstPlayer"]
     # [3] turnActionCount
     cls_feat[3] = _clip_norm(float(state["turnActionCount"]), COUNT_N)
-    # [4:7] firstPlayer one-hot {-1→[1,0,0], 0→[0,1,0], 1→[0,0,1]}
-    fp = state["firstPlayer"]
+    # [4] toss_undecided -- firstPlayer is -1 until the toss resolves.  Already
+    # seat-invariant, and kept so [2] can abstain rather than assert "second".
     if fp == -1:
         cls_feat[4] = 1.0
-    elif fp == 0:
-        cls_feat[5] = 1.0
-    elif fp == 1:
-        cls_feat[6] = 1.0
-    # [7:11] per-turn flags
-    cls_feat[7] = 1.0 if state.get("supporterPlayed", False) else 0.0
-    cls_feat[8] = 1.0 if state.get("stadiumPlayed", False) else 0.0
-    cls_feat[9] = 1.0 if state.get("energyAttached", False) else 0.0
-    cls_feat[10] = 1.0 if state.get("retreated", False) else 0.0
-    # [11:13] prizes left
-    cls_feat[11] = _clip_norm(
+    else:
+        cls_feat[2] = float(your_index == fp)
+    # [5:9] per-turn flags
+    cls_feat[5] = 1.0 if state.get("supporterPlayed", False) else 0.0
+    cls_feat[6] = 1.0 if state.get("stadiumPlayed", False) else 0.0
+    cls_feat[7] = 1.0 if state.get("energyAttached", False) else 0.0
+    cls_feat[8] = 1.0 if state.get("retreated", False) else 0.0
+    # [9:11] prizes left
+    cls_feat[9] = _clip_norm(
         float(len(state["players"][your_index]["prize"])), PRIZE_N
     )
-    cls_feat[12] = _clip_norm(
+    cls_feat[10] = _clip_norm(
         float(len(state["players"][1 - your_index]["prize"])), PRIZE_N
     )
-    # [13:24] select.type one-hot (N_SELTYPE=11)
+    # [11:22] select.type one-hot (N_SELTYPE=11)
     sel_type = select["type"]
-    cls_feat[13 + int(sel_type)] = 1.0
-    # [24:73] select.context one-hot (N_SELCTX=49)
+    cls_feat[11 + int(sel_type)] = 1.0
+    # [22:71] select.context one-hot (N_SELCTX=49)
     sel_ctx = select["context"]
-    cls_feat[24 + int(sel_ctx)] = 1.0
-    # [73:77] minCount, maxCount, remainEnergyCost, remainDamageCounter
-    cls_feat[73] = _clip_norm(float(select["minCount"]), COUNT_N)
-    cls_feat[74] = _clip_norm(float(select["maxCount"]), COUNT_N)
-    cls_feat[75] = _clip_norm(
+    cls_feat[22 + int(sel_ctx)] = 1.0
+    # [71:75] minCount, maxCount, remainEnergyCost, remainDamageCounter
+    cls_feat[71] = _clip_norm(float(select["minCount"]), COUNT_N)
+    cls_feat[72] = _clip_norm(float(select["maxCount"]), COUNT_N)
+    cls_feat[73] = _clip_norm(
         float(select.get("remainEnergyCost", 0)), ATKCOST_N
     )
-    cls_feat[76] = _clip_norm(
+    cls_feat[74] = _clip_norm(
         float(select.get("remainDamageCounter", 0)), DMGCTR_N
     )
-    # [77:87] conditions: my-active(5) + opp-active(5)
+    # [75:85] conditions: my-active(5) + opp-active(5)
     for pi, pidx in enumerate([your_index, 1 - your_index]):
         player = state["players"][pidx]
-        base = 77 + pi * 5
+        base = 75 + pi * 5
         cls_feat[base + 0] = 1.0 if player.get("poisoned", False) else 0.0
         cls_feat[base + 1] = 1.0 if player.get("burned", False) else 0.0
         cls_feat[base + 2] = 1.0 if player.get("asleep", False) else 0.0
         cls_feat[base + 3] = 1.0 if player.get("paralyzed", False) else 0.0
         cls_feat[base + 4] = 1.0 if player.get("confused", False) else 0.0
-    # [87:89] has_contextCard, has_effect
-    cls_feat[87] = 1.0 if select.get("contextCard") is not None else 0.0
-    cls_feat[88] = 1.0 if select.get("effect") is not None else 0.0
-    # [89:93] reserved (zeros already)
+    # [85:87] has_contextCard, has_effect.  Written as literals, like every
+    # other column here, *not* through CLS_HAS_CONTEXT_CARD/CLS_HAS_EFFECT: a
+    # column written and read through the same constant moves with it, so the
+    # test asserting the constant names the right column would follow it and
+    # catch nothing.  The literal is what makes the exported constant an
+    # independent claim that a test can falsify.
+    cls_feat[85] = 1.0 if select.get("contextCard") is not None else 0.0
+    cls_feat[86] = 1.0 if select.get("effect") is not None else 0.0
+    # [87:91] reserved (zeros already)
 
     # context_card_id, effect_card_id
     ctx_card = select.get("contextCard")
@@ -821,10 +1028,10 @@ def _build_cls_features(
         dtype=np.int64,
     )
 
-    # [93:97] KO pressure.  Zero when either feature table is absent -- an
+    # [91:95] KO pressure.  Zero when either feature table is absent -- an
     # all-zero block is the same "no information" signal a PAD row carries.
     if poke_card_feat is not None and poke_feat is not None:
-        cls_feat[93:97] = _ko_pressure(poke_card_feat, poke_feat)
+        cls_feat[91:95] = _ko_pressure(poke_card_feat, poke_feat)
 
     return cls_feat, context_card_id, effect_card_id
 
@@ -933,6 +1140,7 @@ def _build_option_tokens(
     poke_card_feat: np.ndarray | None = None,
     poke_feat: np.ndarray | None = None,
     engine_attack_features: dict | None = None,
+    engine_card_features: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], int]:
     """Build option tensors per A.4/A.7.
 
@@ -1016,6 +1224,11 @@ def _build_option_tokens(
         _bench_idx_slot = 0
         _my_attached_energy = 0.0
         _retreat_cost = 0.0
+
+    #: True where the option resolves a card *I* am spending -- playing one
+    #: from my hand, or using my own Pokemon's ability.  Options that merely
+    #: name a Pokemon in play are False; see the dim-13 block below.
+    _opt_spends_my_card = np.zeros(O_MAX, dtype=bool)
 
     for new_j, old_j in enumerate(indices_to_keep):
         opt = options[old_j]
@@ -1160,7 +1373,7 @@ def _build_option_tokens(
                 engine_attack_features,
             )
             opt_scalar[new_j, 6] = ratio
-            opt_scalar[new_j, 7] = 1.0 if ratio >= 1.0 else 0.0
+            opt_scalar[new_j, 7] = 1.0 if ratio >= 1.0 - _KO_EPS else 0.0
             # Deck-out risk from drawing (dim 8) and zero-damage flag (dim 9)
             aid = opt.get("attackId")
             if engine_attack_features is not None and aid is not None:
@@ -1190,6 +1403,11 @@ def _build_option_tokens(
                 opt_card_id[new_j] = _raw_card(cid)
             else:
                 _set_card(area, player_idx, index)
+            # A CARD option from *my hand* is a play and burns my deck; the same
+            # option type naming a Pokemon in play is a target and burns nothing.
+            _opt_spends_my_card[new_j] = (
+                area == AREA_HAND and int(player_idx) == int(your_index)
+            )
             # Damage preview, sharing dims 6/7 with ATTACK.  `opt_src_idx` is a
             # state-token row, and only rows 1..P_MAX are Pokémon slots — hand
             # rows (13..42), the stadium row and -1 must stay at 0.0 rather
@@ -1226,6 +1444,9 @@ def _build_option_tokens(
             if cid is not None:
                 opt_card_id[new_j] = _raw_card(cid)
             opt_src_idx[new_j] = serial_row(ref_map, opt.get("serial"))
+            # My own Pokemon's ability -- Fezandipiti ex and Dudunsparce both
+            # draw, so a SKILL genuinely burns my deck.
+            _opt_spends_my_card[new_j] = True
 
         elif otype in (1, 2, 14, 16):  # YES, NO, END, SPECIAL_CONDITION
             # src = -1, tgt = -1 (constant-type options)
@@ -1246,6 +1467,52 @@ def _build_option_tokens(
         opt_type[n_opts] = STOP_OPT_TYPE
         opt_mask[n_opts] = True
         # src/tgt = -1, card_id = PAD, attack_idx = 0, scalar = 0 (all defaults)
+
+    # --- Per-option deck cost (dim 13) -------------------------------------
+    # dim 8 carries this quantity for ATTACK options only, and has since it was
+    # added.  But an attack is rarely what decks you out: the PLAY options are,
+    # and they were getting dims 0-5 and nothing else.  Measured on this corpus,
+    # 7.8% of games end in deck-out.
+    #
+    # **Only options that actually resolve a card of mine may score here.**  An
+    # option that merely *names* a Pokémon in play -- a gust target, a
+    # damage-counter placement -- carries that Pokémon's card id in
+    # `opt_card_id`, and scoring it reads the *opponent's* ability text and
+    # divides it by *my* deck.  Measured on a real Dragapult game: at a
+    # Phantom-Dive counter-placement select, the option targeting the
+    # opponent's Teal Mask Ogerpon ex scored 0.05 purely because that card's
+    # ability says "draw a card".  It was the only column separating four
+    # otherwise-identical options, so the pointer would have learned to key on
+    # it -- a spurious signal is worse here than no signal.
+    #
+    # Deliberately 0.0 rather than a guess when the card is unresolvable (PAD,
+    # hidden, absent from the table): an invented cost reads as "safe to play"
+    # on exactly the cards we cannot see.
+    if state is not None:
+        _me = state["players"][your_index]
+        _deck = max(int(_me.get("deckCount", 0)), 1)
+        _hand = int(_me.get("handCount", 0))
+        for j in range(n_opts):
+            if int(opt_type[j]) == 13:
+                # Already computed from the attack table; keep the two columns
+                # consistent rather than re-deriving from the card row, whose
+                # draw text describes the card's *ability*, not the attack.
+                opt_scalar[j, 13] = opt_scalar[j, 8]
+                continue
+            if engine_card_features is None or not _opt_spends_my_card[j]:
+                continue
+            cid = int(opt_card_id[j])
+            if cid == PAD_CARD:
+                continue
+            crow = engine_card_features.get(cid)
+            if crow is None:
+                continue
+            d_fixed = float(crow[83]) * DRAW_N
+            d_to_hand = float(crow[84]) * DRAW_N
+            # 'draw until you have N' only costs the shortfall against my hand.
+            draw_est = d_fixed + max(0.0, d_to_hand - _hand)
+            if draw_est > 0.0:
+                opt_scalar[j, 13] = min(draw_est / _deck, 1.0)
 
     return (
         opt_type,
@@ -1374,58 +1641,6 @@ def _build_label(
 # ============================================================
 
 
-def _build_log_tokens(
-    logs: list[dict],
-    your_index: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build fixed-size log feature tensor for the belief module.
-
-    Each log entry is encoded as [log_type, player_rel, card_id, area_from,
-    area_to, scalar_value].  The sequence is truncated to L_LOG_MAX entries.
-
-    Returns (log_feat[L_LOG_MAX, LOG_FEAT_DIM], log_mask[L_LOG_MAX], log_len).
-    """
-    log_feat = np.zeros((L_LOG_MAX, LOG_FEAT_DIM), dtype=np.float32)
-    log_mask = np.zeros(L_LOG_MAX, dtype=bool)
-    n_logs = min(len(logs), L_LOG_MAX)
-
-    for i in range(n_logs):
-        log = logs[i]
-        lt = int(log.get("type", 0))
-
-        # player relative: -1=self, 1=opponent, 0=unknown
-        pidx = log.get("playerIndex")
-        player_rel = 0
-        if pidx is not None:
-            player_rel = 1 if int(pidx) != your_index else -1
-
-        # card id — raw engine id, so log_card_feat resolves OOV cards too
-        card_idx = _raw_card(log.get("cardId"))
-
-        # area from/to
-        area_from = log.get("fromArea", -1)
-        area_to = log.get("toArea", -1)
-        if area_from is None:
-            area_from = -1
-        if area_to is None:
-            area_to = -1
-
-        # scalar: pick the most informative numeric field
-        scalar = 0.0
-        if lt == 16:  # HP_CHANGE
-            scalar = _clip_norm(float(log.get("value", 0)), 200.0)
-        elif lt == 22:  # COIN
-            scalar = 1.0 if log.get("head") else -1.0
-        elif lt == 23:  # RESULT
-            scalar = float(log.get("result", 2)) / 2.0  # 0,1,2 → 0,0.5,1
-
-        log_feat[i] = [lt, player_rel, card_idx, area_from, area_to, scalar]
-        log_mask[i] = True
-
-    log_len = np.int64(n_logs)
-    return log_feat, log_mask, log_len
-
-
 # ============================================================
 # Top-level featurize()
 # ============================================================
@@ -1485,10 +1700,7 @@ def _ids_to_feat(ids: np.ndarray, engine_features: dict | None,
 #: put the train split's mmap cache at 47 GB against 30 GB of RAM.  ``.npz``
 #: hides this on disk because the arrays are ~0.5% nonzero and compress ~240x.
 #:
-#: So the writer stores the id and the reader re-gathers, exactly as the
-#: ``bel_*`` labels are stored sparsely and densified on the way into a batch.
-#: ``log_card_feat`` is absent by design -- ``log_feat[:, 2]`` already carries
-#: its ids, so it needs no key of its own.
+#: So the writer stores the id and the reader re-gathers.
 CARD_FEAT_SOURCES: dict[str, tuple[str, str]] = {
     "poke_card_feat": ("poke_card_id", "card"),
     "poke_tool_feat": ("poke_tool_ids", "card"),
@@ -1502,9 +1714,6 @@ CARD_FEAT_SOURCES: dict[str, tuple[str, str]] = {
     "opt_card_feat": ("opt_card_id", "card"),
     "opt_attack_feat": ("opt_attack_idx", "attack"),
 }
-
-#: ``log_card_feat`` is rebuilt from this column of ``log_feat`` instead.
-LOG_CARD_ID_COLUMN = 2
 
 
 def build_static_table(engine_features: dict | None, feat_dim: int) -> np.ndarray:
@@ -1621,9 +1830,41 @@ def load_engine_tables(data_dir) -> dict[str, dict | None]:
             return None
         return np.load(path, allow_pickle=True).item()
 
+    def _check(table, name, expected):
+        """Fail loudly when a table on disk predates a featurizer edit.
+
+        These files are written by ``ptcg_mine.cards`` at whatever ``F_CARD`` /
+        ``F_ATK`` were when mining last ran, so any change to the featurizer's
+        dims makes them stale until mining re-runs.  Left unchecked the failure
+        is invisible and expensive: ``featurize`` raises "could not broadcast
+        input array from shape (218,) into shape (223,)" on *every* decision,
+        ``shard_writer``'s pass-B worker catches ``ValueError`` and
+        ``logger.debug``s it, and half an hour later the build reports
+        "0 total samples" and blames experts and D_self/D_opp.  Measured for
+        real: 125,123 kept pairs, 0 samples, no traceback.
+        """
+        if table is None:
+            return table
+        row = next(iter(table.values()), None)
+        if row is None:
+            return table
+        width = int(np.asarray(row).shape[-1])
+        if width != expected:
+            raise ValueError(
+                f"{name} on disk is {width} wide but this featurizer expects "
+                f"{expected}. The table was built by an older ptcg_mine.cards; "
+                f"re-run mining to rebuild it:\n"
+                f"    uv run python -m ptcg_mine.mine --skip-download "
+                f"--raw-dir raw --out-dir {d} --force\n"
+                f"then rebuild shards with --force."
+            )
+        return table
+
     return {
-        "engine_card_features": _load(ENGINE_CARD_FEATURES_FILE),
-        "engine_attack_features": _load(ENGINE_ATTACK_FEATURES_FILE),
+        "engine_card_features": _check(
+            _load(ENGINE_CARD_FEATURES_FILE), ENGINE_CARD_FEATURES_FILE, F_CARD),
+        "engine_attack_features": _check(
+            _load(ENGINE_ATTACK_FEATURES_FILE), ENGINE_ATTACK_FEATURES_FILE, F_ATK),
         "evolution_map": _load(EVOLUTION_MAP_FILE),
     }
 
@@ -1700,6 +1941,9 @@ def featurize(
     # _build_option_tokens both need the same array, and the result dict
     # reuses it instead of calling _cfeat(poke_card_id) a second time.
     poke_card_feat = _cfeat(poke_card_id)
+    # Must run here: it is the first point where both the gathered static rows
+    # and poke_feat exist, and _build_cls_features below reads poke_feat.
+    _slot_ko_block(poke_card_feat, poke_feat)
     hand_card_id, hand_feat = _build_hand_tokens(
         state, your_index, engine_card_features, evolution_map,
     )
@@ -1711,10 +1955,6 @@ def featurize(
     discard_ids, discard_mask, prize_ids = _build_discard_prizes(
         state, your_index
     )
-
-    # --- Logs: belief-module input ---
-    logs = obs_dict.get("logs", [])
-    log_feat, log_mask, log_len = _build_log_tokens(logs, your_index)
 
     # --- State: categorical token attributes ---
     tok_type, tok_owner, tok_zone, tok_mask = _build_tok_attrs(
@@ -1739,6 +1979,7 @@ def featurize(
         poke_card_feat=poke_card_feat,
         poke_feat=poke_feat,
         engine_attack_features=engine_attack_features,
+        engine_card_features=engine_card_features,
     )
 
     # --- Labels ---
@@ -1790,10 +2031,6 @@ def featurize(
         "value_target": np.float32(value_target),
         "sample_weight": np.float32(sample_weight),
         "stop_column": np.int64(stop_column),
-        # Logs (belief module) — card features extracted from log entries
-        "log_feat": log_feat,
-        "log_mask": log_mask,
-        "log_len": log_len,
         # Card and attack ids.  These are what the model consumes: it gathers
         # the ``*_card_feat`` rows itself, on device, from the static tables
         # (``Policy._gather_card_feats``, keyed by CARD_FEAT_SOURCES).  This
@@ -1801,8 +2038,7 @@ def featurize(
         # materialising them here made a sample 416 KiB instead of 29.6 KiB, of
         # which 93% was a redeliverable lookup into a 1.1 MB table, and shipping
         # that through the DataLoader queue cost 128 of 174 ms per training
-        # step.  ``log_card_feat`` is gathered from ``log_feat``'s card-id
-        # column and likewise not emitted.
+        # step.
         #
         # Several of the feature arrays are still built *locally* above, because
         # cls_feat's KO-pressure block, opt_scalar's damage preview and

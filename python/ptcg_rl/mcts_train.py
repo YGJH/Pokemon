@@ -334,8 +334,8 @@ def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> None:
     """Load *ckpt_sd* into *policy*, handling size-mismatched ``*.static`` params.
 
     For any parameter whose checkpoint shape differs from the model, only
-    the overlapping prefix is copied.  Everything else is loaded as-is.
-    Missing belief-head keys are tolerated (pre-belief checkpoints).
+    the overlapping prefix is copied.  Everything else is loaded as-is; keys
+    the checkpoint does not carry are left at their initial values.
     """
     import torch
 
@@ -344,9 +344,6 @@ def _load_lenient(policy: Any, model_sd: dict, ckpt_sd: dict) -> None:
     for key, model_param in model_sd.items():
         ckpt_param = ckpt_sd.get(key)
         if ckpt_param is None:
-            if key.startswith("belief_heads."):
-                skipped += 1
-                continue
             logger.warning("  _load_lenient: missing key %s", key)
             skipped += 1
             continue

@@ -29,7 +29,6 @@ from ptcg_il.featurizer import (
     CARD_FEAT_SOURCES,
     F_ATK,
     F_CARD,
-    LOG_CARD_ID_COLUMN,
     build_static_table,
     gather_static_feats,
 )
@@ -117,18 +116,16 @@ class TestGatherIntoBatch:
             n_checked += 1
         assert n_checked == len(CARD_FEAT_SOURCES) > 0
 
-    def test_log_card_feat_comes_from_the_log_feat_column(self):
-        card, _ = _tables()
+    def test_log_card_feat_is_no_longer_gathered(self):
+        """After the log encoder's removal, ``log_card_feat`` is not gathered."""
         p = _policy()
         x = _make_synthetic_batch(B=2, n_cards=N_CARDS, n_attacks=N_ATK)
         x.pop("log_card_feat", None)
 
         out = p._gather_card_feats(x)
 
-        ids = x["log_feat"][..., LOG_CARD_ID_COLUMN].long().numpy()
-        np.testing.assert_array_equal(
-            out["log_card_feat"].numpy(),
-            gather_static_feats(ids, card.numpy()),
+        assert "log_card_feat" not in out, (
+            "log_card_feat should not be gathered after log encoder removal"
         )
 
     def test_ids_win_over_a_stale_feat_key_in_the_batch(self):

@@ -127,8 +127,8 @@ def read_candidate(path: Path) -> Candidate:
     if not ckpt.get("config"):
         raise ValueError(
             f"{path} carries no config record — the architecture cannot be "
-            "inferred, and a wrong n_opp_arch loads silently as a plausible "
-            "model with randomly-initialised belief heads."
+            "inferred, and a guessed one loads silently as a plausible model "
+            "with randomly-initialised parameters."
         )
     return Candidate(
         name=f"{dir_label(path.parent)}/{ckpt_label(path)}",

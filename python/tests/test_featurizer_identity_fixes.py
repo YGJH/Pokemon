@@ -417,7 +417,7 @@ class TestAttachedCardIdentity:
                 for k, v in s.items()
                 if isinstance(v, np.ndarray)
             }
-            for b in ("tok_mask", "opt_mask", "discard_mask", "log_mask"):
+            for b in ("tok_mask", "opt_mask", "discard_mask"):
                 batch[b] = batch[b].bool()
             for i in ("tok_type", "tok_owner", "tok_zone"):
                 batch[i] = batch[i].long()

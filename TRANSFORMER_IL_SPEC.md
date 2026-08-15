@@ -133,8 +133,8 @@ token** in the model (`B.2`). Revealed prizes are carried the same way (`prize_i
 drafts described these as count-vectors over `|𝒟vocab|`; the contract in Appendix A supersedes that —
 pooled id-embeddings generalize across the *wider* vocab §1.2 and reuse the shared `CardEncoder`.)
 
-**CLS / global features** (concat, projected in): `turn, turn%2, yourIndex, turnActionCount,
-firstPlayer, supporterPlayed, stadiumPlayed, energyAttached, retreated, my_prizes_left,
+**CLS / global features** (concat, projected in): `turn, turn%2, am_i_first, turnActionCount,
+toss_undecided, supporterPlayed, stadiumPlayed, energyAttached, retreated, my_prizes_left,
 opp_prizes_left`, **plus the current decision conditioning**: `select.type 1hot(11),
 select.context 1hot(49), minCount, maxCount, remainEnergyCost, remainDamageCounter`, and
 `card_feat(contextCard)`, `card_feat(effect)` when present. This conditioning is essential — the same
@@ -380,10 +380,10 @@ the sample only carries **ids**, not repeated static rows).
 ### State — dense features
 | key | shape | dtype | contents |
 |---|---|---|---|
-| `poke_feat` | `[P_MAX, F_POKE=26]` | float32 | see A.5 |
+| `poke_feat` | `[P_MAX, F_POKE=29]` | float32 | see A.5 |
 | `hand_feat` | `[H_MAX, F_HAND=2]` | float32 | `[idx/H_MAX, dup_count_in_hand/COUNT_N]` |
 | `sum_feat` | `[SUM, F_SUM=11]` | float32 | see A.5 |
-| `cls_feat` | `[F_GLOBAL=93]` | float32 | see A.6 (holds the select conditioning) |
+| `cls_feat` | `[F_GLOBAL=95]` | float32 | see A.6 (holds the select conditioning) |
 | `stadium_present` | `[1]` | float32 | 1 if a stadium is in play |
 
 ### State — categorical token attributes (shared `[L_STATE]` vectors)
@@ -418,7 +418,7 @@ the sample only carries **ids**, not repeated static rows).
 > Deck-selection steps (`select is None`) are **excluded** from this featurizer — the deck is fixed
 > (`FIXED_DECK`), not predicted (§1.2).
 
-## A.5 `poke_feat` (F_POKE = 26) and `sum_feat` (F_SUM = 11)
+## A.5 `poke_feat` (F_POKE = 29) and `sum_feat` (F_SUM = 12)
 
 `poke_feat[slot]` (all-zero for empty/face-down slots):
 | slice | dim | contents |
@@ -434,32 +434,66 @@ the sample only carries **ids**, not repeated static rows).
 | `[19]` | 1 | `appearThisTurn` |
 | `[20]` | 1 | `is_active` |
 | `[21:26]` | 5 | active-only condition flags `[poison,burn,sleep,paralyze,confuse]` (0 on bench) |
+| `[26]` | 1 | KO damage ratio, `min(dmg/hp, 2.0)` — see below |
+| `[27]` | 1 | KO flag, `1.0` when the ratio reaches `1.0` |
+| `[28]` | 1 | `1/(1+ceil(hp/10))` — damage counters still needed to KO |
 
-(21 + 5 = 26; conditions read from the owning `PlayerState` flags and applied to that player's active
-slot only.)
+(21 + 5 + 2 + 1 = 29; conditions read from the owning `PlayerState` flags and applied to that player's
+active slot only.)
+
+**The KO block (`[26:28]`, written by `_slot_ko_block`) flips polarity by owner**, matching
+`_card_target_preview`: opportunity on their side, danger on mine.
+
+* **my slots 0..5** — their Active's best attack against this slot, over the slot's current HP; the
+  flag means *this one dies*. Affordability is **ignored**, matching `_ko_pressure`'s opponent side:
+  their energy is theirs to spend next turn. Bench slots are scored as if gusted into the Active
+  spot, which is the question a promote or a Boss's Orders read actually asks.
+* **their slots 6..11** — my Active's best **affordable** attack against this slot, over its HP; the
+  flag means *I can kill it*.
+
+`tok_owner` is in the embedder's input, so the two readings are separable. Every unresolvable case
+(no static tables, empty slot, dead attacker, HP <= 0) stays `(0.0, 0.0)` — the same "no information"
+signal a PAD row carries. The ratio is on `[0, 2]` like every other damage ratio in the featurizer
+(`cls_feat[91]`/`[93]`, `opt_scalar[6]`/`[11]`), not `[0, 1]`: the extra headroom separates "barely
+lethal" from "overkill".
 
 `sum_feat[player]`:
 `[is_me, deckCount/DECK_N, handCount/HAND_N, len(bench)/BENCH_N, benchMax/BENCH_N, prizes_left/PRIZE_N,
-len(discard)/DECK_N, poisoned, burned, asleep, paralyzed]` → 11. (5th condition `confused` is dropped
+len(discard)/DECK_N, poisoned, burned, asleep, paralyzed, 1/(1+deckCount)]` → 12. (5th condition `confused` is dropped
 here to keep 11; it is already in `poke_feat`. Adjust to 12 if you prefer symmetry.)
 
-## A.6 `cls_feat` (F_GLOBAL = 93) — global state + **decision conditioning**
+## A.6 `cls_feat` (F_GLOBAL = 95) — global state + **decision conditioning**
 
 | slice | dim | contents |
 |---|---|---|
 | `[0]` | 1 | `turn/TURN_N` |
 | `[1]` | 1 | `turn % 2` |
-| `[2]` | 1 | `yourIndex` |
+| `[2]` | 1 | `am_i_first` — `float(yourIndex == firstPlayer)`, 0 while the toss is open |
 | `[3]` | 1 | `turnActionCount/COUNT_N` |
-| `[4:7]` | 3 | `firstPlayer` one-hot over `{-1,0,1}` |
-| `[7:11]` | 4 | `[supporterPlayed, stadiumPlayed, energyAttached, retreated]` |
-| `[11:13]` | 2 | `[my_prizes_left/PRIZE_N, opp_prizes_left/PRIZE_N]` |
-| `[13:24]` | 11 | `select.type` one-hot (`N_SELTYPE`) |
-| `[24:73]` | 49 | `select.context` one-hot (`N_SELCTX`) |
-| `[73:77]` | 4 | `[minCount/COUNT_N, maxCount/COUNT_N, remainEnergyCost/ATKCOST_N, remainDamageCounter/DMGCTR_N]` |
-| `[77:87]` | 10 | my-active conditions (5) ⊕ opp-active conditions (5) |
-| `[87:89]` | 2 | `[has_contextCard, has_effect]` |
-| `[89:93]` | 4 | reserved (0) for forward-compat with appended enum values |
+| `[4]` | 1 | `toss_undecided` — `float(firstPlayer == -1)` |
+| `[5:9]` | 4 | `[supporterPlayed, stadiumPlayed, energyAttached, retreated]` |
+| `[9:11]` | 2 | `[my_prizes_left/PRIZE_N, opp_prizes_left/PRIZE_N]` |
+| `[11:22]` | 11 | `select.type` one-hot (`N_SELTYPE`) |
+| `[22:71]` | 49 | `select.context` one-hot (`N_SELCTX`) |
+| `[71:75]` | 4 | `[minCount/COUNT_N, maxCount/COUNT_N, remainEnergyCost/ATKCOST_N, remainDamageCounter/DMGCTR_N]` |
+| `[75:85]` | 10 | my-active conditions (5) ⊕ opp-active conditions (5) |
+| `[85:87]` | 2 | `[has_contextCard, has_effect]` |
+| `[87:91]` | 4 | reserved (0) for forward-compat with appended enum values |
+| `[91:95]` | 4 | KO pressure |
+
+**No absolute seat may appear in this block.** `[2]` and `[4]` replace an earlier
+`yourIndex` scalar plus a 3-wide absolute `firstPlayer` one-hot. Both were
+absolute-seat quantities and only their XOR carried information: every other
+tensor in the dict is already built relative to `yourIndex`, so relabelling seat
+0 ↔ seat 1 is a symmetry of the whole input. Keeping them cost accuracy rather
+than two floats — seat 0 wins the coin toss in every corpus episode measured
+(3000/3000) and elects to go first in 99.1%, leaving `yourIndex` 96.25%
+collinear with "am I going second", so the policy used the seat as the proxy.
+Measured on a real Kaggle replay, flipping only those columns changed the
+agent's chosen action on 11 of 126 decisions. `test_featurizer_seat_invariance`
+pins the symmetry; `CLS_AM_I_FIRST`, `CLS_TOSS_UNDECIDED`, `CLS_OUR_PRIZES`,
+`CLS_OPP_PRIZES`, `CLS_HAS_CONTEXT_CARD` and `CLS_HAS_EFFECT` are exported from
+`featurizer.py` so no other module hardcodes a column that can shift again.
 
 `context_card_id`/`effect_card_id` are embedded via `card_embed` and **added** to the CLS token vector
 in the model, alongside `ClsMLP(cls_feat)`.
@@ -521,7 +555,7 @@ gathered 256-d refs before the option MLP). Encoder sees `[B, L_STATE=46, 256]`;
 
 PyTorch reference. Every tensor name/shape matches **Appendix A**. `B` = batch of decision points.
 Recap of the dims used below: `D=256`, `L=L_STATE=46`, `O=O_MAX=64`, `P=P_MAX=12`, `H=H_MAX=30`,
-`SUM=2`, `V`, `A`, `F_CARD=52`, `F_ATK=14`, `F_POKE=26`, `F_HAND=2`, `F_SUM=11`, `F_GLOBAL=93`,
+`SUM=2`, `V`, `A`, `F_CARD=52`, `F_ATK=14`, `F_POKE=26`, `F_HAND=2`, `F_SUM=11`, `F_GLOBAL=95`,
 `F_OPT=6`. Standard blocks are `batch_first=True`, `norm_first=True` (pre-norm), GELU, dropout 0.0.
 
 ## B.0 Prebuilt lookup buffers (registered, not learned)
@@ -555,7 +589,7 @@ class TokenEmbedder(nn.Module):
         self.poke_mlp  = MLP(F_POKE=26, D, D)
         self.hand_mlp  = MLP(F_HAND=2,  D, D)
         self.sum_mlp   = MLP(F_SUM=11,  D, D)
-        self.cls_mlp   = MLP(F_GLOBAL=93, D, D)
+        self.cls_mlp   = MLP(F_GLOBAL=95, D, D)
         self.no_stadium = nn.Parameter(torch.zeros(D))   # when stadium absent
 
     def forward(self, x):                          # x = featurizer dict, all with batch dim B
@@ -1147,3 +1181,63 @@ manifest.csv ─▶ [P0 sample] ─▶ [P1 download → raw/<day>/<id>.json] ─
    ─▶ freeze EXPERTS, 𝒟_self, 𝒟_opp, vocab.json, archetypes.json, FIXED_DECK
    ─▶ [P3 featurize kept games] ─▶ shards/ + meta.parquet ─▶ [P4 QA] ─▶ Appendix C training
 ```
+
+
+## A.5.1 Deck-out features
+
+Losing by deck-out is **7.8% of corpus games**, and **10.4% of all decision points sit at
+`deck <= 5`** — so this is neither an edge case nor a data-scarcity problem.
+
+**`sum_feat[:, 11] = 1/(1+deckCount)`** (`SUM_DECK_OUT_COL`), written for *both* players because
+decking the opponent is a win condition. `sum_feat[:, 1]` remains `deckCount/DECK_N` and is *linear*
+in a quantity whose decision-utility is *hyperbolic*: deck 50→48 and deck 3→1 are both a 0.033 step
+there, and only one of them ends the game. The reciprocal is already in `[0, 1]` with no clipping
+and needs no tuned threshold — deck 3→1 moves 0.250→0.500 while 50→48 moves 0.020→0.020, roughly
+**250× more gradient where the game is decided**. It is an *additional* fixed divisor, never a
+replacement: the all-zero row is still the PAD sentinel.
+
+**`opt_scalar[:, 13] = min(draw_est / deckCount, 1.0)`** (`OPT_DECK_COST_COL`) — how much of what is
+left *this* option burns, for **every** option type. `opt_scalar[:, 8]` carries the same quantity but
+is filled only inside the `otype == 13` ATTACK branch, and an attack is rarely what decks you out;
+the PLAY options are, and they were getting dims 0–5 and nothing else. ATTACK options copy dim 8 so
+the two columns cannot disagree. An unresolvable card (PAD, hidden, absent from the table) stays
+`0.0` rather than being assigned a guess, which would read as "safe to play" on exactly the cards we
+cannot see.
+
+**`card_static_row[83:85]`** (`CARD_DRAW_FIXED_COL`, `CARD_DRAW_TO_HAND_COL`) supplies the counts,
+normalised by `DRAW_N` exactly as `attack_static_row[14:16]` is, so one formula reads either source.
+`ptcg_mine.keywords.card_draw_counts` parses them from `card.skills[].text` — Trainers store oracle
+text there just as Pokémon abilities do — and yields a numeric count for **38 of the 42**
+draw-mentioning engine cards (90%); the rest fall back to the binary `draw` keyword already in the
+ability row.
+
+The two columns sit **before** the embedded attack blocks, not appended. `CARD_ATTACK_BLOCK_START` is
+derived as `F_CARD - 3 * F_ATK` in the featurizer and `52 + K_EFFECT + 2 + 2` in `cards.py`;
+appending would leave those disagreeing by exactly 2, and every embedded attack would decode as
+garbage while every shape check still passed.
+
+
+## A.5.2 Counters-to-KO and bench damage
+
+**`poke_feat[:, 28] = 1/(1+ceil(hp/10))`** (`POKE_COUNTERS_TO_KO_COL`). A damage counter is 10 HP, so
+this is the unit every counter-placement decision is denominated in. Measured on a real archetype-16
+(Dragapult ex) game, **18 of that player's 96 decisions — 19% — were exactly that select**:
+`select(type=1, context=14)` with `remainDamageCounter` counting 6 down to 1, choosing among 4–5
+benched Pokémon. Reciprocal for the same reason the deck-out curve is: `hp/HP_N` is linear, so 70 HP
+and 10 HP sit 0.15 apart while "1 counter away" versus "7 counters away" is the entire decision.
+
+**`attack_static_row[16] = bench_damage/ATKDMG_N`** (`ATK_BENCH_DMG_COL`), pushing the keyword flags
+to `17:46` and `F_ATK` to 46, hence `F_CARD` to 223.
+
+**An attack's `damage` field is always the number dealt to the Active, never to a benched Pokémon.**
+Measured over the engine's pool, 27 attacks reach the bench and every one states that figure only in
+its oracle text, in three forms: *"this attack **also** does N damage to 1 of your opponent's Benched
+Pokémon"* (19), *"put N damage counters on your opponent's Benched Pokémon"* (2, worth N×10 on a
+single target), and *"also does N damage to each Benched"* (6). One (Pinpoint Dive) is a pure snipe
+whose `damage` field is `0`.
+
+`_attack_damage_ratio` previously scored bench targets with col 0, over-reporting all 27 — Phantom
+Dive read **200 against a 70 HP benched Pokémon (ratio 2.0, KO flag set)** when the truth is at most
+60. It now reads `ATK_BENCH_DMG_COL` for any `tgt_slot != 6`, and applies it **raw**: 25 of the 27
+spell out *"Don't apply Weakness and Resistance for Benched Pokémon"*, which is the printed rule for
+bench damage generally.

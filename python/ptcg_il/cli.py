@@ -20,17 +20,20 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import logging
 from rich.logging import RichHandler
 import os
+import socket
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
-# belief_labels is deliberately torch-free, so importing the weight defaults
-# here does not drag torch into `--help`.
-from ptcg_il.belief_labels import BELIEF_WEIGHTS
+from ptcg_il.notify import send_telegram
+
 logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler()])
 logger = logging.getLogger(__name__)
 
@@ -39,15 +42,39 @@ logger = logging.getLogger(__name__)
 # Default hyperparameters (C.10)
 # ============================================================
 import random
-d_model = random.choice([128,256,512])
-layers  = random.randint(4, 10)
-heads   = random.choice([2, 4, 8])
+
+
+def _sample_arch() -> dict[str, int]:
+    """One draw of the random architecture.
+
+    Training re-rolls this until the model fits under ``MAX_MODEL_BYTES``, so
+    the distributions live in exactly one place.
+    """
+    d_model = random.choice([128,256,512])
+    return {
+        "d_model": d_model,
+        "layers": random.randint(2, 10),
+        "heads": random.choice([2, 4, 8]),
+        "ff": 4 * d_model,
+    }
+
+
+#: Cap on the shipped model size.  ``weights.pt`` carries only the state_dict
+#: (the card/attack tables are non-persistent buffers), so that is what gets
+#: measured.  Training re-rolls the random architecture until it fits.
+MAX_MODEL_BYTES = 192 * 1024**2
+
+#: Give-up bound on architecture draws — with these distributions a fitting
+#: draw shows up within a handful, so reaching the bound means something else
+#: is wrong.
+_MAX_ARCH_DRAWS = 100
+
+#: Architecture flags that disable re-rolling when passed explicitly.
+_ARCH_FLAGS = frozenset({"d_model", "layers", "heads", "ff"})
+
 DEFAULTS = {
     # Model
-    "d_model": d_model,
-    "layers": layers,
-    "heads": heads,
-    "ff": 4*d_model,
+    **_sample_arch(),
     # Split by site.  Attention-weight dropout stays off: the encoder runs over
     # 46 structured entity tokens (CLS + Pokemon slots + hand + summaries +
     # stadium), so dropping a key severs a specific fact rather than adding
@@ -56,7 +83,7 @@ DEFAULTS = {
     "ffn_dropout": 0.0,
     # Training
     "batch_size": 1024,
-    "epochs": 1000,
+    "epochs": 100,
     "peak_lr": 8e-5,
     "warmup": 100,
     "min_lr": 1e-5,
@@ -67,18 +94,18 @@ DEFAULTS = {
     "alpha_ctx": 0.5,
     "alpha_arch": 0.5,
     "lambda_v": 0.5,
-    "w_lost": 0.6,
+    "w_lost": 0.5,
     # Cadence
     "log_every": 50,
-    "val_every": 100,
+    "val_every": 50,
     "ckpt_every": 2000,
     "live_every": 1000000,
     # Data
-    "num_workers": 8,
+    "num_workers": 14,
     # Precision
     "mixed_precision": True,
     # Patience
-    "patience": 5000,
+    "patience": 50,
     # Live eval
     "live_eval_games": 500,
     # W&B.  Runs land in the `poken` team by default; override with
@@ -88,6 +115,19 @@ DEFAULTS = {
     "wandb_name": "pokemon-tcg-il",
     "wandb_mode": "online",
 }
+
+
+def _parse_arch_date(value: str) -> tuple[int, datetime.date]:
+    """Parse ``ARCH:YYYY-MM-DD`` for ``--exclude-arch-before``."""
+    try:
+        arch, sep, day = value.partition(":")
+        if not sep:
+            raise ValueError
+        return int(arch), datetime.date.fromisoformat(day)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected ARCH:YYYY-MM-DD, got {value!r}"
+        ) from None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -209,7 +249,7 @@ def _build_parser() -> argparse.ArgumentParser:
                                "unrelated policies at once. Default: all decks.")
     train_hp.add_argument("--epochs", type=int, default=DEFAULTS["epochs"],
                           help="Training epochs (overridden by --total-steps)")
-    train_hp.add_argument("--total-steps", type=int, default=None,
+    train_hp.add_argument("--total-steps", type=int, default=15000,
                           help="Override total training steps (default: epochs * steps_per_epoch)")
     from ptcg_il.train.loop import MUON_LR
 
@@ -254,24 +294,12 @@ def _build_parser() -> argparse.ArgumentParser:
     loss.add_argument("--lambda-v", type=float, default=DEFAULTS["lambda_v"],
                       help="Value loss weight")
     loss.add_argument("--w-lost", type=float, default=DEFAULTS["w_lost"],
-                      help="Weight multiplier for lost-game decisions")
+                      help="Sample weight for lost-game decisions. Negative "
+                           "(default) makes the loss push the expert action's "
+                           "probability down on those rows; 0 drops them; "
+                           "positive imitates them at reduced weight")
     loss.add_argument("--ema-decay", type=float, default=DEFAULTS["ema_decay"],
                       help="EMA decay for parameter averaging")
-
-    # Opponent-card belief (auxiliary supervision for MCTS determinization).
-    # These heads always train: build-shards writes belief labels for every
-    # decision point unconditionally, and the RL stage's determinizer needs the
-    # heads to exist.  Set every weight to 0 to disable the term.
-    bel = train_parser.add_argument_group("Belief heads")
-    bel.add_argument("--no-belief", action="store_true",
-                     help="Disable the auxiliary opponent-card belief heads "
-                          "(archetype / deck / hidden pool / hand). They train by "
-                          "default; disabling them saves the heads' [B, V] matmuls "
-                          "but leaves the MCTS determinizer on its mirror-deck guess.")
-    for name, default in BELIEF_WEIGHTS.items():
-        bel.add_argument(f"--belief-{name[2:]}", type=float, default=default,
-                         dest=f"belief_{name[2:]}",
-                         help=f"Weight of the belief {name[2:]} term (default {default})")
 
     # Cadence
     cadence = train_parser.add_argument_group("Logging & eval cadence (C.8–C.10)")
@@ -288,6 +316,14 @@ def _build_parser() -> argparse.ArgumentParser:
     data = train_parser.add_argument_group("Data loading")
     data.add_argument("--num-workers", type=int, default=DEFAULTS["num_workers"],
                       help="DataLoader workers")
+    data.add_argument("--exclude-arch-before", type=_parse_arch_date, default=None,
+                      metavar="ARCH:YYYY-MM-DD",
+                      help="Drop one archetype's episodes predating the date from "
+                           "the train/val datasets, e.g. 1:2026-07-20 keeps only "
+                           "archetype-1 games from 2026-07-20 on. Episode dates "
+                           "are decoded from the UUIDv1 id inside each raw "
+                           "episode JSON; test split and other archetypes are "
+                           "untouched.")
     data.add_argument("--mixed-precision", action="store_true", default=DEFAULTS["mixed_precision"],
                       help="Use bf16 autocast (default: True)")
     data.add_argument("--fp32", action="store_true",
@@ -323,15 +359,6 @@ def _build_parser() -> argparse.ArgumentParser:
     qa = train_parser.add_argument_group("QA gates (D.5)")
     qa.add_argument("--skip-qa", action="store_true",
                     help="Skip QA gates (not recommended)")
-    qa.add_argument("--allow-belief-widening", action="store_true",
-                    help="Accept a --resume checkpoint whose belief archetype "
-                         "head is narrower than the current artifacts require, "
-                         "copying its rows into the leading 𝒟_opp slots. Sound "
-                         "only when archetypes.json was SEEDED from the "
-                         "checkpoint's generation (lineage.seeded), because "
-                         "then slot i still means the archetype it did. After "
-                         "a --rebaseline the leading rows describe different "
-                         "decks and this makes an untrained head look trained.")
 
     # Baseline recording (pipeline stage 4c)
     base = train_parser.add_argument_group("IL baselines (RL_SPEC §10.2 cond. 3)")
@@ -385,9 +412,6 @@ def _load_artifacts(data_dir: Path) -> dict:
         with open(arch_path) as f:
             arch = json.load(f)
         artifacts["fixed_deck"] = arch.get("fixed_deck", list(range(60)))
-        # The belief head classifies over the retained 𝒟_opp set, in the same
-        # contiguous order shard_writer used when it wrote bel_arch.
-        artifacts["n_opp_arch"] = len(arch.get("opp_ids", []))
         artifacts["archetypes"] = arch
     else:
         raise FileNotFoundError(f"archetypes.json not found at {arch_path}")
@@ -395,31 +419,12 @@ def _load_artifacts(data_dir: Path) -> dict:
     return artifacts
 
 
-def _belief_weights(args: argparse.Namespace) -> dict[str, float] | None:
-    """CLI flags → the ``belief_weights`` dict, or None when disabled.
-
-    None (not a dict of zeros) is what turns the belief forward pass off
-    entirely, so a run with ``--no-belief`` never pays for the heads' [B, V]
-    matmuls.
-
-    The heads are on by default.  They used to be opt-in via ``--belief``,
-    guarding against shards mined without belief labels — but ``shard_writer``
-    writes those labels for every decision point unconditionally, so the guard
-    protected against a corpus that no longer exists, while the *default* left
-    the MCTS determinizer on its mirror-deck guess.
-    """
-    if getattr(args, "no_belief", False):
-        return None
-    return {name: float(getattr(args, f"belief_{name[2:]}")) for name in BELIEF_WEIGHTS}
-
-
 def _load_static_tables(data_dir: Path) -> Any:
     """``(card_table, attack_table)`` for the policy's on-device card gather.
 
     Thin wrapper over :func:`ptcg_il.model.policy.load_static_tables` so the
     import stays lazy — ``cli`` is imported for subcommands that never build a
-    model.  The card table doubles as the belief heads' scoring matrix; the
-    policy wires both from one call.
+    model.  The policy wires the card and attack tables from one call.
     """
     from ptcg_il.model.policy import load_static_tables
 
@@ -430,8 +435,8 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
     """Create a Policy module from artifact sizes and CLI args.
 
     There is no vocab width to pass: cards reach the model purely as static
-    feature vectors (``CardFeaturizer``), so the only card-derived shape is
-    ``n_all_cards`` for the belief heads' output width.
+    feature vectors (``CardFeaturizer``); ``n_all_cards`` is recorded in the
+    config so a checkpoint still names the table it was trained against.
     """
     from ptcg_il.model.policy import Policy
 
@@ -441,9 +446,8 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
                                     ("engine_attack_features.npy", all_attack_feat))
                if t is None]
     if missing:
-        # Every card would embed as all-zeros and the belief heads would have no
-        # scoring matrix.  Refuse here rather than at the first forward pass,
-        # several minutes into a run -- or worse, not at all.
+        # Every card would embed as all-zeros.  Refuse here rather than at the
+        # first forward pass, several minutes into a run -- or worse, not at all.
         raise SystemExit(
             f"missing {', '.join(missing)} in {args.data_dir}; the policy cannot "
             "featurize cards without the engine static tables. Run "
@@ -458,7 +462,6 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
         heads=args.heads,
         layers=args.layers,
         ff=args.ff,
-        n_opp_arch=artifacts.get("n_opp_arch", 0),
         n_all_cards=n_all_cards,
         all_card_feat=all_card_feat,
         all_attack_feat=all_attack_feat,
@@ -472,6 +475,78 @@ def _build_policy(artifacts: dict, args: argparse.Namespace) -> Any:
     from ptcg_il.model import init_weights
     init_weights(policy)
     return policy
+
+
+def _model_size_bytes(policy: Any) -> int:
+    """Bytes the state_dict occupies — what lands in the shipped weights.pt.
+
+    Non-persistent buffers (the card/attack tables) never appear in the
+    state_dict, so they are correctly excluded here.
+    """
+    import torch
+
+    return sum(
+        int(t.numel()) * int(t.element_size())
+        for t in policy.state_dict().values()
+        if isinstance(t, torch.Tensor)
+    )
+
+
+def _explicit_arch_flags(argv: list[str]) -> set[str]:
+    """Which architecture flags the user actually typed on the command line.
+
+    A re-roll may only override the random default, never an explicit choice,
+    so ``--d-model 512`` must be distinguishable from ``d_model`` happening to
+    default to 512.  A throwaway parser with SUPPRESS defaults records exactly
+    the flags that were present.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    for flag in ("--d-model", "--layers", "--heads", "--ff"):
+        parser.add_argument(flag, type=int, default=argparse.SUPPRESS)
+    ns, _ = parser.parse_known_args(argv)
+    return set(vars(ns))
+
+
+def _build_policy_under_cap(artifacts: dict, args: argparse.Namespace) -> Any:
+    """Build the policy, re-rolling the random architecture while it is over
+    ``MAX_MODEL_BYTES``.
+
+    An explicitly pinned architecture (any of ``--d-model/--layers/--heads/
+    --ff``) is never re-rolled — an oversized explicit choice fails instead.
+    """
+    explicit = _ARCH_FLAGS & getattr(args, "_arch_explicit", frozenset())
+    for attempt in range(1, _MAX_ARCH_DRAWS + 1):
+        logger.info(
+            "Building Policy(D=%d, heads=%d, layers=%d, ff=%d, "
+            "attn_dropout=%g, ffn_dropout=%g)",
+            args.d_model, args.heads, args.layers, args.ff,
+            getattr(args, "attn_dropout", 0.0), getattr(args, "ffn_dropout", 0.0),
+        )
+        policy = _build_policy(artifacts, args)
+        size = _model_size_bytes(policy)
+        if size <= MAX_MODEL_BYTES:
+            logger.info(
+                "Model size %.1f MiB (cap %d MiB)",
+                size / 2**20, MAX_MODEL_BYTES // 2**20,
+            )
+            return policy
+        if explicit:
+            raise SystemExit(
+                f"model is {size / 2**20:.1f} MiB, over the "
+                f"{MAX_MODEL_BYTES // 2**20} MiB submission cap, and "
+                f"--{sorted(explicit)[0].replace('_', '-')} was passed "
+                "explicitly — pick a smaller architecture"
+            )
+        logger.warning(
+            "Model size %.1f MiB exceeds the %d MiB cap — re-rolling the "
+            "random architecture (draw %d/%d)",
+            size / 2**20, MAX_MODEL_BYTES // 2**20, attempt, _MAX_ARCH_DRAWS,
+        )
+        vars(args).update(_sample_arch())
+    raise SystemExit(
+        f"no sampled architecture fit under the {MAX_MODEL_BYTES // 2**20} MiB "
+        f"cap in {_MAX_ARCH_DRAWS} draws"
+    )
 
 
 def cmd_build_shards(args: argparse.Namespace) -> int:
@@ -536,7 +611,25 @@ def cmd_build_shards(args: argparse.Namespace) -> int:
     logger.info("  meta:       %s", summary["meta_path"])
 
     if summary["total_samples"] == 0:
-        logger.error("No samples produced! Check that experts, D_self/D_opp, and raw data are available.")
+        if summary["n_kept_games"] > 0:
+            # Pairs survived selection but nothing featurized, so selection is
+            # not the cause and the old message pointed the wrong way for half
+            # an hour.  The overwhelmingly common reason is a static table left
+            # stale by a featurizer edit; `load_engine_tables` now checks the
+            # two engine tables up front, so a survivor is something it cannot
+            # see.  Re-run with -v to get the per-sample reason.
+            logger.error(
+                "No samples produced, but %d (episode, player) pairs passed "
+                "selection — so this is not a filter problem. Every featurize() "
+                "call failed. Check the warning above for the first exception; "
+                "re-run mining with --force if a static table is stale.",
+                summary["n_kept_games"],
+            )
+        else:
+            logger.error(
+                "No samples produced and no pairs kept. Check that D_self "
+                "archetypes and raw data are available."
+            )
         return 1
 
     # Stamped only on a run that produced samples, so a failed build never
@@ -573,21 +666,11 @@ def cmd_train(args: argparse.Namespace) -> int:
                     qa_results.get("label_sanity_pass"),
                     qa_results.get("deck_legality_pass"))
 
-    # Build policy
-    logger.info(
-        "Building Policy(D=%d, heads=%d, layers=%d, ff=%d, n_opp_arch=%d, "
-        "attn_dropout=%g, ffn_dropout=%g)",
-        args.d_model,
-        args.heads,
-        args.layers,
-        args.ff,
-        artifacts.get("n_opp_arch", 0),
-        getattr(args, "attn_dropout", 0.0),
-        getattr(args, "ffn_dropout", 0.0),
-    )
+    # Build policy — re-rolls the random architecture while it is over the
+    # size cap (the "Building Policy(...)" log line lives in the helper).
     import torch as _torch
     _torch.manual_seed(args.seed)
-    policy = _build_policy(artifacts, args)
+    policy = _build_policy_under_cap(artifacts, args)
 
     # Eval-only mode
     if args.eval_only:
@@ -620,6 +703,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         optimizer_name=args.optimizer,
         muon_lr=args.muon_lr,
         archetype_self=args.archetype_self,
+        exclude_arch_before=args.exclude_arch_before,
         seed=args.seed,
         peak_lr=args.peak_lr,
         min_lr=args.min_lr,
@@ -629,7 +713,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         group_marginal=args.group_marginal,
         ema_decay=args.ema_decay,
         lambda_v=args.lambda_v,
-        belief_weights=_belief_weights(args),
+        w_lost=args.w_lost,
         weight_decay=args.weight_decay,
         betas=(args.beta1, args.beta2),
         total_steps=total_steps,
@@ -642,7 +726,6 @@ def cmd_train(args: argparse.Namespace) -> int:
         wandb_entity=args.wandb_entity,
         wandb_name=_wandb_run_name(args),
         resume_ckpt=args.resume,
-        allow_belief_widening=args.allow_belief_widening,
         run_val=True,
         patience=args.patience,
     )
@@ -691,8 +774,7 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
     from ptcg_il.train.checkpoint import load_checkpoint
     ckpt = load_checkpoint(args.resume, device)
     from ptcg_il.model.policy import load_policy_state
-    load_policy_state(policy, ckpt["model_state_dict"],
-                      allow_belief_widening=args.allow_belief_widening)
+    load_policy_state(policy, ckpt["model_state_dict"])
     policy.to(device)
     policy.eval()
 
@@ -730,7 +812,6 @@ def _cmd_eval_only(policy: Any, artifacts: dict, args: argparse.Namespace) -> in
         )
         eval_metrics = offline_eval(
             policy, eval_loader, device, lambda_v=args.lambda_v,
-            belief=_belief_weights(args) is not None,
         )
         logger.info(
             "Offline eval (%s): top1_macro=%.4f, top1_micro=%.4f, "
@@ -796,7 +877,6 @@ def _cmd_eval_only_ensemble(
     ensemble.eval()
 
     split = getattr(args, "eval_split", "val")
-    belief = _belief_weights(args) is not None
 
     select_k = getattr(args, "ensemble_select", None)
     if select_k is not None:
@@ -828,8 +908,7 @@ def _cmd_eval_only_ensemble(
     # Evaluate each member
     member_metrics = []
     for i, member in enumerate(ensemble.members):
-        m = offline_eval(member, eval_loader, device, lambda_v=args.lambda_v,
-                         belief=belief)
+        m = offline_eval(member, eval_loader, device, lambda_v=args.lambda_v)
         member_metrics.append(m)
         logger.info(
             "Member %d: top1_macro=%.4f, top1_micro=%.4f, top1_nontrivial=%.4f, "
@@ -843,8 +922,7 @@ def _cmd_eval_only_ensemble(
         )
 
     # Evaluate ensemble
-    ens_metrics = offline_eval(ensemble, eval_loader, device, lambda_v=args.lambda_v,
-                               belief=belief)
+    ens_metrics = offline_eval(ensemble, eval_loader, device, lambda_v=args.lambda_v)
     logger.info(
         "Ensemble: top1_macro=%.4f, top1_micro=%.4f, top1_nontrivial=%.4f, "
         "value_corr=%.4f, value_std=%.4f",
@@ -1003,7 +1081,6 @@ def _record_ensemble_selection(
     subset.eval()
     subset_metrics = offline_eval(
         subset, test_loader, device, lambda_v=args.lambda_v,
-        belief=_belief_weights(args) is not None,
     )
     logger.info(
         "Top-%d subset on test: top1_macro=%.4f, top1_micro=%.4f, "
@@ -1105,27 +1182,20 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
         "search_planner": search_planner_agent,
     }
 
-    # A second planner whose determinization uses the belief heads' predicted
-    # opponent deck instead of the mirror assumption.  Kept alongside the plain
-    # planner rather than replacing it, so the two numbers measure what the
-    # belief model is actually worth.
-    if _belief_weights(args) is not None:
-        try:
-            import copy
+    # A second planner whose determinization uses the archetype prior instead
+    # of the mirror assumption.  Kept alongside the plain planner rather than
+    # replacing it, so the two numbers measure what the prior is actually
+    # worth.  No NN in this path any more, so it needs no policy and no CPU
+    # copy for fork-safety.
+    try:
+        from ptcg_il.deck_prior import OpponentDeckPredictor
+        from ptcg_il.live_eval import SearchPlannerAgent
 
-            from ptcg_il.belief_infer import OpponentDeckOracle
-            from ptcg_il.live_eval import SearchPlannerAgent
-
-            # A CPU copy: the workers are forked, and a CUDA tensor cannot
-            # cross a fork.
-            oracle_policy = copy.deepcopy(policy).to("cpu").eval()
-            oracle = OpponentDeckOracle(
-                oracle_policy, artifacts["vocab"], artifacts["archetypes"],
-                device="cpu", data_dir=args.data_dir,
-            )
-            opponents["search_planner_belief"] = SearchPlannerAgent(oracle=oracle)
-        except Exception as e:
-            logger.warning("Could not build belief-backed search planner: %s", e)
+        opponents["search_planner_prior"] = SearchPlannerAgent(
+            predictor=OpponentDeckPredictor(artifacts["archetypes"]),
+        )
+    except Exception as e:
+        logger.warning("Could not build prior-backed search planner: %s", e)
 
     # Frozen checkpoint opponent — load from --resume if available
     if args.resume is not None:
@@ -1136,9 +1206,7 @@ def _run_live_eval(policy: Any, artifacts: dict, args: argparse.Namespace) -> No
             from ptcg_il.train.checkpoint import load_checkpoint
             ckpt = load_checkpoint(args.resume, device="cpu")
             from ptcg_il.model.policy import load_policy_state
-            load_policy_state(
-                frozen_policy, ckpt["model_state_dict"],
-                allow_belief_widening=getattr(args, "allow_belief_widening", False))
+            load_policy_state(frozen_policy, ckpt["model_state_dict"])
             frozen_agent = make_agent_from_policy(
                 frozen_policy, artifacts["vocab"], artifacts["fixed_deck"],
                 device="cpu", data_dir=args.data_dir,
@@ -1205,7 +1273,7 @@ def cmd_archetypes(args: argparse.Namespace) -> int:
             "Only %d of the requested %d archetypes have enough held-out data; "
             "training %s", len(ids), args.top, ids,
         )
-    print(" ".join(str(i) for i in ids))
+    print(" ".join(str(i).format("{:>10}") for i in ids))
     return 0
 
 
@@ -1214,16 +1282,13 @@ def cmd_archetypes(args: argparse.Namespace) -> int:
 # ============================================================
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI entry point."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
+def _dispatch(argv: list[str] | None) -> int:
+    """Parse args and run the subcommand."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    args._arch_explicit = _explicit_arch_flags(
+        sys.argv[1:] if argv is None else argv
+    )
 
     if args.command == "train":
         return cmd_train(args)
@@ -1234,6 +1299,59 @@ def main(argv: list[str] | None = None) -> int:
     else:
         parser.print_help()
         return 0
+
+
+def _notify(title: str, started: float, invoked: str, detail: str = "") -> None:
+    """One Telegram message per process exit; failures here are swallowed."""
+    elapsed = time.monotonic() - started
+    duration = f"{int(elapsed // 60)}m{int(elapsed % 60):02d}s"
+    send_telegram(
+        f"{title} ({duration}) on {socket.gethostname()}\n$ {invoked}{detail}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Every exit path sends exactly one Telegram message: a returned non-zero
+    code, an uncaught exception (traceback tail attached), ``SystemExit``
+    with a non-zero code (argparse usage errors, explicit ``SystemExit``),
+    and Ctrl-C.  ``SystemExit(0)`` (``--help``) stays silent.  The exception
+    paths re-raise after notifying, so stderr and the process exit code are
+    unchanged.  Note a SIGKILL (OOM) cannot be caught in-process.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    started = time.monotonic()
+    invoked = " ".join(
+        [Path(sys.argv[0]).name, *(sys.argv[1:] if argv is None else argv)]
+    )
+    try:
+        rc = _dispatch(argv)
+    except SystemExit as e:
+        if e.code is None or e.code == 0:
+            raise
+        code = e.code if isinstance(e.code, int) else 1
+        detail = "" if isinstance(e.code, int) else f"\n{e.code}"
+        _notify(f"❌ ptcg-il exit {code}", started, invoked, detail)
+        raise
+    except KeyboardInterrupt:
+        _notify("⚠️ ptcg-il interrupted (Ctrl-C)", started, invoked)
+        raise
+    except Exception:
+        _notify("❌ ptcg-il crashed", started, invoked,
+                "\n" + traceback.format_exc()[-1500:])
+        raise
+
+    if rc == 0:
+        _notify("✅ ptcg-il finished", started, invoked)
+    else:
+        _notify(f"❌ ptcg-il exit {rc}", started, invoked)
+    return rc
 
 
 if __name__ == "__main__":

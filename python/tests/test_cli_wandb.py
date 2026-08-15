@@ -6,6 +6,7 @@ off, and several same-named runs from one pipeline invocation.
 """
 
 import argparse
+import datetime
 
 import pytest
 
@@ -27,6 +28,19 @@ def test_entity_and_project_are_overridable():
     args = _parse("--wandb-entity", "RBS123", "--wandb-project", "scratch")
     assert args.wandb_entity == "RBS123"
     assert args.wandb_project == "scratch"
+
+
+class TestExcludeArchBeforeFlag:
+    def test_default_is_no_filter(self):
+        assert _parse().exclude_arch_before is None
+
+    def test_parses_arch_and_date(self):
+        args = _parse("--exclude-arch-before", "1:2026-07-20")
+        assert args.exclude_arch_before == (1, datetime.date(2026, 7, 20))
+
+    def test_rejects_malformed_value(self):
+        with pytest.raises(SystemExit):
+            _parse("--exclude-arch-before", "2026-07-20")
 
 
 class TestRunName:
@@ -76,6 +90,8 @@ def test_cmd_train_exports_the_computed_mode(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "_load_artifacts", lambda d: _ARTIFACTS)
     monkeypatch.setattr(cli, "_build_policy", lambda a, args: object())
+    # The size gate now wraps the build; a bare object() has no state_dict.
+    monkeypatch.setattr(cli, "_model_size_bytes", lambda p: 0)
 
     import ptcg_il.train.loop as loop
 

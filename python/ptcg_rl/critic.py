@@ -37,6 +37,9 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from ptcg_il.featurizer import CLS_OPP_PRIZES, CLS_OUR_PRIZES
+
 logging.basicConfig(level=logging.INFO, format="%(message)s", datefmt="[%X]", handlers=[RichHandler(show_time=False)])
 logger = logging.getLogger(__name__)
 
@@ -141,12 +144,13 @@ def diagnose(
     return d
 
 
-# `cls_feat[11:13]` are the two players' prize counts, each normalised by
-# PRIZE_N (featurizer.py:327-332).  Prizes taken only ever goes up, so their
-# complement is a real measure of game progress — and unlike a turn counter it is
-# already in the features, so no shard rebuild is needed.
-CLS_OUR_PRIZES = 11
-CLS_OPP_PRIZES = 12
+# The two players' prize counts, each normalised by PRIZE_N.  Prizes taken only
+# ever goes up, so their complement is a real measure of game progress — and
+# unlike a turn counter it is already in the features, so no shard rebuild is
+# needed.  `CLS_OUR_PRIZES`/`CLS_OPP_PRIZES` are imported from the featurizer
+# rather than written as literals here: the global block has been reordered once
+# (the absolute-seat columns came out of it), and a stale literal reads a
+# condition flag instead and reports a plausible wrong curve.
 PROGRESS_BUCKETS = 5
 
 

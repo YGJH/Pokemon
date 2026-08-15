@@ -130,3 +130,94 @@ def draw_to_hand(attack) -> int:
     if m:
         return int(m.group(1))
     return 0
+
+
+# ============================================================
+# Bench-damage parsing (for attack_static_row[16])
+# ============================================================
+
+# An attack's ``damage`` field is **always** the number dealt to the Active.
+# Measured over the engine's attack pool, 27 attacks also reach a benched
+# Pokémon and every one of them states that figure only in the oracle text, in
+# one of three forms.  Using the ``damage`` field against a bench slot therefore
+# over-reports for all of them -- Phantom Dive reads 200 against a 70 HP bench
+# Pokémon (ratio 2.0, KO flag set) when the truth is at most 60.
+#
+# Note the `also` forms and the bare form are both needed: Pinpoint Dive is a
+# *pure* snipe whose ``damage`` field is 0 and whose whole output is on the
+# bench.
+_BENCH_DMG_PATS = (
+    # "This attack (also) does 30 damage to 1 of your opponent's Benched Pokemon"
+    re.compile(r"does (\d+) damage to (?:1 of )?(?:your opponent[’']?s )?Benched", re.I),
+    # "... does 50 damage to each (of your opponent's) Benched Pokemon"
+    re.compile(r"does (\d+) damage to each (?:of your opponent[’']?s )?Benched", re.I),
+    re.compile(r"does (\d+) damage to each Benched", re.I),
+)
+
+#: A damage counter is 10 HP.  "Put N damage counters on your opponent's
+#: Benched Pokemon in any way you like" means up to N*10 on a *single* target,
+#: which is the number a KO check needs.
+_BENCH_COUNTER_PAT = re.compile(
+    r"put (\d+) damage counters? on (?:your opponent[’']?s )?Benched", re.I
+)
+_BENCH_COUNTER_WORD_PAT = re.compile(
+    r"put (a|one|two|three|four|five|six) damage counters? on "
+    r"(?:your opponent[’']?s )?Benched", re.I
+)
+_WORD_TO_INT = {"a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+
+def attack_bench_damage(attack) -> int:
+    """Damage this attack can put on a **single benched** Pokémon, in HP.
+
+    Zero when the attack does not reach the bench.  Deliberately the *maximum*
+    a single bench target can take: for "put N damage counters ... in any way
+    you like" that is all N counters aimed at one Pokémon, which is exactly the
+    quantity a "can I KO it" check needs.
+
+    Text that merely *mentions* the bench -- moving Energy to a benched Pokémon,
+    searching a Pokémon onto the bench -- must not match, so the patterns all
+    require an explicit damage or damage-counter verb.
+    """
+    text = getattr(attack, "text", "") or ""
+    if not text:
+        return 0
+    for pat in _BENCH_DMG_PATS:
+        m = pat.search(text)
+        if m:
+            return int(m.group(1))
+    m = _BENCH_COUNTER_PAT.search(text)
+    if m:
+        return int(m.group(1)) * 10
+    m = _BENCH_COUNTER_WORD_PAT.search(text)
+    if m:
+        return _WORD_TO_INT[m.group(1).lower()] * 10
+    return 0
+
+
+class _TextCarrier:
+    """Adapts a blob of text to the ``.text`` interface the parsers expect."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+def card_draw_counts(card) -> tuple[int, int]:
+    """``(draw_fixed, draw_to_hand)`` over every ``card.skills[].text``.
+
+    Trainers keep their oracle text in ``skills[].text`` exactly as Pokémon
+    abilities do -- Boss's Orders and Colress's Tenacity are ``cardType`` 3 with
+    one skill each -- so the two attack parsers apply unchanged.  Measured over
+    the engine's 1267 cards: 42 mention "draw" and **38 (90%) yield a numeric
+    count**; the four that do not (Judge, Frosmoth, Meddling Memo, Mystery
+    Garden) phrase it in forms the patterns deliberately skip and fall back to
+    the binary ``draw`` keyword already in the ability row.
+
+    This is what lets a *per-option* deck cost be a number rather than a flag:
+    without it the featurizer can only say "this card draws something".
+    """
+    skills = getattr(card, "skills", None) or []
+    blob = _TextCarrier("\n".join((getattr(s, "text", "") or "") for s in skills))
+    return draw_fixed(blob), draw_to_hand(blob)

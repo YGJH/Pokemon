@@ -30,10 +30,13 @@ table, exactly as the ``bel_*`` labels are stored sparsely and densified here.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
+import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import Iterator
 
@@ -68,6 +71,83 @@ def repack_dirname(archetype_self: int, split: str) -> str:
     return REPACK_DIRNAME_TEMPLATE.format(arch=int(archetype_self), split=split)
 
 
+#: Offset between the UUID epoch (1582-10-15) and the Unix epoch, in 100-ns
+#: ticks — for decoding the timestamp embedded in a v1 UUID.
+_GREGORIAN_OFFSET_100NS = 0x01B21DD213814000
+
+_ID_RE = re.compile(rb'"id"\s*:\s*"([0-9a-fA-F-]{36})"')
+
+
+def _episode_date_from_json(path: Path) -> datetime.date | None:
+    """Play date embedded in an episode's UUIDv1 ``id``; None when unreadable.
+
+    The episode JSON has no explicit play-date field, but Kaggle stamps every
+    episode with a UUIDv1 at creation, and a v1 UUID embeds its own creation
+    timestamp.  (Cross-checked against the download-day layout: 123/123
+    sampled episodes landed on their directory's date.)
+
+    The ``id`` sits within the first ~150 bytes, so a 4 KB head read avoids
+    parsing megabytes of step history; a full parse is the fallback.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(4096)
+        m = _ID_RE.search(head)
+        if m is not None:
+            raw_id = m.group(1).decode()
+        else:
+            with path.open() as fh:
+                raw_id = json.load(fh).get("id")
+            if not isinstance(raw_id, str):
+                return None
+        u = uuid.UUID(raw_id)
+        if u.version != 1:
+            return None
+        return datetime.datetime.fromtimestamp(
+            (u.time - _GREGORIAN_OFFSET_100NS) / 1e7, tz=datetime.timezone.utc
+        ).date()
+    except (OSError, ValueError):
+        return None
+
+
+def episode_dates(raw_dir: str | Path) -> dict[str, datetime.date]:
+    """Map episode id → play date, read from each episode JSON's UUIDv1 id.
+
+    Falls back to the download-day directory name (``raw/YYYY-MM-DD/``) when
+    a file carries no usable id; non-date directory names are ignored.
+    """
+    out: dict[str, datetime.date] = {}
+    raw_dir = Path(raw_dir)
+    if not raw_dir.is_dir():
+        return out
+    for day_dir in raw_dir.iterdir():
+        if not day_dir.is_dir():
+            continue
+        try:
+            day = datetime.date.fromisoformat(day_dir.name)
+        except ValueError:
+            continue
+        for f in day_dir.iterdir():
+            out[f.stem] = _episode_date_from_json(f) or day
+    return out
+
+
+def arch_age_drop_mask(
+    meta: pd.DataFrame,
+    arch: int,
+    cutoff: datetime.date,
+    ep_dates: dict[str, datetime.date],
+) -> pd.Series:
+    """Boolean mask — True for rows of *arch* whose episode predates *cutoff*.
+
+    Rows whose episode has no raw file (no known date) are kept: an unknown
+    date is not an old date, and dropping on suspicion would silently shrink
+    the corpus if raw/ is ever cleaned up before shards/ are rebuilt.
+    """
+    days = pd.to_datetime(meta["episode_id"].map(ep_dates))
+    return (meta["archetype_self"] == arch) & (days < pd.Timestamp(cutoff))
+
+
 # ``MADV_RANDOM`` on these mappings was tried and **rejected on measurement**.
 # It does what it claims — physical reads fall ~10x, 1585 -> 156 KiB/sample —
 # but it is slower in every paired comparison, because small synchronous random
@@ -82,7 +162,11 @@ def repack_dirname(archetype_self: int, split: str) -> str:
 # ============================================================
 ALPHA_CTX: float = 0.5
 ALPHA_ARCH: float = 0.5
-W_LOST: float = 0.6
+#: Signed outcome weight: a lost-game decision pushes its expert action's
+#: probability *down* at 0.3x the rate a won-game decision pushes its up.
+#: Kept small because per-game outcome is a noisy proxy for move quality
+#: (TCG variance), so imitation stays dominant at 1 : 0.3.
+W_LOST: float = -0.3
 
 # Keys that should stay on CPU as int64 (indices, masks, types)
 _INT_KEYS = frozenset({
@@ -90,34 +174,23 @@ _INT_KEYS = frozenset({
     "opt_type", "opt_src_idx", "opt_tgt_idx", "opt_bench_idx", "opt_group",
     "sel_type", "sel_ctx",
     "action_idx", "minCount", "maxCount", "action_len", "stop_column",
-    "log_len",
 } | {id_key for id_key, _ in CARD_FEAT_SOURCES.values()})
 
 # Keys that should be float32 (can be cast to bf16)
 _FLOAT_KEYS = frozenset({
     "cls_feat", "poke_feat", "hand_feat", "sum_feat",
     "stadium_present", "opt_scalar",
-    "value_target", "sample_weight", "log_feat",
+    "value_target", "sample_weight",
     "poke_card_feat", "hand_card_feat", "stadium_card_feat",
     "context_card_feat", "effect_card_feat",
     "discard_card_feat", "prize_card_feat",
     "opt_card_feat", "opt_attack_feat",
-    "log_card_feat",
 })
 
 # Boolean masks
 _BOOL_KEYS = frozenset({
     "tok_mask", "opt_mask", "discard_mask",
-    "bel_valid", "bel_hand_valid",
 })
-
-# Belief labels are stored sparsely in the shards (index/count pairs) because a
-# 60-card decklist touches at most 26 of ~300 vocab slots, so dense float32[V]
-# rows would be ~97% zeros and would dominate shard size.  They are densified
-# per sample here, on the way into the batch.
-_BELIEF_SPARSE = (("bel_deck", "bel_deck_idx", "bel_deck_cnt"),
-                  ("bel_hidden", "bel_hidden_idx", "bel_hidden_cnt"),
-                  ("bel_hand", "bel_hand_idx", "bel_hand_cnt"))
 
 
 def compute_sample_weights(
@@ -129,7 +202,7 @@ def compute_sample_weights(
     """Compute per-sample weights from meta.parquet columns (C.3 formula).
 
     ``w = w_ctx[sel_ctx] * w_arch[archetype_self] * w_outcome * w_skill``,
-    normalized so that ``mean(weights) ≈ 1.0`` over the split.
+    normalized so that ``mean(|weights|) ≈ 1.0`` over the split.
 
     ``w_skill`` is the ``skill_w`` column — ``exp(20 * (wilson_lb - 0.5))`` of
     the row's team, see :func:`ptcg_mine.stats.skill_weight`.  It is what
@@ -154,7 +227,9 @@ def compute_sample_weights(
     alpha_arch : float
         Exponent for archetype balancing (0.5).
     w_lost : float
-        Weight multiplier for lost-game decisions (0.6).
+        Weight multiplier for lost-game decisions (-0.3).  Negative values
+        make the loss *decrease* the expert action's probability on those
+        rows instead of imitating it; zero drops lost games from the loss.
 
     Returns
     -------
@@ -195,7 +270,13 @@ def compute_sample_weights(
         w_skill = np.ones(n, dtype=np.float64)
 
     weights = w_ctx * w_arch * w_out * w_skill
-    weights /= weights.mean()  # normalize to mean ≈ 1.0
+    # Normalize by the mean *magnitude*.  With a signed w_lost the plain mean
+    # can approach (or cross) zero, which would rescale the loss by a
+    # near-infinite or sign-flipping factor; for non-negative weights this is
+    # exactly the old mean-normalization.
+    scale = np.abs(weights).mean()
+    if scale > 0:
+        weights /= scale  # normalize to mean-magnitude ≈ 1.0
 
     return weights.astype(np.float32)
 
@@ -497,6 +578,17 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         single model trained across all of them is fitting several unrelated
         policies at once.  ``None`` (default) keeps every deck, the original
         behaviour.
+    exclude_arch_before : tuple[int, datetime.date], optional
+        ``(archetype_self, cutoff)`` — drop that archetype's rows whose
+        episode predates *cutoff* (play dates are decoded from the UUIDv1
+        ``id`` inside each raw episode JSON).  Applied to whichever split this
+        dataset loads; episode-level, so the 80/10/10 split is unaffected.
+    raw_dir : str or Path, optional
+        Where episode dates are read from.  Defaults to ``data_dir``'s
+        sibling ``raw/``.
+    w_lost : float
+        Outcome weight for lost-game rows, forwarded to
+        :func:`compute_sample_weights` (default ``W_LOST``).
     """
 
     def __init__(
@@ -506,19 +598,13 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         shuffle: bool = False,
         seed: int = 42,
         archetype_self: int | None = None,
+        exclude_arch_before: tuple[int, datetime.date] | None = None,
+        raw_dir: str | Path | None = None,
+        w_lost: float = W_LOST,
     ):
         data_dir = Path(data_dir)
         self.split = split
         self.archetype_self = archetype_self
-
-        # n_all_cards — total engine cards, needed to densify sparse belief
-        # labels.  Read from engine_card_features.npy (max engine card id + 1).
-        self.n_all_cards: int = 0
-        ecf_path = data_dir / "engine_card_features.npy"
-        ecf: dict = {}
-        if ecf_path.exists():
-            ecf = np.load(ecf_path, allow_pickle=True).item()
-            self.n_all_cards = max(ecf.keys()) + 1 if ecf else 0
 
         # The dataset does *not* build the static card/attack tables.  It used
         # to, to re-gather the ``*_card_feat`` tensors per sample; that gather
@@ -539,6 +625,28 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         if len(self.meta) == 0:
             raise ValueError(f"No samples found for split '{split}' in meta.parquet")
 
+        # Optional per-archetype age filter, before the deck filter and the
+        # sample weights so both see the same row set.  Whole episodes drop
+        # together (they share a date), so the split stays episode-level.
+        if exclude_arch_before is not None:
+            arch, cutoff = exclude_arch_before
+            ep_dates = episode_dates(
+                raw_dir if raw_dir is not None else data_dir.parent / "raw"
+            )
+            drop = arch_age_drop_mask(self.meta, arch, cutoff, ep_dates)
+            n_dropped = int(drop.sum())
+            self.meta = self.meta[~drop].reset_index(drop=True)
+            logger.info(
+                "Excluded %d archetype-%d row(s) from the %s split (episodes "
+                "before %s); %d row(s) kept.",
+                n_dropped, arch, self.split, cutoff, len(self.meta),
+            )
+            if len(self.meta) == 0:
+                raise ValueError(
+                    f"exclude_arch_before={exclude_arch_before} removed every "
+                    f"row of split '{split}'"
+                )
+
         # Optional per-deck filter.  Applied after the split filter so the
         # 80/10/10 episode-level split still holds within each deck.
         if archetype_self is not None:
@@ -557,7 +665,7 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
                 )
 
         # Compute sample weights from meta columns (C.3)
-        self.sample_weights = compute_sample_weights(self.meta)
+        self.sample_weights = compute_sample_weights(self.meta, w_lost=w_lost)
         self.meta["sample_weight"] = self.sample_weights
 
         # Shuffle row order if requested
@@ -585,7 +693,7 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
         self._check_card_id_coverage()
 
     #: Keys the model gathers for itself, from the ids in ``CARD_FEAT_SOURCES``.
-    _DERIVED_FEAT_KEYS = frozenset(CARD_FEAT_SOURCES) | {"log_card_feat"}
+    _DERIVED_FEAT_KEYS = frozenset(CARD_FEAT_SOURCES)
 
     def _check_card_id_coverage(self) -> None:
         """Refuse a shard that has ``*_card_feat`` but not the id behind it.
@@ -793,49 +901,7 @@ class ShardDataset(Dataset[dict[str, torch.Tensor]]):
             float(row["sample_weight"]), dtype=torch.float32
         )
 
-        self._densify_belief(sample)
         return sample
-
-    def _densify_belief(self, sample: dict[str, torch.Tensor]) -> None:
-        """Sparse belief labels -> normalised distributions over the vocab.
-
-        Replaces each ``bel_*_idx``/``bel_*_cnt`` pair with a single
-        ``float32[V]`` row summing to 1 (or to 0 when the label is absent, which
-        the ``bel_*_valid`` masks flag).  Rows are *not* renormalised when empty
-        -- an all-zero row must stay all-zero, or a missing label would silently
-        become a uniform target.
-
-        Shards written before belief labels existed simply have no ``bel_*``
-        keys; those samples get zero-filled rows and ``bel_valid=False``, so an
-        old corpus trains exactly as it did before.
-        """
-        V = self.n_all_cards
-        for dense_key, idx_key, cnt_key in _BELIEF_SPARSE:
-            # No vocab.json => no way to size the row.  Fall through to the
-            # zero-fill branch and mark the label invalid below, rather than
-            # emitting a length-1 row the belief head would reject.
-            if idx_key not in sample or V is None:
-                sample[dense_key] = torch.zeros(V or 1, dtype=torch.float32)
-                sample.pop(idx_key, None)
-                sample.pop(cnt_key, None)
-                continue
-            idx = sample.pop(idx_key).long().clamp_(0, V - 1)
-            cnt = sample.pop(cnt_key).float()
-            row = torch.zeros(V, dtype=torch.float32)
-            row.scatter_add_(0, idx, cnt)
-            row[0] = 0.0  # PAD slot: padded entries land here carrying count 0
-            total = row.sum()
-            if total > 0:
-                row /= total
-            sample[dense_key] = row
-
-        for key, dtype in (("bel_valid", torch.bool), ("bel_hand_valid", torch.bool),
-                           ("bel_arch", torch.long)):
-            if key not in sample or V is None:
-                fill = -1 if dtype is torch.long else False
-                sample[key] = torch.tensor(fill, dtype=dtype)
-            else:
-                sample[key] = sample[key].to(dtype)
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         for i in range(len(self)):

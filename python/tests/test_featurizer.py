@@ -13,6 +13,8 @@ import pytest
 from ptcg_il.featurizer import featurize as _featurize_raw
 from ptcg_il.featurizer import (
     ATKCOST_N,
+    CLS_AM_I_FIRST,
+    CLS_TOSS_UNDECIDED,
     COUNT_N,
     D_MAX,
     DECK_N,
@@ -29,8 +31,6 @@ from ptcg_il.featurizer import (
     H_MAX,
     HAND_N,
     HP_N,
-    L_LOG_MAX,
-    LOG_FEAT_DIM,
     L_STATE,
     O_MAX,
     PAD_CARD,
@@ -151,7 +151,7 @@ class TestPokemonTokens:
     """Step 1: Verify pokemon token shapes, slot layout, and feature values."""
 
     def test_shapes(self):
-        """poke_card_feat.shape == (12, F_CARD), poke_feat.shape == (12, 26)."""
+        """poke_card_feat.shape == (12, F_CARD), poke_feat.shape == (12, F_POKE)."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)  # MAIN select with visible mons
@@ -468,10 +468,10 @@ class TestClsFeatures:
 
         # Step 8 P0: select.type=0 (MAIN)
         sel_type = obs["select"]["type"]
-        assert result["cls_feat"][13 + sel_type] == 1.0
-        # Other positions in 13:24 should be 0
-        for i in range(13, 24):
-            if i != 13 + sel_type:
+        assert result["cls_feat"][11 + sel_type] == 1.0
+        # Other positions in 11:22 should be 0
+        for i in range(11, 22):
+            if i != 11 + sel_type:
                 assert result["cls_feat"][i] == 0.0, f"cls_feat[{i}] should be 0"
 
     def test_select_context_onehot(self):
@@ -483,10 +483,10 @@ class TestClsFeatures:
         result = featurize(obs, vocab, action)
 
         sel_ctx = obs["select"]["context"]
-        assert result["cls_feat"][24 + sel_ctx] == 1.0
+        assert result["cls_feat"][22 + sel_ctx] == 1.0
 
-    def test_turn_and_your_index(self):
-        """Verify turn/TURN_N and yourIndex features."""
+    def test_turn_features(self):
+        """Verify turn/TURN_N and turn-parity features."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
@@ -496,21 +496,26 @@ class TestClsFeatures:
         state = obs["current"]
         assert result["cls_feat"][0] == pytest.approx(float(state["turn"]) / TURN_N)
         assert result["cls_feat"][1] == float(state["turn"] % 2)
-        assert result["cls_feat"][2] == float(state["yourIndex"])
 
-    def test_first_player_onehot(self):
-        """Verify firstPlayer one-hot over {-1,0,1}."""
+    def test_turn_order_is_derived_not_the_raw_seat(self):
+        """``am_i_first`` replaces the old yourIndex / firstPlayer one-hot pair.
+
+        Both of those were absolute-seat quantities; only their XOR carried any
+        information, and seat 0 wins the toss in effectively every corpus game,
+        so the seat stood in for the turn order.  See
+        ``test_featurizer_seat_invariance.py`` for the invariance guard itself.
+        """
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
 
         result = featurize(obs, vocab, action)
 
-        fp = obs["current"]["firstPlayer"]
-        assert fp == 1  # In this episode, player 1 goes first
-        assert result["cls_feat"][4] == 0.0  # -1 slot
-        assert result["cls_feat"][5] == 0.0  # 0 slot
-        assert result["cls_feat"][6] == 1.0  # 1 slot
+        state = obs["current"]
+        assert state["firstPlayer"] == 1  # In this episode, player 1 goes first
+        assert state["yourIndex"] == 0    # ...and this observation is player 0's
+        assert result["cls_feat"][CLS_AM_I_FIRST] == 0.0  # so: moving second
+        assert result["cls_feat"][CLS_TOSS_UNDECIDED] == 0.0
 
     def test_per_turn_flags(self):
         """Verify supporterPlayed, stadiumPlayed, energyAttached, retreated."""
@@ -521,13 +526,13 @@ class TestClsFeatures:
         result = featurize(obs, vocab, action)
 
         # These are booleans → 0.0 or 1.0
-        for idx in [7, 8, 9, 10]:
+        for idx in [5, 6, 7, 8]:
             assert result["cls_feat"][idx] in (0.0, 1.0), (
                 f"cls_feat[{idx}] should be 0 or 1, got {result['cls_feat'][idx]}"
             )
 
     def test_condition_flags_in_cls(self):
-        """my-active conditions at [77:82], opp-active conditions at [82:87]."""
+        """my-active conditions at [75:80], opp-active conditions at [80:85]."""
         ep = _load_episode()
         vocab = _build_test_vocab(ep)
         obs, action = _get_active_step(ep, 8, 0)
@@ -535,7 +540,7 @@ class TestClsFeatures:
         result = featurize(obs, vocab, action)
 
         # Should be 5 booleans each
-        for idx in range(77, 87):
+        for idx in range(75, 85):
             assert result["cls_feat"][idx] in (0.0, 1.0), (
                 f"cls_feat[{idx}] should be 0 or 1, got {result['cls_feat'][idx]}"
             )
@@ -987,10 +992,6 @@ class TestEndToEnd:
         "value_target",
         "sample_weight",
         "stop_column",
-        # Logs (belief module)
-        "log_feat",
-        "log_mask",
-        "log_len",
     }
 
     def test_out_of_vocab_cards_still_carry_their_features(self):
@@ -1036,27 +1037,6 @@ class TestEndToEnd:
                 break
 
         assert n_checked > 0, "fixture offered no hand card to evict"
-
-    def test_log_card_feat_shape(self):
-        """log_card_feat is [L_LOG_MAX, F_CARD] — one card-feature row per log entry.
-
-        Regression: the card-id column was sliced with the *batched* form
-        ``log_feat[:, :, 2]`` (as ``model/belief.py`` does on ``[B, L, 6]``),
-        but ``featurize`` emits per-sample ``log_feat[L_LOG_MAX, LOG_FEAT_DIM]``,
-        so the slice raised IndexError for every decision point.
-        """
-        ep = _load_episode()
-        vocab = _build_test_vocab_with_attacks(ep)
-
-        count = 0
-        for obs, action in self._iter_active_decisions(ep):
-            result = featurize(obs, vocab, action)
-            assert result["log_feat"].shape == (L_LOG_MAX, LOG_FEAT_DIM)
-            assert result["log_card_feat"].shape == (L_LOG_MAX, F_CARD)
-            assert result["log_card_feat"].dtype == np.float32
-            count += 1
-
-        assert count > 0, "No ACTIVE decisions found in sample episode"
 
     def _iter_active_decisions(self, ep: dict):
         """Yield (obs, action) for all ACTIVE decisions in the episode."""
@@ -1135,9 +1115,6 @@ class TestEndToEnd:
             "sel_ctx": (),
             "value_target": (),
             "sample_weight": (),
-            "log_feat": (L_LOG_MAX, LOG_FEAT_DIM),
-            "log_mask": (L_LOG_MAX,),
-            "log_card_feat": (L_LOG_MAX, F_CARD),
         }
 
         for obs, action in self._iter_active_decisions(ep):
@@ -1171,7 +1148,6 @@ class TestEndToEnd:
                 "context_card_feat", "effect_card_feat",
                 "discard_card_feat", "prize_card_feat",
                 "opt_card_feat", "opt_attack_feat",
-                "log_feat", "log_card_feat",
             ]:
                 assert result[key].dtype == np.float32, (
                     f"{key} dtype: expected float32, got {result[key].dtype}"
@@ -1182,14 +1158,14 @@ class TestEndToEnd:
                 "tok_type", "tok_owner", "tok_zone",
                 "opt_type", "opt_src_idx", "opt_tgt_idx",
                 "action_idx", "action_len", "minCount", "maxCount",
-                "sel_type", "sel_ctx", "log_len",
+                "sel_type", "sel_ctx",
             ]:
                 assert result[key].dtype == np.int64, (
                     f"{key} dtype: expected int64, got {result[key].dtype}"
                 )
 
             # Bool tensors
-            for key in ["discard_mask", "tok_mask", "opt_mask", "log_mask"]:
+            for key in ["discard_mask", "tok_mask", "opt_mask"]:
                 assert result[key].dtype == bool, (
                     f"{key} dtype: expected bool, got {result[key].dtype}"
                 )
@@ -1607,8 +1583,7 @@ class TestOptCardId:
 def _with_card_feats(result, engine_card_features=None, engine_attack_features=None):
     """Add the ``*_card_feat`` tensors ``Policy._gather_card_feats`` would."""
     from ptcg_il.featurizer import (
-        CARD_FEAT_SOURCES, LOG_CARD_ID_COLUMN, build_static_table,
-        gather_static_feats,
+        CARD_FEAT_SOURCES, build_static_table, gather_static_feats,
     )
 
     tables = {
@@ -1618,10 +1593,6 @@ def _with_card_feats(result, engine_card_features=None, engine_attack_features=N
     for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
         if id_key in result:
             result[feat_key] = gather_static_feats(result[id_key], tables[kind])
-    if "log_feat" in result:
-        result["log_card_feat"] = gather_static_feats(
-            result["log_feat"][:, LOG_CARD_ID_COLUMN].astype(np.int64), tables["card"]
-        )
     return result
 
 
@@ -2206,3 +2177,401 @@ class TestAffordabilityTolerance:
             "my_ratio stayed 0.0 with an exactly-affordable attack"
         )
         assert can_ko == 0.0
+
+
+class TestSlotKOBlock:
+    """Every Pokemon state token must carry its own KO reading.
+
+    ``poke_feat`` held HP, energy and conditions but no damage or KO field, so
+    the 12 tokens the encoder attends over were blind to the single fact that
+    decides most Pokemon TCG turns: does this thing die, and can I kill it.
+    ``_ko_pressure`` answered it only for the Active pair (into ``cls_feat``),
+    and ``_card_target_preview`` only for options that name a Pokemon -- so
+    every other option type saw a board with the KO math stripped out.
+
+    Polarity flips by owner, matching ``_card_target_preview``:
+      * my slots 0-5    -- their Active's damage against this slot; danger.
+      * their slots 6-11 -- my Active's affordable damage against it; opportunity.
+    """
+
+    @staticmethod
+    def _block(my_active, my_bench, opp_active, opp_bench):
+        from ptcg_il.featurizer import (
+            _build_poke_tokens, _feat_gatherer, _slot_ko_block,
+        )
+        obs = _obs_with_boards(
+            my_active=my_active, my_bench=my_bench,
+            opp_active=opp_active, opp_bench=opp_bench, options=[],
+        )
+        poke_id, poke_feat, _, _ = _build_poke_tokens(obs["current"], 0)
+        poke_card_feat = _feat_gatherer(_engine_card_features(), F_CARD)(poke_id)
+        _slot_ko_block(poke_card_feat, poke_feat)
+        return poke_feat
+
+    def test_exported_columns_name_the_right_slots(self):
+        """The constants are an independent claim, not an alias of the writes."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        assert POKE_KO_RATIO_COL == 26
+        assert POKE_KO_FLAG_COL == 27
+        assert F_POKE == 29, "F_POKE must hold the KO block + counters-to-KO"
+
+    def test_ko_flag_is_set_when_damage_exactly_equals_hp(self):
+        """Solrock's 70 into a 70-HP Lunatone is lethal, not one short."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(675, 10, 70)],                  # Lunatone at 70 hp
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],   # Solrock, 70 for {F}
+            opp_bench=[],
+        )
+        assert np.isclose(pf[0][POKE_KO_RATIO_COL], 1.0)
+        assert pf[0][POKE_KO_FLAG_COL] == 1.0
+
+    def test_exact_lethality_survives_the_float32_hp_round_trip(self):
+        """The ``_ENERGY_EPS`` trap again, one step downstream.
+
+        HP reaches the comparison as ``float32(hp/HP_N) * HP_N`` and damage as
+        ``float32(dmg/ATKDMG_N) * ATKDMG_N``, so an *exactly* lethal attack
+        lands either side of 1.0 on rounding alone.
+
+        This fixture is the measured wrong-rounding case: Riolu's 30 doubles to
+        60 on Dunsparce's {F} weakness, against exactly 60 HP.  The damage comes
+        back as 60.00000163912773 and the HP as 60.000002384185791, so the ratio
+        is 0.9999999875823662 -- and a bare ``>= 1.0`` silently reports that a
+        lethal attack is survivable.  Removing ``_KO_EPS`` must fail here.
+        """
+        from ptcg_il.featurizer import (
+            HP_N, POKE_KO_FLAG_COL, _best_damage, _build_poke_tokens,
+            _feat_gatherer,
+        )
+
+        my_active = [_poke_e(305, 10, 60)]                     # Dunsparce, weak {F}
+        opp_active = [_poke_e(677, 20, 80, [_F_ENERGY])]       # Riolu, 30 -> 60
+
+        # Guard the fixture at the precision the helper compares at.  Reading
+        # poke_feat back would not work: 0.9999999875823662 rounds to exactly
+        # 1.0 once stored as float32, which is why the bug hides so well.
+        obs = _obs_with_boards(my_active, [], opp_active, [], [])
+        poke_id, pf_raw, _, _ = _build_poke_tokens(obs["current"], 0)
+        pcf = _feat_gatherer(_engine_card_features(), F_CARD)(poke_id)
+        dmg = _best_damage(pcf[6], pcf[0], None, require_affordable=False)
+        hp = float(pf_raw[0][0]) * HP_N
+        assert dmg / hp < 1.0, (
+            "fixture no longer reproduces the wrong-rounding case -- if the "
+            "featurizer's divisors changed, re-derive it before trusting this"
+        )
+
+        pf = self._block(my_active, [], opp_active, [])
+        assert pf[0][POKE_KO_FLAG_COL] == 1.0, (
+            "an exactly-lethal hit read as survivable -- fp32 round-trip"
+        )
+
+    def test_exact_lethality_holds_for_every_attacker(self):
+        """Guards against a tolerance that happens to fix one fixture.
+
+        Each pair sets the defender's HP to that attacker's exact damage, so
+        every case is lethal by construction.  Only the 60 HP one rounds the
+        wrong way today; the others must not regress either.
+        """
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL
+
+        n_checked = 0
+        # (attacker id, energies needed, exact damage onto {F}-weak Dunsparce)
+        for atk, n_energy, lethal in ((677, 1, 60), (675, 2, 100), (676, 1, 140)):
+            for hp, expect in ((lethal, 1.0), (lethal + 10, 0.0)):
+                pf = self._block(
+                    my_active=[_poke_e(305, 10, hp)],
+                    my_bench=[],
+                    opp_active=[_poke_e(atk, 20, 110, [_F_ENERGY] * n_energy)],
+                    opp_bench=[],
+                )
+                assert pf[0][POKE_KO_FLAG_COL] == expect, (
+                    f"attacker {atk} ({lethal} dmg) vs {hp} HP"
+                )
+                n_checked += 1
+        assert n_checked == 6, "sweep did not run"
+
+    def test_ko_flag_clears_one_step_above_lethal(self):
+        """Pins the >= boundary: 80 HP survives the same 70 damage."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(675, 10, 80)],                  # Lunatone at 80 hp
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],
+            opp_bench=[],
+        )
+        assert np.isclose(pf[0][POKE_KO_RATIO_COL], 70.0 / 80.0)
+        assert pf[0][POKE_KO_FLAG_COL] == 0.0
+
+    def test_weakness_turns_a_survivable_hit_lethal(self):
+        """Proves the block routes through _effective_damage, not raw damage.
+
+        Dunsparce is weak to {F} and Solrock is a {F} attacker, so 70 doubles to
+        140.  At 100 HP the raw number survives and the doubled one does not.
+        """
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(305, 10, 100)],                 # Dunsparce, weak {F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],   # Solrock {F}, 70
+            opp_bench=[],
+        )
+        assert np.isclose(pf[0][POKE_KO_RATIO_COL], 140.0 / 100.0)
+        assert pf[0][POKE_KO_FLAG_COL] == 1.0, "weakness was not applied"
+
+    def test_polarity_my_side_is_danger_their_side_is_opportunity(self):
+        """Swapping the two branches must break this test.
+
+        Their Solrock kills my 70-HP Lunatone; my Lunatone (no energy) cannot
+        touch their Solrock.  So slot 0 flags and slot 6 does not -- the
+        readings are not interchangeable.
+        """
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(675, 10, 70)],                  # no energy attached
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],
+            opp_bench=[],
+        )
+        assert pf[0][POKE_KO_FLAG_COL] == 1.0, "my Active should read as dying"
+        assert pf[6][POKE_KO_FLAG_COL] == 0.0, "their Active should not read as dying"
+        assert pf[6][POKE_KO_RATIO_COL] == 0.0, (
+            "an unaffordable attack must score 0 on their side"
+        )
+
+    def test_my_side_ignores_affordability(self):
+        """Their energy is theirs to spend next turn -- matches _ko_pressure."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL
+
+        stripped = self._block(
+            my_active=[_poke_e(675, 10, 70)],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],                # zero energy attached
+            opp_bench=[],
+        )
+        assert stripped[0][POKE_KO_FLAG_COL] == 1.0, (
+            "incoming damage must not require the opponent to have paid yet"
+        )
+
+    def test_their_side_requires_affordability(self):
+        """My reach is limited by energy I have actually attached."""
+        from ptcg_il.featurizer import POKE_KO_RATIO_COL
+
+        broke = self._block(
+            my_active=[_poke_e(675, 10, 110)],                 # Lunatone, no energy
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[],
+        )
+        paid = self._block(
+            my_active=[_poke_e(675, 10, 110, [_F_ENERGY] * 2)],  # 50 for {F}{F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[],
+        )
+        assert broke[6][POKE_KO_RATIO_COL] == 0.0
+        assert np.isclose(paid[6][POKE_KO_RATIO_COL], 50.0 / 110.0), (
+            "an affordable attack must score on their side"
+        )
+
+    def test_my_bench_is_evaluated_as_gustable(self):
+        """A bench slot that dies on arrival must say so, not read 0."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(676, 10, 110)],                 # a healthy Active
+            my_bench=[_poke_e(675, 11, 70)],                   # Lunatone at 70 hp
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],   # Solrock, 70 for {F}
+            opp_bench=[],
+        )
+        assert np.isclose(pf[1][POKE_KO_RATIO_COL], 1.0)
+        assert pf[1][POKE_KO_FLAG_COL] == 1.0, (
+            "benched Pokemon must be scored as if gusted into the Active spot"
+        )
+
+    def test_their_bench_reads_my_reach(self):
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL
+
+        pf = self._block(
+            my_active=[_poke_e(676, 10, 110, [_F_ENERGY])],    # Solrock, 70 for {F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110)],
+            opp_bench=[_poke_e(675, 21, 70)],                  # Lunatone at 70 hp
+        )
+        assert pf[7][POKE_KO_FLAG_COL] == 1.0, (
+            "their bench must carry my can-I-kill-it reading"
+        )
+
+    def test_ratio_is_clipped_at_two(self):
+        """Overkill saturates like every other ratio in the featurizer."""
+        from ptcg_il.featurizer import POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(305, 10, 20)],                  # Dunsparce, weak {F}
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],   # 70 x2 = 140 vs 20 hp
+            opp_bench=[],
+        )
+        assert pf[0][POKE_KO_RATIO_COL] == 2.0
+
+    def test_empty_slots_stay_all_zero(self):
+        """PAD slots keep the no-information signal the rest of the row uses."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, POKE_KO_RATIO_COL
+
+        pf = self._block(
+            my_active=[_poke_e(675, 10, 70)],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],
+            opp_bench=[],
+        )
+        n_checked = 0
+        for s in list(range(1, 6)) + list(range(7, 12)):
+            assert pf[s][POKE_KO_RATIO_COL] == 0.0
+            assert pf[s][POKE_KO_FLAG_COL] == 0.0
+            n_checked += 1
+        assert n_checked == 10, "fixture did not exercise the empty slots"
+
+    def test_featurize_emits_the_block_end_to_end(self):
+        """The helper must actually be wired into featurize(), not just exist."""
+        from ptcg_il.featurizer import POKE_KO_FLAG_COL, featurize
+
+        obs = _obs_with_boards(
+            my_active=[_poke_e(675, 10, 70)],
+            my_bench=[],
+            opp_active=[_poke_e(676, 20, 110, [_F_ENERGY])],
+            opp_bench=[],
+            options=[],
+        )
+        out = featurize(
+            obs, _build_test_vocab(_load_episode()), [0],
+            engine_card_features=_engine_card_features(),
+        )
+        assert out["poke_feat"].shape[-1] == F_POKE
+        assert out["poke_feat"][0][POKE_KO_FLAG_COL] == 1.0, (
+            "_slot_ko_block is not called from featurize()"
+        )
+
+
+class TestExactLethalityAtEveryKOSite:
+    """The fp32 round-trip trap, at all five KO comparisons in this module.
+
+    HP reaches each comparison as ``float32(hp/HP_N) * HP_N`` and damage as
+    ``float32(dmg/ATKDMG_N) * ATKDMG_N``, so an *exactly lethal* attack lands
+    either side of 1.0 on rounding alone.  ``_slot_ko_block`` was written with
+    ``_KO_EPS`` from the start; the four older comparisons compared bare and
+    reported "survives" on a lethal hit.
+
+    Measured: 769 distinct (attackId, exactly-lethal HP) pairs round the wrong
+    way through ``_attack_damage_ratio`` alone, so this is pervasive rather than
+    a corner case.
+
+    Every fixture below asserts the pre-tolerance ratio is genuinely < 1.0
+    first, so removing ``_KO_EPS`` must fail rather than pass vacuously.
+    """
+
+    #: Riolu's 30 doubles to 60 on Dunsparce's {F} weakness; 60 HP is exact.
+    _LETHAL_HP = 60
+
+    @staticmethod
+    def _boards(my_active, my_bench, opp_active, opp_bench):
+        from ptcg_il.featurizer import _build_poke_tokens, _feat_gatherer
+        obs = _obs_with_boards(my_active, my_bench, opp_active, opp_bench, [])
+        poke_id, poke_feat, _, _ = _build_poke_tokens(obs["current"], 0)
+        return _feat_gatherer(_engine_card_features(), F_CARD)(poke_id), poke_feat
+
+    def test_ko_pressure_my_side_flags_an_exactly_lethal_attack(self):
+        """``cls_feat[92]`` -- can I KO their Active."""
+        from ptcg_il.featurizer import _ko_pressure
+
+        pcf, pf = self._boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],       # Riolu, 30 {F}
+            my_bench=[],
+            opp_active=[_poke_e(305, 20, self._LETHAL_HP)],      # Dunsparce, weak {F}
+            opp_bench=[],
+        )
+        my_ratio, can_ko, _, _ = _ko_pressure(pcf, pf)
+        assert my_ratio < 1.0, "fixture no longer rounds the wrong way"
+        assert can_ko == 1.0, "exactly lethal read as survivable (cls_feat[92])"
+
+    def test_ko_pressure_their_side_flags_an_exactly_lethal_attack(self):
+        """``cls_feat[94]`` -- can their Active KO me."""
+        from ptcg_il.featurizer import _ko_pressure
+
+        pcf, pf = self._boards(
+            my_active=[_poke_e(305, 10, self._LETHAL_HP)],       # Dunsparce, weak {F}
+            my_bench=[],
+            opp_active=[_poke_e(677, 20, 80)],                   # Riolu; no energy
+            opp_bench=[],                                        # (affordability ignored)
+        )
+        _, _, opp_ratio, opp_can_ko = _ko_pressure(pcf, pf)
+        assert opp_ratio < 1.0, "fixture no longer rounds the wrong way"
+        assert opp_can_ko == 1.0, "exactly lethal read as survivable (cls_feat[94])"
+
+    def test_card_target_preview_opponent_branch(self):
+        """``opt_scalar[7]`` for a gust target on their board."""
+        from ptcg_il.featurizer import _card_target_preview
+
+        pcf, pf = self._boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],
+            my_bench=[],
+            opp_active=[_poke_e(305, 20, self._LETHAL_HP)],
+            opp_bench=[],
+        )
+        ratio, ko = _card_target_preview(6, pcf, pf)
+        assert ratio < 1.0, "fixture no longer rounds the wrong way"
+        assert ko == 1.0, "exactly lethal gust target read as surviving"
+
+    def test_card_target_preview_my_branch_compares_raw_damage(self):
+        """The same trap in its other form: ``incoming >= cand_hp``, not a ratio.
+
+        This is the promote-after-KO reading -- whether a bench candidate
+        survives arriving.  Both sides are fp32 round-trips, so it needs a
+        *relative* tolerance, not the ratio one.
+        """
+        from ptcg_il.featurizer import HP_N, _best_damage, _card_target_preview
+
+        pcf, pf = self._boards(
+            my_active=[_poke_e(675, 10, 110)],                   # some other Active
+            my_bench=[_poke_e(305, 11, self._LETHAL_HP)],        # candidate, weak {F}
+            opp_active=[_poke_e(677, 20, 80)],                   # Riolu -> 60
+            opp_bench=[],
+        )
+        incoming = _best_damage(pcf[6], pcf[1], None, require_affordable=False)
+        cand_hp = float(pf[1][0]) * HP_N
+        assert incoming < cand_hp, "fixture no longer rounds the wrong way"
+
+        _, ko = _card_target_preview(1, pcf, pf)
+        assert ko == 1.0, (
+            "a promote candidate that dies on arrival read as surviving"
+        )
+
+    def test_attack_option_ko_flag(self):
+        """``opt_scalar[7]`` in the ATTACK branch, end to end through featurize."""
+        from ptcg_il.featurizer import _attack_damage_ratio, _build_poke_tokens, _feat_gatherer
+
+        # attackId 4 deals exactly 60; Lunatone is weak to {G}, so no doubling.
+        obs = _obs_with_boards(
+            my_active=[_poke_e(677, 10, 80, [_F_ENERGY])],
+            my_bench=[],
+            opp_active=[_poke_e(675, 20, self._LETHAL_HP)],
+            opp_bench=[],
+            options=[{"type": 13, "attackId": 4}],
+        )
+        poke_id, pf, _, _ = _build_poke_tokens(obs["current"], 0)
+        pcf = _feat_gatherer(_engine_card_features(), F_CARD)(poke_id)
+        raw = _attack_damage_ratio(4, 6, pcf, pf, _engine_attack_features())
+        assert 0.99 < raw < 1.0, f"fixture no longer rounds the wrong way: {raw!r}"
+
+        out = featurize(
+            obs, _build_test_vocab(_load_episode()), [0],
+            engine_card_features=_engine_card_features(),
+            engine_attack_features=_engine_attack_features(),
+        )
+        assert out["opt_scalar"][0, 7] == 1.0, (
+            "an exactly-lethal attack option read as non-lethal"
+        )

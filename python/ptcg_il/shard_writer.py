@@ -21,12 +21,6 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ptcg_il.belief_labels import (
-    build_belief_labels,
-    empty_belief_labels,
-    hand_after,
-    opp_hand_timeline,
-)
 from ptcg_il.featurizer import (
     CARD_FEAT_SOURCES,
     featurize,
@@ -604,7 +598,7 @@ _FP16_KEYS: frozenset[str] = frozenset()
 #: store.  Dropping them here rather than in ``_write_shard`` also keeps them
 #: out of the shard buffer, which holds ``samples_per_shard`` samples in RAM —
 #: at 50k samples these keys alone were ~5.8 GB of the writer's own footprint.
-_DERIVED_KEYS = frozenset(CARD_FEAT_SOURCES) | {"log_card_feat"}
+_DERIVED_KEYS = frozenset(CARD_FEAT_SOURCES)
 
 #: Card/attack ids are small non-negative integers; int64 doubles them for no
 #: reason.  int32 is still 6 orders of margin over the largest engine id.
@@ -664,10 +658,16 @@ _PARALLEL_FEATURIZE_MIN_EPISODES = 256
 _FEATURIZE_INFLIGHT_PER_WORKER = 2
 
 
+#: Set once per worker process the first time `featurize` raises, so a
+#: systematic fault warns immediately instead of hiding at debug level.
+_WARNED_SKIP = False
+
+
 def _init_feat_ctx(ctx: dict) -> None:
     """Pool initializer: publish *ctx* for this worker's `_featurize_episode`."""
-    global _FEAT_CTX
+    global _FEAT_CTX, _WARNED_SKIP
     _FEAT_CTX = ctx
+    _WARNED_SKIP = False
 
 
 def _featurize_player(eid: str, ep: dict, p: int, won: bool,
@@ -698,18 +698,7 @@ def _featurize_player(eid: str, ep: dict, p: int, won: bool,
     # `opp_arch is None` means the opponent's decklist matched no cluster at
     # jaccard >= thresh -- not that the episode is malformed.  Pass A already
     # decided to keep this row (filter_opp is off), so dropping it here would
-    # silently reinstate the filter one pass later.  -1 is the same sentinel
-    # an off-list-but-clustered opponent gets from opp_arch_to_contig.
-
-    # Belief supervision, gathered once per (episode, player):
-    #   - the opponent's exact decklist is their step-0 action, constant all game
-    #   - their hand is read off their own ACTIVE steps
-    try:
-        opp_deck = deck_of(ep, 1 - p)
-    except (KeyError, IndexError, ValueError):
-        opp_deck = None
-    opp_hands = opp_hand_timeline(ep, 1 - p) if opp_deck is not None else []
-    opp_arch_contig = ctx["opp_arch_to_contig"].get(opp_arch, -1)
+    # silently reinstate the filter one pass later.
 
     for step_i, obs, action in _active_decisions(ep, p):
         # Deck-selection steps are skipped (featurizer raises ValueError)
@@ -723,26 +712,25 @@ def _featurize_player(eid: str, ep: dict, p: int, won: bool,
                                engine_attack_features=ctx["engine_attack_features"],
                                evolution_map=ctx["evolution_map"])
         except (ValueError, TypeError, KeyError) as exc:
-            logger.debug("Skipping sample %s/%d/%d: %s", eid, p, step_i, exc)
-            continue
-
-        # Belief labels are always written, valid or not — see
-        # empty_belief_labels() for why the key set has to be uniform.
-        state = obs.get("current") or {}
-        your_index = state.get("yourIndex")
-        if opp_deck is not None and your_index is not None:
-            sample.update(
-                build_belief_labels(
-                    state=state,
-                    your_index=int(your_index),
-                    opp_deck=opp_deck,
-                    n_all_cards=ctx["n_all_cards"],
-                    opp_arch_index=opp_arch_contig,
-                    opp_hand_ids=hand_after(opp_hands, step_i),
+            # Individually skipping a malformed decision is correct.  Skipping
+            # *every* decision is a systematic fault, and at debug level it is
+            # invisible: a stale engine table once produced 125,123 kept pairs,
+            # 0 samples and no traceback after 30 minutes, and the only error
+            # printed blamed experts and D_self/D_opp.  Warn once per worker
+            # process so a systematic cause announces itself immediately, then
+            # fall back to debug so a few genuine oddities stay quiet.
+            global _WARNED_SKIP
+            if not _WARNED_SKIP:
+                _WARNED_SKIP = True
+                logger.warning(
+                    "featurize failed on %s/%d/%d: %s: %s — if this repeats for "
+                    "every decision the cause is systematic (most often a stale "
+                    "engine_*_features.npy); further skips log at debug level",
+                    eid, p, step_i, type(exc).__name__, exc,
                 )
-            )
-        else:
-            sample.update(empty_belief_labels())
+            else:
+                logger.debug("Skipping sample %s/%d/%d: %s", eid, p, step_i, exc)
+            continue
 
         # sample_weight is NOT written into shards (spec D.4);
         # it is derived from meta.parquet columns at training time (C.3).
@@ -991,8 +979,7 @@ def build_shards(
         archetypes_data, self_ids, opp_ids = _load_archetypes_from_json(arch_path)
 
     self_id_set = set(self_ids)
-    # None = accept any opponent deck.  `opp_ids` still defines the belief
-    # head's class order below; it just no longer decides which rows exist.
+    # None = accept any opponent deck.
     opp_id_set = set(opp_ids) if filter_opp else None
 
     # Skill enters as a weight, not a filter.  `experts_set` stays None unless a
@@ -1000,12 +987,6 @@ def build_shards(
     # the leaderboard below still covers every team, including the ones a top-K
     # filter would have dropped, because each one needs a weight.
     experts_set = set(experts) if experts is not None else None
-
-    # Archetype ids in archetypes.json are global cluster indices (0..157 on the
-    # current corpus) but only a handful are retained as 𝒟_opp.  The belief head
-    # classifies over the retained set, so map global id -> contiguous index
-    # here; unmapped opponents get -1, which the loss ignores.
-    opp_arch_to_contig = {gid: i for i, gid in enumerate(opp_ids)}
 
     # --- Pass A: scan, select, and tally the leaderboard in one sweep ---
     #
@@ -1113,7 +1094,6 @@ def build_shards(
     engine_card_features = engine_tables["engine_card_features"]
     engine_attack_features = engine_tables["engine_attack_features"]
     evolution_map = engine_tables["evolution_map"]
-    _n_all_cards = max(engine_card_features.keys()) + 1 if engine_card_features else 0
 
     leaderboard = _leaderboard_from_counts(team_counts)
     skill_w_by_team = team_skill_weights(leaderboard)
@@ -1166,8 +1146,6 @@ def build_shards(
         "evolution_map": evolution_map,
         "archetypes_data": archetypes_data,
         "jaccard_thresh": jaccard_thresh,
-        "opp_arch_to_contig": opp_arch_to_contig,
-        "n_all_cards": _n_all_cards,
     }
     n_jobs = (os.cpu_count() or 1) if jobs is None else max(1, jobs)
 

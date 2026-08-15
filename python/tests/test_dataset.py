@@ -4,6 +4,7 @@ Creates small synthetic .npz shards + meta.parquet so tests are self-contained
 and do not require a full corpus.
 """
 
+import datetime
 import logging
 import tempfile
 from pathlib import Path
@@ -20,8 +21,10 @@ from ptcg_il.train.dataset import (
     ALPHA_CTX,
     W_LOST,
     ShardDataset,
+    arch_age_drop_mask,
     collate_fn,
     compute_sample_weights,
+    episode_dates,
 )
 
 # ============================================================
@@ -196,16 +199,50 @@ def _build_synthetic_data(
 
 class TestComputeSampleWeights:
     def test_basic(self):
-        """Weights should be positive and normalized to mean approx 1."""
+        """Non-negative w_lost: weights positive and normalized to mean ~1."""
         meta = pd.DataFrame({
             "sel_ctx": [0, 1, 0, 2, 1],
             "archetype_self": [0, 0, 1, 1, 0],
             "won": [True, True, True, False, True],
         })
-        weights = compute_sample_weights(meta)
+        weights = compute_sample_weights(meta, w_lost=0.6)
         assert len(weights) == 5
         assert (weights >= 0).all()
         assert np.allclose(weights.mean(), 1.0, atol=1e-5)
+
+    def test_negative_w_lost_flips_the_sign(self):
+        """The default is signed: lost rows push their action's prob down."""
+        meta = pd.DataFrame({
+            "sel_ctx": [0, 0],
+            "archetype_self": [0, 0],
+            "won": [True, False],
+        })
+        weights = compute_sample_weights(meta)  # default W_LOST = -0.3
+        assert weights[0] > 0 > weights[1]
+        assert np.isclose(weights[0] / abs(weights[1]), 1.0 / 0.3, rtol=1e-4)
+
+    def test_abs_mean_normalization_with_signed_weights(self):
+        """Scale stability: mean(|w|) ~ 1 regardless of the sign mix.
+
+        The plain mean of signed weights can approach zero and would rescale
+        the loss by an unbounded factor; abs-mean cannot (unless every row is
+        zero-weighted).
+        """
+        meta = pd.DataFrame({
+            "sel_ctx": [0, 0, 0],
+            "archetype_self": [0, 0, 0],
+            "won": [True, False, False],
+        })
+        weights = compute_sample_weights(meta)
+        assert np.allclose(np.abs(weights).mean(), 1.0, atol=1e-5)
+
+    def test_dataset_applies_signed_w_lost(self):
+        """Wiring: ShardDataset's stored weights carry the outcome sign."""
+        data_dir = _build_synthetic_data(n_train=10, n_val=2)
+        ds = ShardDataset(data_dir, split="train", w_lost=-0.3)
+        w = ds.meta["sample_weight"].to_numpy()
+        won = ds.meta["won"].to_numpy()
+        assert (w[won] > 0).all() and (w[~won] < 0).all()
 
     def test_lost_discounted(self):
         """Lost-game samples should get lower weight than won, all else equal."""
@@ -657,3 +694,90 @@ class TestMmapCache:
         assert (cache_root / "val-00000.npz").is_dir()
         ShardDataset(data_dir, split="train")
         assert (cache_root / "val-00000.npz").is_dir()
+
+
+# ============================================================
+# Tests — per-archetype age filter (exclude_arch_before)
+# ============================================================
+
+
+class TestExcludeArchBefore:
+    def test_episode_dates_reads_only_day_dirs(self, tmp_path):
+        raw = tmp_path / "raw"
+        (raw / "2026-07-04").mkdir(parents=True)
+        (raw / "2026-08-10").mkdir()
+        (raw / "not-a-date").mkdir()
+        (raw / "2026-07-04" / "111.json").touch()
+        (raw / "2026-08-10" / "222.json").touch()
+        (raw / "not-a-date" / "333.json").touch()
+        assert episode_dates(raw) == {
+            "111": datetime.date(2026, 7, 4),
+            "222": datetime.date(2026, 8, 10),
+        }
+
+    def test_episode_dates_missing_dir_is_empty(self, tmp_path):
+        assert episode_dates(tmp_path / "raw") == {}
+
+    # Real UUIDv1 from raw/2026-07-04/83709252.json — decodes to 2026-07-04.
+    _UUID_V1 = "88ebb260-773b-11f1-a9ad-0242ac130203"
+
+    def test_date_comes_from_the_json_content(self, tmp_path):
+        """The content timestamp wins over the download-day directory name."""
+        raw = tmp_path / "raw"
+        day_dir = raw / "2026-08-01"  # deliberately not the content's date
+        day_dir.mkdir(parents=True)
+        (day_dir / "999.json").write_text(
+            '{"configuration": {}, "id": "%s", "steps": []}' % self._UUID_V1
+        )
+        assert episode_dates(raw) == {"999": datetime.date(2026, 7, 4)}
+
+    def test_unusable_id_falls_back_to_directory_date(self, tmp_path):
+        raw = tmp_path / "raw"
+        day_dir = raw / "2026-08-01"
+        day_dir.mkdir(parents=True)
+        (day_dir / "999.json").write_text(
+            '{"id": "00000000-0000-4000-8000-000000000000"}'  # v4, no timestamp
+        )
+        assert episode_dates(raw) == {"999": datetime.date(2026, 8, 1)}
+
+    def test_drop_mask_hits_only_old_rows_of_that_arch(self):
+        meta = pd.DataFrame({
+            "episode_id": ["a", "b", "c", "d", "e"],
+            "archetype_self": [1, 1, 2, 1, 1],
+        })
+        ep_dates = {
+            "a": datetime.date(2026, 7, 4),   # old arch-1 -> drop
+            "b": datetime.date(2026, 8, 1),   # recent arch-1 -> keep
+            "c": datetime.date(2026, 7, 4),   # old but arch-2 -> keep
+            # d: no raw file -> unknown date -> keep
+            "e": datetime.date(2026, 7, 20),  # on the cutoff -> keep
+        }
+        mask = arch_age_drop_mask(meta, 1, datetime.date(2026, 7, 20), ep_dates)
+        assert mask.tolist() == [True, False, False, False, False]
+
+    def test_dataset_drops_old_episodes_end_to_end(self, tmp_path):
+        data_dir = _build_synthetic_data(n_train=9, n_val=3)
+        raw = tmp_path / "raw"
+        (raw / "2026-07-04").mkdir(parents=True)
+        (raw / "2026-08-10").mkdir()
+        # arch = idx % 3, so archetype 1 owns episodes ep_1, ep_4, ep_7.
+        for old in ("ep_1", "ep_4"):
+            (raw / "2026-07-04" / f"{old}.json").touch()
+        (raw / "2026-08-10" / "ep_7.json").touch()
+
+        ds = ShardDataset(
+            data_dir, split="train",
+            exclude_arch_before=(1, datetime.date(2026, 7, 20)),
+            raw_dir=raw,
+        )
+        kept_eps = set(ds.meta["episode_id"])
+        assert "ep_1" not in kept_eps and "ep_4" not in kept_eps
+        assert "ep_7" in kept_eps
+        # Other archetypes keep every row, dated or not.
+        assert set(ds.meta["archetype_self"]) == {0, 1, 2}
+        assert len(ds) == 7
+
+    def test_no_flag_keeps_everything(self):
+        data_dir = _build_synthetic_data(n_train=9, n_val=3)
+        ds = ShardDataset(data_dir, split="train")
+        assert len(ds) == 9

@@ -234,18 +234,3 @@ class EnsemblePolicy(nn.Module):
             h_list=h_list,
             card_encs=card_encs,
         )
-
-    def belief_logits(
-        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
-    ) -> dict[str, torch.Tensor]:
-        """Delegate to first member only. Belief is only consumed by MCTS;
-        the ensemble is greedy-only."""
-        return self.members[0].belief_logits(x, history_h)
-
-    def forward_with_belief(
-        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """Forward + belief, delegating belief to the first member."""
-        logits, value, history_h_out = self(x, history_h)
-        belief = self.members[0].belief_logits(x, history_h)
-        return logits, value, history_h_out, belief

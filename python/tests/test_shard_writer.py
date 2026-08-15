@@ -766,28 +766,10 @@ class TestBuildShards:
         off_list = kept_meta[~kept_meta["archetype_opp"].isin(narrow)]
         assert len(off_list) > 0, "no off-list rows were recovered"
 
-        # meta keeps the opponent's real global cluster id -- that is not the
-        # belief label.  The head only has classes for D_opp, so the *shard*
-        # must carry -1 for exactly these rows.
-        checked = 0
-        for shard_name, group in off_list.groupby("shard"):
-            data = np.load(tmp_path / "kept" / "shards" / shard_name)
-            bel = data["bel_arch"][group["row"].to_numpy()]
-            assert (bel == -1).all(), (
-                f"{shard_name}: off-list opponents must be ignored by the arch "
-                f"head, got classes {sorted(set(bel.tolist()))}"
-            )
-            checked += len(group)
-        assert checked == len(off_list)
-
-        # ...and in-list rows must still carry a real class, or the head trains
-        # on nothing at all and this test would pass vacuously.
-        in_list = kept_meta[kept_meta["archetype_opp"].isin(narrow)]
-        assert len(in_list) > 0
-        for shard_name, group in in_list.groupby("shard"):
-            data = np.load(tmp_path / "kept" / "shards" / shard_name)
-            bel = data["bel_arch"][group["row"].to_numpy()]
-            assert (bel >= 0).all()
+        # Meta correctly records the real global cluster id (or -1) for every
+        # opponent — the old bel_arch label is gone, but the meta column
+        # remains for slicing eval and downstream analysis.
+        assert len(off_list) > 0
 
     def test_an_unclustered_opponent_survives_both_passes(self, tmp_path):
         """The opponent deck that matches *no* cluster, end to end.
@@ -840,19 +822,9 @@ class TestBuildShards:
         meta = pd.read_parquet(out_dir / "meta.parquet")
         assert (meta["archetype_opp"] == -1).all()
 
-        checked = 0
-        for shard_name, group in meta.groupby("shard"):
-            data = np.load(out_dir / "shards" / shard_name)
-            bel = data["bel_arch"][group["row"].to_numpy()]
-            assert (bel == -1).all()
-            # The other belief targets are still marked valid -- abstaining on
-            # the archetype is the whole cost of keeping the row.  Their
-            # *contents* are not asserted here: this fixture writes no
-            # engine_card_features, so n_all_cards is 0 and the deck/hand
-            # histograms are empty for every test in this file, off-list or not.
-            assert data["bel_valid"][group["row"].to_numpy()].all()
-            checked += len(group)
-        assert checked == len(meta)
+        # The important invariant is that unclustered rows exist at all —
+        # pass B used to silently reinstate the filter.  Meta correctness
+        # (archetype_opp == -1) is already checked above.
 
     def test_skill_w_matches_the_team_leaderboard(self, tmp_path):
         """``skill_w`` is this corpus's own leaderboard, not a constant.
@@ -1044,7 +1016,7 @@ class TestBuildShards:
             # stores the ids and ShardDataset rebuilds the features on read.
             essential_keys = {
                 "poke_card_id", "hand_card_id", "opt_card_id",
-                "log_feat", "cls_feat", "opt_type",
+                "cls_feat", "opt_type",
                 "opt_src_idx", "action_idx", "action_len", "sel_type", "sel_ctx",
                 "value_target", "tok_mask", "opt_mask",
             }

@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ptcg_il.model.belief import BeliefHeads, BeliefModule
 from ptcg_il.model.embed import TokenEmbedder
 from ptcg_il.model.encoder import Encoder
 from ptcg_il.model.pointer import PointerHead
@@ -99,10 +98,8 @@ class Policy(nn.Module):
         Encoder layers (4).
     ff : int
         Feed-forward hidden dim (1024).
-    n_opp_arch : int
-        Number of opponent archetypes for belief head.
     n_all_cards : int
-        Total number of engine cards (for belief card matrix).
+        Total number of engine cards.
     attn_dropout, ffn_dropout : float
         Encoder dropout, split by site: attention weights vs FFN/residual (see
         :class:`~ptcg_il.model.encoder.Encoder`).  They are separate knobs
@@ -120,7 +117,6 @@ class Policy(nn.Module):
         heads: int = 8,
         layers: int = 4,
         ff: int = 1024,
-        n_opp_arch: int = 0,
         n_all_cards: int = 0,
         all_card_feat: torch.Tensor | None = None,
         all_attack_feat: torch.Tensor | None = None,
@@ -135,18 +131,12 @@ class Policy(nn.Module):
         self.pointer = PointerHead(D, heads)
         self.pointer.card = self.embed.card
         self.value = ValueHead(D)
-        self.belief = BeliefModule(D)
-        self.belief.card_emb = self.embed.card  # share CardFeaturizer
-        self.belief_heads = BeliefHeads(D, n_opp_arch, n_all_cards,
-                                         card_emb=self.embed.card)
-        self.n_opp_arch = n_opp_arch
         self.D = D
         self.config: dict[str, int] = {
             "D": D,
             "heads": heads,
             "layers": layers,
             "ff": ff,
-            "n_opp_arch": n_opp_arch,
             "n_all_cards": n_all_cards,
             "feat_dims": current_feature_dims(),
             # Provenance, not a shape.  Recorded so a .pt says which regime
@@ -176,15 +166,15 @@ class Policy(nn.Module):
         is evaluated against without anything noticing.  ``config`` records
         their shapes instead, and :func:`policy_from_config` refuses a mismatch.
 
-        ``belief_heads`` gets the card table through the same call, so there is
-        one place a caller has to get right rather than two that can disagree.
+        The card table is set on ``embed.card``, and everything that needs it
+        shares that one reference.
         """
         self.card_table = None if card_table is None else card_table.to(torch.float32)
         self.attack_table = (
             None if attack_table is None else attack_table.to(torch.float32)
         )
         if card_table is not None:
-            self.belief_heads.set_all_card_feat(card_table)
+            pass  # card table is set on embed.card already
         shapes = {}
         if self.card_table is not None:
             shapes["card"] = list(self.card_table.shape)
@@ -232,7 +222,7 @@ class Policy(nn.Module):
         somehow still carried a stale ``poke_card_feat`` would otherwise take
         precedence over the ids beside it.
         """
-        from ptcg_il.featurizer import CARD_FEAT_SOURCES, LOG_CARD_ID_COLUMN
+        from ptcg_il.featurizer import CARD_FEAT_SOURCES
 
         out = dict(x)
         for feat_key, (id_key, kind) in CARD_FEAT_SOURCES.items():
@@ -245,25 +235,20 @@ class Policy(nn.Module):
                 continue
             out[feat_key] = self._gather_rows(ids.long(), self._table(kind))
 
-        log_feat = x.get("log_feat")
-        if log_feat is not None:
-            out["log_card_feat"] = self._gather_rows(
-                log_feat[..., LOG_CARD_ID_COLUMN].long(), self._table("card")
-            )
         return out
 
     def _encode(self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
                 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-        """Shared encode path: gather card features → embed → encode → belief.
+        """Shared encode path: gather card features → embed → encode.
 
-        Returns ``(x, h, history_h)`` where *h* has the belief-augmented CLS
-        token and *x* is the batch **with** the gathered ``*_card_feat``
-        tensors.  Every public entry point funnels through here, which is why
-        the gather lives here: ``forward``, ``belief_logits``,
-        ``forward_with_belief``, ``multiselect_ce`` and ``select_multi`` all get
-        it without five chances to forget.  The augmented dict is returned
-        because the pointer head, which runs *after* this call, reads
-        ``opt_card_feat`` and ``opt_attack_feat``.
+        Returns ``(x, h, history_h)`` where *h* is the encoder output (CLS row
+        unmodified — the belief-augmented CLS and the ``history_gru`` that
+        preceded it are both removed).  *x* is the batch **with** the gathered
+        ``*_card_feat`` tensors.  Every public entry point funnels through here,
+        which is why the gather lives here: ``forward``, ``multiselect_ce`` and
+        ``select_multi`` all get it without three chances to forget.  The
+        augmented dict is returned because the pointer head, which runs *after*
+        this call, reads ``opt_card_feat`` and ``opt_attack_feat``.
 
         *history_h* is accepted and returned unchanged, for callers that still
         pass it.  It no longer does anything: the ``history_gru`` that consumed
@@ -274,8 +259,7 @@ class Policy(nn.Module):
         saturated** (|n| > 0.99), dropped CLS rms 1.31 → 0.96, and gave
         per-dim corr(pre, post) ≈ −0.07.  The value head and the pointer's CLS
         key/value read only that vector, so the one thing the "cross-turn
-        memory" did was bottleneck the global summary token.  The CLS row now
-        passes through with the belief residual and nothing else.
+        memory" did was bottleneck the global summary token.
         """
         B = x["tok_type"].shape[0]
         device = x["tok_type"].device
@@ -283,21 +267,8 @@ class Policy(nn.Module):
         rows = self.embed(x)                                 # [B, L, D]
         h = self.encoder(rows, x["tok_mask"])                # [B, L, D]
 
-        # Belief module: encode logs into belief state
-        if "log_feat" in x and x.get("log_mask") is not None:
-            belief = self.belief(
-                x["log_feat"], x["log_mask"],
-                log_card_feat=x.get("log_card_feat"),
-            )  # [B, D]
-        else:
-            belief = torch.zeros(B, self.D, device=device)
-
         if history_h is None:
             history_h = torch.zeros(B, self.D, device=device)
-
-        # Replace CLS without in-place mutation (preserves autograd graph)
-        cls_token = h[:, 0, :] + belief                      # [B, D]
-        h = torch.cat([cls_token.unsqueeze(1), h[:, 1:, :]], dim=1)  # [B, L, D]
 
         return x, h, history_h
 
@@ -330,149 +301,46 @@ class Policy(nn.Module):
         value = self.value(h[:, 0])                           # [B]
         return logits, value, history_h.detach()
 
-    def belief_logits(
-        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
-    ) -> dict[str, torch.Tensor]:
-        """Opponent-card belief logits: ``arch``, ``deck``, ``hidden``, ``hand``.
-
-        Separate from :meth:`forward` because the two have different callers:
-        training needs the belief heads alongside the action logits and gets
-        them from :meth:`forward_with_belief`, which encodes once, whereas the
-        MCTS planner needs *only* the belief and would otherwise pay for the
-        pointer head on every determinization.
-        """
-        _x, h, _ = self._encode(x, history_h)
-        return self.belief_heads(h[:, 0])
-
-    def forward_with_belief(
-        self, x: dict[str, torch.Tensor], history_h: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        """:meth:`forward` plus the belief logits, sharing a single encode pass.
-
-        Returns ``(logits, value, history_h, belief)``.  Calling ``forward`` and
-        ``belief_logits`` separately would run the transformer twice per step.
-        """
-        x, h, history_h = self._encode(x, history_h)
-        logits, _ = self.pointer(h, x["tok_mask"], self.embed.card, x)
-        value = self.value(h[:, 0])
-        belief = self.belief_heads(h[:, 0])
-        return logits, value, history_h.detach(), belief
 
 
-#: The belief archetype classifier's output layer.  Its width is
-#: ``len(archetypes.json["opp_ids"])``, which grows when a seeded mining run
-#: appends a new 𝒟_opp archetype (``ptcg_mine.archetype._append_only``).
-_ARCH_HEAD_PREFIX = "belief_heads.arch_head."
-
-#: Parameters of the removed cross-turn GRU.  Kept as a named constant because
-#: :func:`load_policy_state` has to recognise them in older checkpoints.
-_HISTORY_GRU_PREFIX = "history_gru."
-
-
-def widen_belief_arch_head(policy: Policy, state_dict: dict) -> tuple[dict, int, int]:
-    """Copy an older, narrower archetype head into this policy's wider one.
-
-    ``𝒟_opp`` is append-only, so slot *i* means the same archetype it always
-    did and the old head's rows are a strict prefix of the new one's.  Copying
-    them keeps everything the old model learned about the archetypes it saw and
-    leaves the appended rows at their initialisation.
-
-    This is only sound *because* the ordering is append-only.  Against a
-    re-baselined ``archetypes.json`` the prefix rows describe different decks,
-    and a prefix copy would be worse than a fresh head — it would look trained.
-    Callers must therefore opt in, and only when the artifacts share a lineage
-    generation with the checkpoint.
-
-    Returns ``(patched_state_dict, old_width, new_width)``; the dict is
-    unchanged and the widths equal when there is nothing to widen.  Raises if
-    the head *shrank*, which means a re-cluster, not an append.
-    """
-    model_sd = policy.state_dict()
-    old_w = new_w = 0
-    patched = state_dict
-    for key, want in model_sd.items():
-        if not key.startswith(_ARCH_HEAD_PREFIX):
-            continue
-        have = state_dict.get(key)
-        if have is None or have.shape == want.shape:
-            continue
-        if have.shape[1:] != want.shape[1:]:
-            raise RuntimeError(
-                f"{key}: checkpoint shape {list(have.shape)} differs from "
-                f"{list(want.shape)} in a dimension that is not the archetype "
-                "count — this is not an appended 𝒟_opp slot."
-            )
-        if have.shape[0] > want.shape[0]:
-            raise RuntimeError(
-                f"{key}: checkpoint has {have.shape[0]} archetype slots but "
-                f"this policy has {want.shape[0]}. 𝒟_opp shrank, which means "
-                "the archetypes were re-clustered rather than appended to. The "
-                "old rows now describe different decks; retrain the belief "
-                "head instead of copying them."
-            )
-        if patched is state_dict:
-            patched = dict(state_dict)
-        grown = want.clone()
-        grown[: have.shape[0]] = have
-        patched[key] = grown
-        old_w, new_w = int(have.shape[0]), int(want.shape[0])
-    return patched, old_w, new_w
+#: Parameters of retired modules, recognised by :func:`load_policy_state` so
+#: checkpoints written before their removal still load.  ``history_gru`` was the
+#: cross-turn GRU, ``belief`` was the game-log encoder (Half B), and
+#: ``belief_heads`` were the auxiliary prediction heads (Half A).
+_RETIRED_PREFIXES = ("history_gru.", "belief.", "belief_heads.")
 
 
 def load_policy_state(
     policy: Policy,
     state_dict: dict,
-    allow_belief_widening: bool = False,
 ) -> list[str]:
-    """``policy.load_state_dict`` that tolerates a pre-belief checkpoint.
+    """``policy.load_state_dict`` that tolerates retired-module parameters.
 
-    Every checkpoint written before :class:`~ptcg_il.model.belief.BeliefHeads`
-    existed lacks the ``belief_heads.*`` parameters, and a strict load rejects
-    it outright.  Those are the *only* keys allowed to be missing: anything
-    else still raises, because a silently half-loaded policy evaluates as a
-    plausible-looking but randomly-initialised model.
+    Parameters belonging to retired modules (``history_gru.*``, ``belief.*``,
+    ``belief_heads.*``) are dropped rather than raising.  Anything else
+    unexpected still raises, because a silently half-loaded policy evaluates as
+    a plausible-looking but randomly-initialised model.
 
-    With *allow_belief_widening*, a checkpoint whose archetype head is narrower
-    than this policy's is accepted and its rows copied into the leading slots —
-    see :func:`widen_belief_arch_head` for the condition that makes that sound.
-    It is off by default: a shape mismatch is the only signal that the 𝒟_opp
-    set moved, and swallowing it by default would let a re-baselined corpus load
-    a checkpoint whose belief slots mean different decks.
-
-    Returns the list of belief keys that were left at their initial values.
+    Returns the list of retired-module keys that were left at their initial
+    values (always empty now — kept for API compatibility).
     """
-    # ``history_gru`` was removed (see Policy._encode).  Every checkpoint written
-    # before that still carries its four parameters, and they would land in
-    # ``unexpected`` and raise below.  Dropping them is safe in a way that
-    # dropping an *unknown* key would not be: the module is gone, nothing reads
-    # its weights, and the CLS row it used to transform now passes through
-    # untouched.  Anything else unexpected still raises.
-    stale = [k for k in state_dict if k.startswith(_HISTORY_GRU_PREFIX)]
+    policy_keys = set(policy.state_dict())
+    stale = [k for k in state_dict
+             if k.startswith(_RETIRED_PREFIXES) and k not in policy_keys]
     if stale:
-        state_dict = {k: v for k, v in state_dict.items()
-                      if not k.startswith(_HISTORY_GRU_PREFIX)}
+        state_dict = {k: v for k, v in state_dict.items() if k not in stale}
         logger.info(
-            "dropped %d stale history_gru parameter(s) from the checkpoint; the "
-            "module was removed and the CLS token is no longer squashed through it",
-            len(stale),
+            "dropped %d parameter(s) from retired modules (%s); their weights "
+            "are no longer read by any code path",
+            len(stale), ", ".join(sorted({k.split(".")[0] for k in stale})),
         )
 
-    if allow_belief_widening:
-        state_dict, old_w, new_w = widen_belief_arch_head(policy, state_dict)
-        if new_w > old_w > 0:
-            logger.warning(
-                "belief archetype head widened %d → %d slots; rows 0..%d were "
-                "copied from the checkpoint and %d appended slot(s) start "
-                "untrained. This is only correct if archetypes.json was seeded, "
-                "not re-baselined.",
-                old_w, new_w, old_w - 1, new_w - old_w,
-            )
     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
     belief_missing = [k for k in missing if k.startswith("belief_heads.")]
     other = [k for k in missing if not k.startswith("belief_heads.")]
 
-    # Policy ties one CardEncoder into three places (pointer.card, belief.card_emb,
-    # belief_heads all reference self.embed.card), and EMA shadows built via
+    # Policy ties one CardEncoder into two places (pointer.card, belief.card_emb
+    # both reference self.embed.card), and EMA shadows built via
     # named_parameters() (remove_duplicate=True, the default) omit the alias
     # names.  The tensors are already loaded through embed.card.* — compare object
     # identity rather than guessing at name prefixes.
@@ -569,7 +437,6 @@ def policy_from_config(config: dict,
         heads=int(config["heads"]),
         layers=int(config["layers"]),
         ff=int(config["ff"]),
-        n_opp_arch=int(config.get("n_opp_arch", 0)),
         n_all_cards=int(config.get("n_all_cards", 0)),
         all_card_feat=all_card_feat,
         all_attack_feat=all_attack_feat,

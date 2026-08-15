@@ -172,8 +172,6 @@ class TestPolicy:
         for name, p in policy.named_parameters():
             if "msgru" in name:
                 continue  # only exercised in multi-select loop
-            if name.startswith("belief_heads."):
-                continue  # auxiliary; only reached via forward_with_belief
             assert p.grad is not None, f"Parameter {name} has no gradient"
 
     def test_pointer_card_bound(self):
@@ -512,24 +510,22 @@ class TestHistoryGruIsGone:
         assert not hasattr(p, "history_gru")
         assert not [k for k in p.state_dict() if k.startswith("history_gru.")]
 
-    def test_cls_row_is_the_encoder_row_plus_belief(self):
-        """The CLS token must now pass through, not be squashed."""
+    def test_cls_row_is_the_encoders_own_output(self):
+        """The CLS token must pass through the encoder unmodified.
+
+        ``policy.py`` used to do ``cls_token = h[:, 0, :] + belief``; now
+        ``_encode`` returns the raw encoder output with no residual added.
+        """
         import torch
 
         p = make_policy(D=32, heads=2, layers=1, ff=64).eval()
         x = _make_synthetic_batch(B=3)
         with torch.no_grad():
-            # embed/belief read the gathered features; _encode does the gather,
-            # so a hand-rolled comparison has to do it too.
             xg = p._gather_card_feats(x)
             rows = p.embed(xg)
-            h_enc = p.encoder(rows, xg["tok_mask"])
-            belief = p.belief(xg["log_feat"], xg["log_mask"],
-                              log_card_feat=xg.get("log_card_feat"))
+            expected = p.encoder(rows, xg["tok_mask"])
             _x, h, _ = p._encode(x)
-        assert torch.allclose(h[:, 0, :], h_enc[:, 0, :] + belief, atol=1e-6)
-        # The non-CLS rows are untouched either way.
-        assert torch.allclose(h[:, 1:, :], h_enc[:, 1:, :], atol=1e-6)
+        assert torch.allclose(h, expected, atol=1e-6)
 
     def test_cls_is_not_tanh_bounded(self):
         """The old path squashed every CLS dim into (-1, 1); this one does not."""
@@ -575,3 +571,60 @@ class TestHistoryGruIsGone:
         sd["genuinely_unknown.weight"] = torch.randn(4, 4)
         with pytest.raises(RuntimeError):
             load_policy_state(p, sd)
+
+
+def test_belief_carrying_checkpoint_still_loads():
+    """A checkpoint written before the belief removal carries ``belief.*`` and
+    ``belief_heads.*`` parameters the current Policy does not define.  Those must
+    be dropped like the retired ``history_gru.*`` ones, not raised on: the run
+    that produced them cannot be repeated.
+    """
+    import torch
+
+    from ptcg_il.model.policy import load_policy_state
+
+    policy = make_policy(D=32, heads=2, layers=1, ff=64)
+    state = dict(policy.state_dict())
+    # Simulate the pre-removal checkpoint.
+    state["belief.gru.weight_ih"] = torch.zeros(3, 4)
+    state["belief_heads.arch_head.weight"] = torch.zeros(9, 8)
+    state["belief_heads.arch_head.bias"] = torch.zeros(9)
+
+    load_policy_state(policy, state)   # must not raise
+
+
+def test_a_genuinely_unknown_key_still_raises():
+    """The drop must be prefix-scoped.  Swallowing every unexpected key would
+    turn a real load mismatch into a silently half-initialised model.
+    """
+    import torch
+
+    from ptcg_il.model.policy import load_policy_state
+
+    policy = make_policy(D=32, heads=2, layers=1, ff=64)
+    state = dict(policy.state_dict())
+    state["some_module_that_never_existed.weight"] = torch.zeros(2, 2)
+
+    with pytest.raises(Exception):
+        load_policy_state(policy, state)
+
+
+def test_cls_token_is_the_encoders_own_output():
+    """After the log encoder's removal the CLS row passes through untouched.
+
+    ``policy.py`` used to do ``cls_token = h[:, 0, :] + belief``.  This asserts the
+    residual is gone, so a future re-introduction cannot happen silently.
+    """
+    import torch
+
+    from ptcg_il.model.policy import Policy
+
+    policy = make_policy().eval()
+    assert not hasattr(policy, "belief"), "the log encoder is still constructed"
+
+    batch = _make_synthetic_batch()
+    with torch.no_grad():
+        _x, h, _hist = policy._encode(batch)
+        rows = policy.embed(policy._gather_card_feats(dict(batch)))
+        expected = policy.encoder(rows, batch["tok_mask"])
+    assert torch.allclose(h, expected, atol=1e-6)

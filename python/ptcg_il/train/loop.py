@@ -9,6 +9,7 @@ Implements:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 from contextlib import contextmanager, nullcontext
@@ -25,11 +26,9 @@ from torch.utils.data import DataLoader
 from ptcg_il.deck import build_deck_metadata
 from ptcg_il.deck import describe as describe_deck
 from ptcg_il.deck import require_deck_record, update_sidecar, write_deck_csv
-from ptcg_il.belief_labels import BELIEF_WEIGHTS  # noqa: F401  (re-exported for the CLI)
-from ptcg_il.model.belief import belief_loss
 from ptcg_il.model.policy import Policy, load_policy_state, multiselect_ce
 from ptcg_il.train.checkpoint import save_checkpoint
-from ptcg_il.train.dataset import ShardDataset, collate_fn
+from ptcg_il.train.dataset import W_LOST, ShardDataset, collate_fn
 from ptcg_il.train.eval import offline_eval
 from ptcg_il.train.logger import WandbLogger
 
@@ -504,14 +503,12 @@ def _compute_loss(
     lambda_v: float = LAMBDA_V,
     label_smoothing: float = LABEL_SMOOTH,
     use_amp: bool = True,
-    belief_weights: dict[str, float] | None = None,
     group_marginal: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward pass + loss only (no backward, no optimizer step).
 
-    Returns ``(loss, ce, value_mse_loss, belief_parts)`` where *loss* is a
-    scalar tensor ready for ``.backward()`` and *belief_parts* holds the
-    per-term belief scalars for logging (empty when the belief loss is off).
+    Returns ``(loss, ce, value_mse_loss)`` where *loss* is a
+    scalar tensor ready for ``.backward()``.
     Caller is responsible for scaling, backward, gradient clipping, and
     optimizer step.
     """
@@ -522,14 +519,7 @@ def _compute_loss(
         if use_amp
         else nullcontext()
     ):
-        # forward_with_belief shares the encode pass; calling policy() and then
-        # policy.belief_logits() would run the transformer twice per step.
-        want_belief = bool(belief_weights) and any(belief_weights.values())
-        if want_belief:
-            logits, value, _history_h, belief_preds = policy.forward_with_belief(batch)
-        else:
-            logits, value, _history_h = policy(batch)  # [B, O], [B], [B, D]
-            belief_preds = None
+        logits, value, _history_h = policy(batch)  # [B, O], [B], [B, D]
 
         maxcount = batch["maxCount"]
         single = maxcount == 1
@@ -605,15 +595,7 @@ def _compute_loss(
         else:
             value_mse_loss = torch.tensor(0.0, device=loss.device)
 
-        belief_parts: dict[str, float] = {}
-        if belief_preds is not None:
-            # Every term is masked by bel_valid, so shards without labels
-            # contribute exactly 0 rather than a bogus gradient.
-            b_loss, belief_parts = belief_loss(belief_preds, batch, **belief_weights)
-            loss = loss + b_loss
-            belief_parts["belief/loss"] = float(b_loss.detach())
-
-    return loss, ce, value_mse_loss, belief_parts
+    return loss, ce, value_mse_loss
 
 
 def train_step(
@@ -626,7 +608,6 @@ def train_step(
     lambda_v: float = LAMBDA_V,
     label_smoothing: float = LABEL_SMOOTH,
     grad_clip: float = GRAD_CLIP,
-    belief_weights: dict[str, float] | None = None,
     group_marginal: bool = True,
 ) -> dict[str, float]:
     """Run one optimizer step on *batch* (C.6).
@@ -650,14 +631,13 @@ def train_step(
 
     Returns
     -------
-    Dict with ``loss, ce_loss, value_mse, grad_norm`` for logging.
+    Dict with ``loss, ce, ce_won, ce_lost, value_mse, grad_norm`` for logging.
     """
     use_amp = grad_scaler is not None
 
-    loss, ce, value_mse_loss, belief_parts = _compute_loss(
+    loss, ce, value_mse_loss = _compute_loss(
         policy, batch, lambda_v=lambda_v,
         label_smoothing=label_smoothing, use_amp=use_amp,
-        belief_weights=belief_weights,
         group_marginal=group_marginal,
     )
 
@@ -676,12 +656,16 @@ def train_step(
 
     ema.update(policy)
 
+    vt = batch["value_target"]
+    won_m = vt > 0
+    lost_m = vt < 0
     return {
         "loss": loss.item(),
         "ce": ce.mean().item(),
+        "ce_won": ce[won_m].mean().item() if bool(won_m.any()) else 0.0,
+        "ce_lost": ce[lost_m].mean().item() if bool(lost_m.any()) else 0.0,
         "value_mse": value_mse_loss.item(),
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
-        **belief_parts,
     }
 
 
@@ -699,7 +683,6 @@ def train(
     label_smoothing: float = LABEL_SMOOTH,
     ema_decay: float = EMA_DECAY,
     lambda_v: float = LAMBDA_V,
-    belief_weights: dict[str, float] | None = None,
     group_marginal: bool = True,
     weight_decay: float = WEIGHT_DECAY,
     betas: tuple[float, float] = BETAS,
@@ -714,6 +697,8 @@ def train(
     muon_lr: float = MUON_LR,
     grad_accum: int = 1,
     archetype_self: int | None = None,
+    exclude_arch_before: tuple[int, datetime.date] | None = None,
+    w_lost: float = W_LOST,
     # Precision
     mixed_precision: bool = True,
     # W&B
@@ -723,7 +708,6 @@ def train(
     wandb_name: str | None = None,
     # Resume
     resume_ckpt: str | Path | None = None,
-    allow_belief_widening: bool = False,
     # Eval
     run_val: bool = True,
     # Early-stop (C.5/C.8)
@@ -814,7 +798,9 @@ def train(
     logger.info('total_steps %s' , total_steps)
     # Build datasets
     train_ds = ShardDataset(
-        data_dir, split="train", shuffle=True, seed=seed, archetype_self=archetype_self
+        data_dir, split="train", shuffle=True, seed=seed,
+        archetype_self=archetype_self, exclude_arch_before=exclude_arch_before,
+        w_lost=w_lost,
     )
     train_loader = DataLoader(
         train_ds,
@@ -832,7 +818,10 @@ def train(
     if run_val:
         try:
             val_ds = ShardDataset(
-                data_dir, split="val", shuffle=False, archetype_self=archetype_self
+                data_dir, split="val", shuffle=False,
+                archetype_self=archetype_self,
+                exclude_arch_before=exclude_arch_before,
+                w_lost=w_lost,
             )
             val_loader = DataLoader(
                 val_ds,
@@ -921,14 +910,10 @@ def train(
     if resume_ckpt is not None:
         from ptcg_il.train.checkpoint import load_checkpoint
         ckpt = load_checkpoint(resume_ckpt, device)
-        stale = load_policy_state(
-            policy, ckpt["model_state_dict"],
-            allow_belief_widening=allow_belief_widening,
-        )
+        stale = load_policy_state(policy, ckpt["model_state_dict"])
         if stale:
             logger.warning(
-                "Checkpoint predates the belief heads; %d belief parameters "
-                "start from scratch.", len(stale),
+                "Checkpoint carries retired keys; %d parameters dropped.", len(stale),
             )
         require_matching_optimizer(ckpt, optimizer_name)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -973,6 +958,10 @@ def train(
     accum_loss = 0.0
     accum_ce = 0.0
     accum_value_mse = 0.0
+    accum_ce_won = 0.0
+    accum_ce_lost = 0.0
+    accum_n_won = 0
+    accum_n_lost = 0
     optimizer.zero_grad(set_to_none=True)
 
     for step in range(start_step, total_steps):
@@ -993,12 +982,11 @@ def train(
             batch_gpu[k] = v.to(device, non_blocking=(device.type == "cuda"))
 
         # ---- micro-batch forward ----
-        loss, ce, value_mse_loss, belief_parts = _compute_loss(
+        loss, ce, value_mse_loss = _compute_loss(
             policy, batch_gpu,
             lambda_v=lambda_v,
             label_smoothing=label_smoothing,
             use_amp=use_amp,
-            belief_weights=belief_weights,
             group_marginal=group_marginal,
         )
 
@@ -1015,6 +1003,17 @@ def train(
         accum_loss += loss.item()
         accum_ce += ce.mean().item()
         accum_value_mse += value_mse_loss.item()
+        # Outcome-split CE, accumulated as sums/counts.  With a signed w_lost
+        # the plain mean mixes the two halves of the objective — ce_lost is
+        # *supposed* to rise while ce_won falls — so only the split shows
+        # whether training is doing what it should.
+        vt = batch_gpu["value_target"]
+        won_m = vt > 0
+        lost_m = vt < 0
+        accum_ce_won += ce[won_m].sum().item()
+        accum_n_won += int(won_m.sum())
+        accum_ce_lost += ce[lost_m].sum().item()
+        accum_n_lost += int(lost_m.sum())
 
         # ---- optimizer step (every grad_accum micro-batches) ----
         is_accum_boundary = (step + 1) % grad_accum == 0
@@ -1039,20 +1038,22 @@ def train(
         metrics = {
             "loss": accum_loss / n,
             "ce": accum_ce / n,
+            "ce_won": accum_ce_won / max(accum_n_won, 1),
+            "ce_lost": accum_ce_lost / max(accum_n_lost, 1),
             "value_mse": accum_value_mse / n,
             "grad_norm": (
                 grad_norm_val.item() if isinstance(grad_norm_val, torch.Tensor) else float(grad_norm_val)
             ) if is_accum_boundary else 0.0,
-            # Belief scalars come from the last micro-batch rather than the
-            # accumulation average: they are diagnostics, not the objective,
-            # and each is already a batch mean.
-            **belief_parts,
         }
 
         if is_accum_boundary:
             accum_loss = 0.0
             accum_ce = 0.0
             accum_value_mse = 0.0
+            accum_ce_won = 0.0
+            accum_ce_lost = 0.0
+            accum_n_won = 0
+            accum_n_lost = 0
 
         # Log / eval / checkpoint — only on accumulation boundaries
         if not is_accum_boundary:
@@ -1068,7 +1069,13 @@ def train(
                 grad_norm=metrics["grad_norm"],
                 lr=lr,
                 samples_per_sec=batch_size / max(data_wait, 0.001),
-                extra={k: v for k, v in metrics.items() if k.startswith("belief/")},
+                extra={
+                    "train/ce_won": metrics["ce_won"],
+                    "train/ce_lost": metrics["ce_lost"],
+                    # The signed policy objective on its own — `loss` mixes in
+                    # the value term, so it can't be read directly.
+                    "train/loss_pi": metrics["loss"] - lambda_v * metrics["value_mse"],
+                },
             )
 
         # Offline eval
@@ -1078,7 +1085,6 @@ def train(
                 ema=ema,
                 lambda_v=lambda_v,
                 label_smoothing=label_smoothing,
-                belief=belief_weights is not None,
             )
             eval_metrics["step"] = step + 1
             wandb_logger.log_eval(**eval_metrics)
